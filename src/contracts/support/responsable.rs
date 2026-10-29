@@ -44,6 +44,12 @@ impl<T: Responsable> Responsable for (HttpStatus, T) {
     }
 }
 
+impl Responsable for () {
+    fn to_response(self) -> Response {
+        Response::ok()
+    }
+}
+
 impl<T: Responsable> Responsable for (u16, T) {
     fn to_response(self) -> Response {
         let mut res = self.1.to_response();
