@@ -85,10 +85,7 @@ impl Response {
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
     pub fn new(status: HttpStatus) -> Self {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        );
+        headers.insert("Content-Type", "text/html; charset=utf-8");
         Self {
             status,
             headers,
@@ -155,43 +152,49 @@ impl Response {
 
     /// Set response body as plain text (`Content-Type: text/plain; charset=utf-8`).
     pub fn text(mut self, body: impl Into<String>) -> Self {
-        self.headers.insert(
-            "Content-Type",
-            "text/plain; charset=utf-8",
-        );
+        self.headers
+            .insert("Content-Type", "text/plain; charset=utf-8");
         self.body = body.into().into_bytes();
         self
     }
 
     /// Set response body as JSON (`Content-Type: application/json`).
     pub fn json(mut self, json_str: impl Into<String>) -> Self {
-        self.headers
-            .insert("Content-Type", "application/json");
+        self.headers.insert("Content-Type", "application/json");
         self.body = json_str.into().into_bytes();
         self
     }
 
     /// Set response body as HTML (`Content-Type: text/html; charset=utf-8`).
     pub fn html(mut self, html_str: impl Into<String>) -> Self {
-        self.headers.insert(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        );
+        self.headers
+            .insert("Content-Type", "text/html; charset=utf-8");
         self.body = html_str.into().into_bytes();
         self
     }
 
     /// Convert struct back to raw HTTP/1.1 bytes for TCP transmission
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut res = format!("HTTP/1.1 {} {}\r\n", self.status.code(), self.status.message());
-        res.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
-        for (k, v) in &self.headers {
-            res.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        res.push_str("\r\n");
+        let mut raw = Vec::with_capacity(128 + self.body.len());
 
-        let mut raw = res.into_bytes();
+        raw.extend_from_slice(b"HTTP/1.1 ");
+        raw.extend_from_slice(self.status_code().to_string().as_bytes());
+        raw.extend_from_slice(b" ");
+        raw.extend_from_slice(self.status_message().as_bytes());
+        raw.extend_from_slice(b"\r\nContent-Length: ");
+        raw.extend_from_slice(self.body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n");
+
+        for (k, v) in &self.headers {
+            raw.extend_from_slice(k.as_bytes());
+            raw.extend_from_slice(b": ");
+            raw.extend_from_slice(v.as_bytes());
+            raw.extend_from_slice(b"\r\n");
+        }
+
+        raw.extend_from_slice(b"\r\n");
         raw.extend_from_slice(&self.body);
+
         raw
     }
 }
