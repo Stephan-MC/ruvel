@@ -1,5 +1,6 @@
 use crate::contracts::Responsable;
 use crate::http::{Method, Request, Response};
+use matchit::Router as MatchitRouter; // Alias to avoid naming conflicts
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -10,7 +11,8 @@ pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture + Send + Sync + 'static>;
 
 #[derive(Default)]
 pub struct Router {
-    routes: HashMap<(Method, String), HandlerFn>,
+    // Map each HTTP Method to its own Radix Tree of routes
+    routes: HashMap<Method, MatchitRouter<HandlerFn>>,
 }
 
 impl Router {
@@ -30,7 +32,13 @@ impl Router {
             let fut = handler(req);
             Box::pin(async move { fut.await.to_response() })
         });
-        self.routes.insert((method, path.to_string()), h);
+
+        // Get the radix tree for this HTTP Method, or create one if it doesn't exist
+        let method_router = self.routes.entry(method).or_insert_with(MatchitRouter::new);
+
+        // Insert the route. Using unwrap() because a syntax error in route
+        // definitions (e.g., overlapping params) should panic at startup.
+        method_router.insert(path, h).unwrap();
     }
 
     pub fn get<F, Fut, R>(&mut self, path: &str, handler: F)
@@ -78,11 +86,22 @@ impl Router {
         self.add_route(Method::PATCH, path, handler);
     }
 
-    pub fn dispatch(&self, req: Request) -> BoxFuture {
-        if let Some(handler) = self.routes.get(&(req.method.clone(), req.path.clone())) {
-            handler(req)
-        } else {
-            Box::pin(async { Response::not_found().text("404 Not Found") })
+    pub fn dispatch(&self, mut req: Request) -> BoxFuture {
+        // 1. Find the Radix Tree for the incoming HTTP method
+        if let Some(method_router) = self.routes.get(&req.method) {
+            // 2. Traverse the tree matching the URL path
+            if let Ok(matched) = method_router.at(&req.path) {
+                // 3. Extract dynamic parameters (e.g., {id}) and inject them into our Request
+                for (key, value) in matched.params.iter() {
+                    req.params.insert(key.to_string(), value.to_string());
+                }
+
+                // 4. Trigger the matched handler
+                let handler = matched.value;
+                return handler(req);
+            }
         }
+
+        Box::pin(async { Response::not_found().text("404 Not Found") })
     }
 }

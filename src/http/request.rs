@@ -28,10 +28,10 @@ pub struct Request {
     pub path: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    pub params: HashMap<String, String>,
 }
 
 impl Request {
-    /// Primitive byte parser reading directly from the TCP stream buffer
     pub fn parse(buffer: &[u8]) -> Option<Self> {
         let req_str = String::from_utf8_lossy(buffer);
         let mut lines = req_str.split("\r\n");
@@ -41,16 +41,16 @@ impl Request {
         let method = parts.next().unwrap_or("GET");
         let path = parts.next().unwrap_or("/");
 
-        // In a full implementation, you'd parse headers and body here
         Some(Self {
             method: Method::from(method),
             path: path.to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
+            params: HashMap::new(), // Initialize empty
         })
     }
 
-    /// Retrieve a header value by key in a case-insensitive manner.
+    /// Retrieve a header value by key (case-insensitive)
     pub fn header(&self, key: &str) -> Option<&str> {
         let lower = key.to_ascii_lowercase();
         self.headers.iter().find_map(|(k, v)| {
@@ -60,5 +60,10 @@ impl Request {
                 None
             }
         })
+    }
+
+    /// Retrieve a URL parameter by key (e.g., req.param("id"))
+    pub fn param(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(|s| s.as_str())
     }
 }

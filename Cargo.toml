@@ -11,4 +11,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.92"
+matchit = "0.9.2"
 tokio = { version = "1.54.1", features = ["full"] }
+
+[lints.clippy]
+async_fn_in_trait = "allow"
