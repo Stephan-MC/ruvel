@@ -1,6 +1,7 @@
 use super::headers::HeaderMap;
 use super::status::HttpStatus;
 use crate::http::Responsable;
+use std::io::Write;
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -173,29 +174,32 @@ impl Response {
         self
     }
 
-    /// Convert struct back to raw HTTP/1.1 bytes for TCP transmission
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(128 + self.body.len());
+    /// Writes the response directly into a pre-allocated buffer to prevent allocations.
+    /// This removes the `.to_string()` heap allocations and reuses Keep-Alive memory.
+    pub fn write_to(&self, buffer: &mut Vec<u8>) {
+        // 1. Write status line directly into the buffer
+        let _ = write!(
+            buffer,
+            "HTTP/1.1 {} {}\r\n",
+            self.status_code(),
+            self.status_message()
+        );
 
-        raw.extend_from_slice(b"HTTP/1.1 ");
-        raw.extend_from_slice(self.status_code().to_string().as_bytes());
-        raw.extend_from_slice(b" ");
-        raw.extend_from_slice(self.status_message().as_bytes());
-        raw.extend_from_slice(b"\r\nContent-Length: ");
-        raw.extend_from_slice(self.body.len().to_string().as_bytes());
-        raw.extend_from_slice(b"\r\n");
+        // 2. Write content length directly into the buffer
+        let _ = write!(buffer, "Content-Length: {}\r\n", self.body.len());
 
+        // 3. Append headers (assuming your custom HeaderMap's K/V can cast to bytes)
         for (k, v) in &self.headers {
-            raw.extend_from_slice(k.as_bytes());
-            raw.extend_from_slice(b": ");
-            raw.extend_from_slice(v.as_bytes());
-            raw.extend_from_slice(b"\r\n");
+            // Note: If HeaderMap keys/values are Strings, `.as_bytes()` works perfectly here.
+            buffer.extend_from_slice(k.as_bytes());
+            buffer.extend_from_slice(b": ");
+            buffer.extend_from_slice(v.as_bytes());
+            buffer.extend_from_slice(b"\r\n");
         }
 
-        raw.extend_from_slice(b"\r\n");
-        raw.extend_from_slice(&self.body);
-
-        raw
+        // 4. End headers and append body
+        buffer.extend_from_slice(b"\r\n");
+        buffer.extend_from_slice(&self.body);
     }
 }
 

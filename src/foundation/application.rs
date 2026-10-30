@@ -5,7 +5,7 @@ use crate::routing::Router;
 use crate::support::ServiceProvider;
 
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 
 #[derive(Default)]
@@ -72,6 +72,9 @@ impl Application {
         self.booted = true;
     }
 
+    // Make sure to add this import at the top of application.rs:
+    // use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+
     /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
     pub async fn listen(
         mut self,
@@ -88,20 +91,38 @@ impl Application {
         let router = Arc::new(self.router);
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (socket, _) = listener.accept().await?;
+            let _ = socket.set_nodelay(true);
             let router_clone = Arc::clone(&router);
 
             tokio::spawn(async move {
-                let mut buffer = [0u8; 2048]; // Slightly larger buffer for headers
+                // 1. Split the socket to buffer the write half
+                let (mut read_half, write_half) = socket.into_split();
+                let mut writer = BufWriter::new(write_half);
 
-                // Loop over the same socket connection for Keep-Alive
+                let mut read_buffer = [0u8; 2048];
+
+                // 2. Pre-allocate the response buffer EXACTLY ONCE per connection
+                let mut response_buffer = Vec::with_capacity(1024);
+
                 loop {
-                    match socket.read(&mut buffer).await {
+                    match read_half.read(&mut read_buffer).await {
                         Ok(0) => break, // Client closed connection
                         Ok(bytes_read) => {
-                            if let Some(req) = Request::parse(&buffer[..bytes_read]) {
+                            if let Some(req) = Request::parse(&read_buffer[..bytes_read]) {
                                 let response = router_clone.dispatch(req).await;
-                                if socket.write_all(&response.to_bytes()).await.is_err() {
+
+                                // 3. Reset buffer length to 0 (keeps capacity, avoids allocation)
+                                response_buffer.clear();
+
+                                // 4. Write directly into the existing buffer
+                                response.write_to(&mut response_buffer);
+
+                                // 5. Write to BufWriter and flush to the kernel
+                                if writer.write_all(&response_buffer).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
                                     break;
                                 }
                             } else {
