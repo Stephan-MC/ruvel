@@ -38,7 +38,7 @@ impl ApplicationBuilder {
         self
     }
 
-    pub fn with_middleware<F>(mut self, callback: F) -> Self
+    pub fn with_middleware<F>(self, _callback: F) -> Self
     where
         F: FnOnce(&mut MiddlewarePipeline),
     {
@@ -47,7 +47,7 @@ impl ApplicationBuilder {
         panic!("Not yet implemented");
     }
 
-    pub fn with_scheduler<F>(mut self, callback: F) -> Self
+    pub fn with_scheduler<F>(self, _callback: F) -> Self
     where
         F: FnOnce(&mut Scheduler),
     {

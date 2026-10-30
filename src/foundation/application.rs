@@ -91,7 +91,7 @@ impl Application {
         let router = Arc::new(self.router);
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
             let router_clone = Arc::clone(&router);
 
