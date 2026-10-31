@@ -59,9 +59,7 @@ impl ApplicationBuilder {
     where
         F: FnOnce(&mut Scheduler),
     {
-        // callback(&mut self.app.scheduler);
-        // self
-        panic!("Not yet implemented");
+        todo!("Not yet implemented");
     }
 
     pub fn create(self) -> Application {
