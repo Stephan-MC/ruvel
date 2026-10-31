@@ -9,16 +9,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 
 #[derive(Default)]
-pub struct MiddlewarePipeline {}
-
-#[derive(Default)]
 pub struct Scheduler {}
 
 #[derive(Default)]
 pub struct Application {
     pub container: Container,
     pub router: Router,
-    pub middleware: MiddlewarePipeline,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
     booted: bool,
@@ -30,7 +26,6 @@ impl Application {
             container: Container::new(),
             router: Router::new(),
             providers: Vec::new(),
-            middleware: MiddlewarePipeline::default(),
             scheduler: Scheduler::default(),
             booted: false,
         }
