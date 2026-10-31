@@ -1,4 +1,5 @@
 use crate::container::Container;
+use crate::foundation::Application;
 use crate::routing::Router;
 use async_trait::async_trait;
 

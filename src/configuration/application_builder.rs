@@ -10,10 +10,8 @@ pub struct ApplicationBuilder {
 }
 
 impl ApplicationBuilder {
-    pub fn new() -> Self {
-        Self {
-            app: Application::new(),
-        }
+    pub fn new(app: Application) -> Self {
+        Self { app }
     }
 
     pub async fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
@@ -37,6 +35,18 @@ impl ApplicationBuilder {
         callback(&mut self.app.router);
 
         self
+    }
+
+    pub fn with_events(self) -> Self {
+        todo!("Not implemented");
+    }
+
+    pub fn with_commands(self) -> Self {
+        todo!("Not implemented");
+    }
+
+    pub fn with_kernels(self) -> Self {
+        todo!("Not implemented");
     }
 
     pub fn with_middleware<F>(self, callback: F) -> Self

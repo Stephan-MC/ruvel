@@ -13,6 +13,7 @@ pub struct Scheduler {}
 
 #[derive(Default)]
 pub struct Application {
+    base_path: String,
     pub container: Container,
     pub router: Router,
     pub scheduler: Scheduler,
@@ -21,8 +22,9 @@ pub struct Application {
 }
 
 impl Application {
-    pub fn new() -> Self {
+    pub fn new(base_path: &str) -> Self {
         Self {
+            base_path: base_path.to_string(),
             container: Container::new(),
             router: Router::new(),
             providers: Vec::new(),
@@ -31,8 +33,10 @@ impl Application {
         }
     }
 
-    pub fn configure() -> ApplicationBuilder {
-        ApplicationBuilder::new()
+    pub fn configure(base_path: &str) -> ApplicationBuilder {
+        ApplicationBuilder::new(Self::new(base_path))
+        // .with_kernels()
+        // .with_events()
     }
 
     /// Register a service provider with the application.
