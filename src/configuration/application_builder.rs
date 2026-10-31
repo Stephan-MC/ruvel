@@ -1,8 +1,5 @@
 pub(crate) use crate::foundation::Application;
-use crate::{routing::Router, support::ServiceProvider};
-
-#[derive(Default)]
-pub struct MiddlewarePipeline {}
+use crate::{configuration::Middleware, routing::Router, support::ServiceProvider};
 
 #[derive(Default)]
 pub struct Scheduler {}
@@ -30,21 +27,32 @@ impl ApplicationBuilder {
         self
     }
 
+    /// Register a route with a specified middleware group
+    ///
+    ///
     pub fn with_routing<F>(mut self, callback: F) -> Self
     where
         F: FnOnce(&mut Router),
     {
         callback(&mut self.app.router);
+
         self
     }
 
-    pub fn with_middleware<F>(self, _callback: F) -> Self
+    pub fn with_middleware<F>(self, callback: F) -> Self
     where
-        F: FnOnce(&mut MiddlewarePipeline),
+        F: FnOnce(&Middleware),
     {
-        // callback(&mut self.app.middleware);
-        // self
-        panic!("Not yet implemented");
+        let mut middleware = Middleware::new();
+
+        callback(&middleware);
+
+        // TODO: Sync Middleware Configs with HttpKernel
+        // 1. Set global Middleware
+        // 2. Set global Middelwares group
+        // 3. Set Middleware Aliases
+
+        self
     }
 
     pub fn with_scheduler<F>(self, _callback: F) -> Self

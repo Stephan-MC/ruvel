@@ -1,5 +1,5 @@
+use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
-use crate::foundation::ApplicationBuilder;
 use crate::http::Request;
 use crate::routing::Router;
 use crate::support::ServiceProvider;
