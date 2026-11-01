@@ -75,12 +75,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_controller_methods() {
         let controller = DummyController;
-        let req = Request {
-            method: crate::http::Method::GET,
-            path: "/test".to_string(),
-            headers: std::collections::HashMap::new(),
-            body: Vec::new(),
-        };
+        let req = Request::new(crate::http::Method::GET, "/test");
 
         let res = controller.index(req).await;
         assert_eq!(res.status, HttpStatus::NotImplemented);
@@ -90,12 +85,7 @@ mod tests {
     #[tokio::test]
     async fn test_controller_responsable_return_types() {
         let controller = BlogController;
-        let dummy_req = || Request {
-            method: crate::http::Method::GET,
-            path: "/test".to_string(),
-            headers: std::collections::HashMap::new(),
-            body: Vec::new(),
-        };
+        let dummy_req = || Request::new(crate::http::Method::GET, "/test");
 
         // 1. &'static str return
         let res_str = controller.index(dummy_req()).await;

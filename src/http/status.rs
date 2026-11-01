@@ -7,7 +7,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 1xx Informational
     // -------------------------------------------------------------------------
-
     /// `100 Continue` - The server has received the request headers and the client should proceed to send the request body.
     Continue = 100,
 
@@ -23,7 +22,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 2xx Success
     // -------------------------------------------------------------------------
-
     /// `200 OK` - Standard response for successful HTTP requests.
     Ok = 200,
 
@@ -57,7 +55,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 3xx Redirection
     // -------------------------------------------------------------------------
-
     /// `300 Multiple Choices` - Indicates multiple options for the resource from which the client may choose.
     MultipleChoices = 300,
 
@@ -85,7 +82,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 4xx Client Errors
     // -------------------------------------------------------------------------
-
     /// `400 Bad Request` - The server cannot or will not process the request due to an apparent client error.
     BadRequest = 400,
 
@@ -176,7 +172,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 5xx Server Errors
     // -------------------------------------------------------------------------
-
     /// `500 Internal Server Error` - A generic error message given when an unexpected condition was encountered.
     InternalServerError = 500,
 
@@ -404,7 +399,10 @@ mod tests {
         assert_eq!(HttpStatus::NotFound.message(), "Not Found");
 
         assert_eq!(HttpStatus::InternalServerError.code(), 500);
-        assert_eq!(HttpStatus::InternalServerError.message(), "Internal Server Error");
+        assert_eq!(
+            HttpStatus::InternalServerError.message(),
+            "Internal Server Error"
+        );
     }
 
     #[test]
