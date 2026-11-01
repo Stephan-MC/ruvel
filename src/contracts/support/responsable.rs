@@ -1,4 +1,4 @@
-use crate::http::{HttpStatus, Response};
+use crate::http::{Response, Status};
 use std::borrow::Cow;
 
 /// Equivalent to Laravel's `Illuminate\Contracts\Support\Responsable`.
@@ -36,7 +36,7 @@ impl Responsable for Box<str> {
 }
 
 // 3. Status + Content tuples
-impl<T: Responsable> Responsable for (HttpStatus, T) {
+impl<T: Responsable> Responsable for (Status, T) {
     fn to_response(self) -> Response {
         let mut res = self.1.to_response();
         res.set_status(self.0);
@@ -53,7 +53,7 @@ impl Responsable for () {
 impl<T: Responsable> Responsable for (u16, T) {
     fn to_response(self) -> Response {
         let mut res = self.1.to_response();
-        if let Some(status) = HttpStatus::from_code(self.0) {
+        if let Some(status) = Status::from_code(self.0) {
             res.set_status(status);
         }
         res
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn test_str_to_response() {
         let res = "<h1>Hello World</h1>".to_response();
-        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.status, Status::Ok);
         assert_eq!(res.status.code(), 200);
         assert_eq!(String::from_utf8(res.body).unwrap(), "<h1>Hello World</h1>");
         assert_eq!(
@@ -80,7 +80,7 @@ mod tests {
     fn test_string_to_response() {
         let text = format!("<p>Dynamic {}</p>", 42);
         let res = text.to_response();
-        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.status, Status::Ok);
         assert_eq!(res.status.code(), 200);
         assert_eq!(String::from_utf8(res.body).unwrap(), "<p>Dynamic 42</p>");
         assert_eq!(
@@ -91,8 +91,8 @@ mod tests {
 
     #[test]
     fn test_tuple_with_status_to_response() {
-        let res = (HttpStatus::Created, "<p>Item Created</p>").to_response();
-        assert_eq!(res.status, HttpStatus::Created);
+        let res = (Status::Created, "<p>Item Created</p>").to_response();
+        assert_eq!(res.status, Status::Created);
         assert_eq!(res.status.code(), 201);
         assert_eq!(String::from_utf8(res.body).unwrap(), "<p>Item Created</p>");
         assert_eq!(

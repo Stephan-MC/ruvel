@@ -47,7 +47,7 @@ pub trait Controller: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::HttpStatus;
+    use crate::http::Status;
 
     struct DummyController;
 
@@ -63,7 +63,7 @@ mod tests {
 
         // Returns status tuple via .to_response()
         async fn store(&self, _req: Request) -> impl Responsable {
-            (HttpStatus::Created, format!("Post created: {}", 1)).to_response()
+            (Status::Created, format!("Post created: {}", 1)).to_response()
         }
 
         // Returns Response directly
@@ -78,7 +78,7 @@ mod tests {
         let req = Request::new(crate::http::Method::GET, "/test");
 
         let res = controller.index(req).await;
-        assert_eq!(res.status, HttpStatus::NotImplemented);
+        assert_eq!(res.status, Status::NotImplemented);
         assert_eq!(res.status.code(), 501);
     }
 
@@ -89,13 +89,13 @@ mod tests {
 
         // 1. &'static str return
         let res_str = controller.index(dummy_req()).await;
-        assert_eq!(res_str.status, HttpStatus::Ok);
+        assert_eq!(res_str.status, Status::Ok);
         assert_eq!(res_str.status.code(), 200);
         assert_eq!(String::from_utf8(res_str.body).unwrap(), "Blog Index");
 
         // 2. (HttpStatus, String) return
         let res_tuple = controller.store(dummy_req()).await;
-        assert_eq!(res_tuple.status, HttpStatus::Created);
+        assert_eq!(res_tuple.status, Status::Created);
         assert_eq!(res_tuple.status.code(), 201);
         assert_eq!(
             String::from_utf8(res_tuple.body).unwrap(),
@@ -104,7 +104,7 @@ mod tests {
 
         // 3. Response return
         let res_resp = controller.show(dummy_req()).await;
-        assert_eq!(res_resp.status, HttpStatus::Ok);
+        assert_eq!(res_resp.status, Status::Ok);
         assert_eq!(res_resp.status.code(), 200);
         assert_eq!(String::from_utf8(res_resp.body).unwrap(), r#"{"id": 1}"#);
     }

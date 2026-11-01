@@ -11,4 +11,4 @@ pub use headers::{HeaderMap, Headers};
 pub use middleware::Middleware;
 pub use request::{Method, Request};
 pub use response::Response;
-pub use status::{HttpStatus, StatusCode};
+pub use status::{Status, StatusCode};

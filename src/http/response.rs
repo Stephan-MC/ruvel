@@ -1,12 +1,12 @@
 use super::headers::HeaderMap;
-use super::status::HttpStatus;
+use super::status::Status;
 use crate::http::Responsable;
 use std::io::Write;
 
 #[derive(Debug, Clone)]
 pub struct Response {
     /// The HTTP status (code + message) of the response.
-    pub status: HttpStatus,
+    pub status: Status,
     /// Case-insensitive HTTP response headers.
     pub headers: HeaderMap,
     pub body: Vec<u8>,
@@ -84,7 +84,7 @@ impl Response {
 
     /// Create a new Response initialized from an [`HttpStatus`].
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
-    pub fn new(status: HttpStatus) -> Self {
+    pub fn new(status: Status) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", "text/html; charset=utf-8");
         Self {
@@ -97,36 +97,36 @@ impl Response {
     /// Create a new Response initialized from a numeric status code.
     /// Returns [`None`] if the code is not a recognized HTTP status code.
     pub fn from_code(code: u16) -> Option<Self> {
-        HttpStatus::from_code(code).map(Self::new)
+        Status::from_code(code).map(Self::new)
     }
 
     /// Convenience constructor with [`HttpStatus`].
-    pub fn status(status: HttpStatus) -> Self {
+    pub fn status(status: Status) -> Self {
         Self::new(status)
     }
 
     pub fn ok() -> Self {
-        Self::new(HttpStatus::Ok)
+        Self::new(Status::Ok)
     }
 
     pub fn created() -> Self {
-        Self::new(HttpStatus::Created)
+        Self::new(Status::Created)
     }
 
     pub fn no_content() -> Self {
-        Self::new(HttpStatus::NoContent)
+        Self::new(Status::NoContent)
     }
 
     pub fn bad_request() -> Self {
-        Self::new(HttpStatus::BadRequest)
+        Self::new(Status::BadRequest)
     }
 
     pub fn not_found() -> Self {
-        Self::new(HttpStatus::NotFound)
+        Self::new(Status::NotFound)
     }
 
     pub fn not_implemented() -> Self {
-        Self::new(HttpStatus::NotImplemented)
+        Self::new(Status::NotImplemented)
     }
 
     /// Helper to get the status code as u16.
@@ -140,7 +140,7 @@ impl Response {
     }
 
     /// Set or change the response status.
-    pub fn set_status(&mut self, status: HttpStatus) -> &mut Self {
+    pub fn set_status(&mut self, status: Status) -> &mut Self {
         self.status = status;
         self
     }
@@ -210,17 +210,17 @@ mod tests {
     #[test]
     fn test_response_status_property_code_and_message() {
         let res = Response::ok();
-        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.status, Status::Ok);
         assert_eq!(res.status.code(), 200);
         assert_eq!(res.status.message(), "OK");
 
         let created_res = Response::created();
-        assert_eq!(created_res.status, HttpStatus::Created);
+        assert_eq!(created_res.status, Status::Created);
         assert_eq!(created_res.status.code(), 201);
         assert_eq!(created_res.status.message(), "Created");
 
         let not_found_res = Response::not_found();
-        assert_eq!(not_found_res.status, HttpStatus::NotFound);
+        assert_eq!(not_found_res.status, Status::NotFound);
         assert_eq!(not_found_res.status.code(), 404);
         assert_eq!(not_found_res.status.message(), "Not Found");
     }
@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn test_response_new_with_http_status_enum() {
-        let res = Response::new(HttpStatus::Accepted).text("Task queued");
-        assert_eq!(res.status, HttpStatus::Accepted);
+        let res = Response::new(Status::Accepted).text("Task queued");
+        assert_eq!(res.status, Status::Accepted);
         assert_eq!(res.status.code(), 202);
         assert_eq!(res.status.message(), "Accepted");
     }
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_response_from_code() {
         let res = Response::from_code(Response::HTTP_CREATED).unwrap();
-        assert_eq!(res.status, HttpStatus::Created);
+        assert_eq!(res.status, Status::Created);
         assert_eq!(res.status.code(), 201);
         assert_eq!(res.status.message(), "Created");
 
@@ -259,10 +259,10 @@ mod tests {
     #[test]
     fn test_response_set_status() {
         let mut res = Response::ok();
-        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.status, Status::Ok);
 
-        res.set_status(HttpStatus::Forbidden);
-        assert_eq!(res.status, HttpStatus::Forbidden);
+        res.set_status(Status::Forbidden);
+        assert_eq!(res.status, Status::Forbidden);
         assert_eq!(res.status.code(), 403);
         assert_eq!(res.status.message(), "Forbidden");
     }
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_response_to_bytes() {
-        let res = Response::new(HttpStatus::Created).html("Created entity");
+        let res = Response::new(Status::Created).html("Created entity");
         let bytes = res.to_bytes();
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.starts_with("HTTP/1.1 201 Created\r\n"));

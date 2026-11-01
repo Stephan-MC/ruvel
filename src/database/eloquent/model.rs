@@ -1,9 +1,9 @@
-use crate::http::{HttpStatus, Responsable, Response};
+use crate::http::{Responsable, Response, Status};
 
 pub struct Model {}
 
 impl Responsable for Model {
     fn to_response(self) -> Response {
-        Response::new(HttpStatus::Ok)
+        Response::new(Status::Ok)
     }
 }
