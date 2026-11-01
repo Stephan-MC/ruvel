@@ -1,43 +1,44 @@
+use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
-use crate::foundation::ApplicationBuilder;
 use crate::http::Request;
 use crate::routing::Router;
 use crate::support::ServiceProvider;
 
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[derive(Default)]
-pub struct MiddlewarePipeline {}
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct Scheduler {}
 
 #[derive(Default)]
 pub struct Application {
+    base_path: String,
     pub container: Container,
     pub router: Router,
-    pub middleware: MiddlewarePipeline,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
     booted: bool,
 }
 
 impl Application {
-    pub fn new() -> Self {
+    pub fn new(base_path: &str) -> Self {
         Self {
+            base_path: base_path.to_string(),
             container: Container::new(),
             router: Router::new(),
             providers: Vec::new(),
-            middleware: MiddlewarePipeline::default(),
             scheduler: Scheduler::default(),
             booted: false,
         }
     }
 
-    pub fn configure() -> ApplicationBuilder {
-        ApplicationBuilder::new()
+    pub fn configure(base_path: &str) -> ApplicationBuilder {
+        ApplicationBuilder::new(Self::new(base_path))
+        // .with_kernels()
+        // .with_events()
     }
 
     /// Register a service provider with the application.
@@ -72,9 +73,6 @@ impl Application {
         self.booted = true;
     }
 
-    // Make sure to add this import at the top of application.rs:
-    // use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-
     /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
     pub async fn listen(
         mut self,
@@ -91,45 +89,77 @@ impl Application {
         let router = Arc::new(self.router);
 
         loop {
-            let (socket, _) = listener.accept().await?;
+            let (mut socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
             let router_clone = Arc::clone(&router);
 
             tokio::spawn(async move {
-                // 1. Split the socket to buffer the write half
-                let (mut read_half, write_half) = socket.into_split();
-                let mut writer = BufWriter::new(write_half);
-
-                let mut read_buffer = [0u8; 2048];
-
-                // 2. Pre-allocate the response buffer EXACTLY ONCE per connection
+                // 1. Fixed-size chunk for reading from the OS network stack
+                let mut chunk = [0u8; 2048];
+                // 2. Buffer for assembling fragmented packets and handling pipelining
+                let mut read_buffer = Vec::with_capacity(2048);
+                // 3. Pre-allocated response buffer (used repeatedly for keep-alive)
                 let mut response_buffer = Vec::with_capacity(1024);
 
-                loop {
-                    match read_half.read(&mut read_buffer).await {
-                        Ok(0) => break, // Client closed connection
-                        Ok(bytes_read) => {
-                            if let Some(req) = Request::parse(&read_buffer[..bytes_read]) {
-                                let response = router_clone.dispatch(req).await;
-
-                                // 3. Reset buffer length to 0 (keeps capacity, avoids allocation)
-                                response_buffer.clear();
-
-                                // 4. Write directly into the existing buffer
-                                response.write_to(&mut response_buffer);
-
-                                // 5. Write to BufWriter and flush to the kernel
-                                if writer.write_all(&response_buffer).await.is_err() {
-                                    break;
-                                }
-                                if writer.flush().await.is_err() {
-                                    break;
-                                }
-                            } else {
+                'connection: loop {
+                    // Read directly from the raw TCP socket
+                    match socket.read(&mut chunk).await {
+                        Ok(0) => break, // Client gracefully closed connection
+                        Ok(n) => {
+                            // Security: Prevent buffer overflow / memory exhaustion
+                            if read_buffer.len().saturating_add(n) > MAX_REQUEST_BYTES {
                                 break;
                             }
+                            read_buffer.extend_from_slice(&chunk[..n]);
+
+                            let mut offset = 0;
+                            loop {
+                                if offset >= read_buffer.len() {
+                                    // Fully consumed. `clear` keeps the allocation for the next read.
+                                    read_buffer.clear();
+                                    break;
+                                }
+
+                                // Attempt to parse a complete request from the unconsumed tail.
+                                let (req, consumed) = match Request::parse(&read_buffer[offset..]) {
+                                    Ok(Some(parsed)) => parsed,
+                                    Ok(None) => {
+                                        // One shift per read, and only when a previous request
+                                        // in this read left a partial one behind.
+                                        if offset > 0 {
+                                            read_buffer.drain(..offset);
+                                        }
+                                        break;
+                                    }
+                                    Err(()) => break 'connection, // Malformed payload, drop connection
+                                };
+
+                                let Some(end) = offset.checked_add(consumed) else {
+                                    break 'connection;
+                                };
+                                if consumed == 0 || end > read_buffer.len() {
+                                    break 'connection;
+                                }
+
+                                // Dispatch to the Router
+                                let response = router_clone.dispatch(req).await;
+
+                                // Reset the response buffer (keeps capacity)
+                                response_buffer.clear();
+
+                                // Format your response into the contiguous Vec<u8>
+                                response.write_to(&mut response_buffer);
+
+                                // Performance: A single write_all syscall directly to the kernel,
+                                // completely bypassing the overhead of BufWriter.
+                                if socket.write_all(&response_buffer).await.is_err() {
+                                    break 'connection;
+                                }
+
+                                offset = end;
+                            }
                         }
-                        Err(_) => break,
+                        Err(_) => break, // Network error
                     }
                 }
             });

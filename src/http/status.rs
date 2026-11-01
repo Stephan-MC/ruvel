@@ -3,11 +3,10 @@
 /// Each variant represents a standardized HTTP status code with its numeric value as discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
-pub enum HttpStatus {
+pub enum Status {
     // -------------------------------------------------------------------------
     // 1xx Informational
     // -------------------------------------------------------------------------
-
     /// `100 Continue` - The server has received the request headers and the client should proceed to send the request body.
     Continue = 100,
 
@@ -23,7 +22,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 2xx Success
     // -------------------------------------------------------------------------
-
     /// `200 OK` - Standard response for successful HTTP requests.
     Ok = 200,
 
@@ -57,7 +55,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 3xx Redirection
     // -------------------------------------------------------------------------
-
     /// `300 Multiple Choices` - Indicates multiple options for the resource from which the client may choose.
     MultipleChoices = 300,
 
@@ -85,7 +82,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 4xx Client Errors
     // -------------------------------------------------------------------------
-
     /// `400 Bad Request` - The server cannot or will not process the request due to an apparent client error.
     BadRequest = 400,
 
@@ -176,7 +172,6 @@ pub enum HttpStatus {
     // -------------------------------------------------------------------------
     // 5xx Server Errors
     // -------------------------------------------------------------------------
-
     /// `500 Internal Server Error` - A generic error message given when an unexpected condition was encountered.
     InternalServerError = 500,
 
@@ -211,7 +206,7 @@ pub enum HttpStatus {
     NetworkAuthenticationRequired = 511,
 }
 
-impl HttpStatus {
+impl Status {
     /// Returns the numerical HTTP status code (e.g. 200, 201, 404).
     #[inline]
     pub const fn code(&self) -> u16 {
@@ -296,14 +291,14 @@ impl HttpStatus {
     }
 }
 
-impl From<HttpStatus> for u16 {
+impl From<Status> for u16 {
     #[inline]
-    fn from(status: HttpStatus) -> Self {
+    fn from(status: Status) -> Self {
         status.code()
     }
 }
 
-impl TryFrom<u16> for HttpStatus {
+impl TryFrom<u16> for Status {
     type Error = ();
 
     fn try_from(code: u16) -> Result<Self, Self::Error> {
@@ -380,13 +375,13 @@ impl TryFrom<u16> for HttpStatus {
     }
 }
 
-impl std::fmt::Display for HttpStatus {
+impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.code(), self.message())
     }
 }
 
-pub type StatusCode = HttpStatus;
+pub type StatusCode = Status;
 
 #[cfg(test)]
 mod tests {
@@ -394,39 +389,42 @@ mod tests {
 
     #[test]
     fn test_status_code_and_message() {
-        assert_eq!(HttpStatus::Ok.code(), 200);
-        assert_eq!(HttpStatus::Ok.message(), "OK");
+        assert_eq!(Status::Ok.code(), 200);
+        assert_eq!(Status::Ok.message(), "OK");
 
-        assert_eq!(HttpStatus::Created.code(), 201);
-        assert_eq!(HttpStatus::Created.message(), "Created");
+        assert_eq!(Status::Created.code(), 201);
+        assert_eq!(Status::Created.message(), "Created");
 
-        assert_eq!(HttpStatus::NotFound.code(), 404);
-        assert_eq!(HttpStatus::NotFound.message(), "Not Found");
+        assert_eq!(Status::NotFound.code(), 404);
+        assert_eq!(Status::NotFound.message(), "Not Found");
 
-        assert_eq!(HttpStatus::InternalServerError.code(), 500);
-        assert_eq!(HttpStatus::InternalServerError.message(), "Internal Server Error");
+        assert_eq!(Status::InternalServerError.code(), 500);
+        assert_eq!(
+            Status::InternalServerError.message(),
+            "Internal Server Error"
+        );
     }
 
     #[test]
     fn test_from_code() {
-        assert_eq!(HttpStatus::from_code(200), Some(HttpStatus::Ok));
-        assert_eq!(HttpStatus::from_code(201), Some(HttpStatus::Created));
-        assert_eq!(HttpStatus::from_code(404), Some(HttpStatus::NotFound));
-        assert_eq!(HttpStatus::from_code(999), None);
+        assert_eq!(Status::from_code(200), Some(Status::Ok));
+        assert_eq!(Status::from_code(201), Some(Status::Created));
+        assert_eq!(Status::from_code(404), Some(Status::NotFound));
+        assert_eq!(Status::from_code(999), None);
     }
 
     #[test]
     fn test_from_and_into_u16() {
-        let code: u16 = HttpStatus::Accepted.into();
+        let code: u16 = Status::Accepted.into();
         assert_eq!(code, 202);
 
-        let status = HttpStatus::try_from(204).unwrap();
-        assert_eq!(status, HttpStatus::NoContent);
+        let status = Status::try_from(204).unwrap();
+        assert_eq!(status, Status::NoContent);
     }
 
     #[test]
     fn test_display() {
-        assert_eq!(format!("{}", HttpStatus::Ok), "200 OK");
-        assert_eq!(format!("{}", HttpStatus::NotFound), "404 Not Found");
+        assert_eq!(format!("{}", Status::Ok), "200 OK");
+        assert_eq!(format!("{}", Status::NotFound), "404 Not Found");
     }
 }
