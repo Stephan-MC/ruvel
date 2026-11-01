@@ -8,7 +8,7 @@ mod status;
 pub use crate::contracts::support::Responsable;
 pub use controllers::Controller;
 pub use headers::{HeaderMap, Headers};
-pub use middleware::Middleware;
+pub use middleware::{BoxFuture, Middleware, Next, Pipeline};
 pub use request::{Method, Request};
 pub use response::Response;
 pub use status::{Status, StatusCode};

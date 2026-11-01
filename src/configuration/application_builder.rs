@@ -49,18 +49,20 @@ impl ApplicationBuilder {
         todo!("Not implemented");
     }
 
-    pub fn with_middleware<F>(self, callback: F) -> Self
+    /// Configure global middleware, groups, and aliases, then install them on the router.
+    pub fn with_middleware<F>(mut self, callback: F) -> Self
     where
-        F: FnOnce(&Middleware),
+        F: FnOnce(&mut Middleware),
     {
         let mut middleware = Middleware::new();
+        callback(&mut middleware);
 
-        callback(&middleware);
-
-        // TODO: Sync Middleware Configs with HttpKernel
-        // 1. Set global Middleware
-        // 2. Set global Middelwares group
-        // 3. Set Middleware Aliases
+        let resolved = middleware.resolve();
+        self.app.router.install_middleware(
+            resolved.global,
+            resolved.groups,
+            resolved.aliases,
+        );
 
         self
     }
