@@ -1,5 +1,5 @@
 pub mod config;
-mod configuration;
+pub mod configuration;
 pub mod container;
 pub mod contracts;
 pub mod database;

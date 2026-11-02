@@ -8,12 +8,15 @@ authors = ['Stephan Munde <mundestephane13@gmail.com>']
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 
-
 [dependencies]
 async-trait = "0.1.92"
 httparse = "1.10.1"
 matchit = "0.9.2"
 tokio = { version = "1.54.1", features = ["full"] }
+
+[[bench]]
+name = "middleware_profile"
+harness = false
 
 [lints.clippy]
 async_fn_in_trait = "allow"

@@ -18,6 +18,86 @@ impl Layer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{BoxFuture, Next, Request, Response};
+
+    struct M1;
+    struct M2;
+    struct M3;
+    struct Replacement;
+
+    impl HttpMiddleware for M1 {
+        fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxFuture<'a, Response> {
+            Box::pin(async move { next.run(request).await })
+        }
+    }
+
+    impl HttpMiddleware for M2 {
+        fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxFuture<'a, Response> {
+            Box::pin(async move { next.run(request).await })
+        }
+    }
+
+    impl HttpMiddleware for M3 {
+        fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxFuture<'a, Response> {
+            Box::pin(async move { next.run(request).await })
+        }
+    }
+
+    impl HttpMiddleware for Replacement {
+        fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxFuture<'a, Response> {
+            Box::pin(async move { next.run(request).await })
+        }
+    }
+
+    #[test]
+    fn test_prepend_and_append_ordering() {
+        let mut mw = Middleware::new();
+        mw.append(M2);
+        mw.prepend(M1);
+        mw.append(M3);
+
+        let resolved = mw.resolve();
+        assert_eq!(resolved.global.len(), 3);
+    }
+
+    #[test]
+    fn test_removal() {
+        let mut mw = Middleware::new();
+        mw.append(M1);
+        mw.append(M2);
+        mw.append(M3);
+        mw.remove::<M2>();
+
+        let resolved = mw.resolve();
+        assert_eq!(resolved.global.len(), 2);
+    }
+
+    #[test]
+    fn test_replacement() {
+        let mut mw = Middleware::new();
+        mw.append(M1);
+        mw.append(M2);
+        mw.replace::<M2, Replacement>(Replacement);
+
+        let resolved = mw.resolve();
+        assert_eq!(resolved.global.len(), 2);
+    }
+
+    #[test]
+    fn test_groups_and_aliases() {
+        let mut mw = Middleware::new();
+        mw.group("api", vec![Arc::new(M1), Arc::new(M2)]);
+        mw.alias("auth", M3);
+
+        let resolved = mw.resolve();
+        assert_eq!(resolved.groups.get("api").unwrap().len(), 2);
+        assert!(resolved.aliases.contains_key("auth"));
+    }
+}
+
 /// Laravel-style middleware configuration.
 ///
 /// Global middleware run on every request, from the outside in:
