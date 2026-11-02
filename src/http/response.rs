@@ -174,6 +174,13 @@ impl Response {
         self
     }
 
+    /// Serialize this response into a new buffer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(128 + self.body.len());
+        self.write_to(&mut buffer);
+        buffer
+    }
+
     /// Writes the response directly into a pre-allocated buffer to prevent allocations.
     /// This removes the `.to_string()` heap allocations and reuses Keep-Alive memory.
     pub fn write_to(&self, buffer: &mut Vec<u8>) {

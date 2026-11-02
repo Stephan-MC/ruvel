@@ -77,7 +77,7 @@ mod tests {
         let controller = DummyController;
         let req = Request::new(crate::http::Method::GET, "/test");
 
-        let res = controller.index(req).await;
+        let res = controller.index(req).await.to_response();
         assert_eq!(res.status, Status::NotImplemented);
         assert_eq!(res.status.code(), 501);
     }
@@ -88,13 +88,13 @@ mod tests {
         let dummy_req = || Request::new(crate::http::Method::GET, "/test");
 
         // 1. &'static str return
-        let res_str = controller.index(dummy_req()).await;
+        let res_str = controller.index(dummy_req()).await.to_response();
         assert_eq!(res_str.status, Status::Ok);
         assert_eq!(res_str.status.code(), 200);
         assert_eq!(String::from_utf8(res_str.body).unwrap(), "Blog Index");
 
         // 2. (HttpStatus, String) return
-        let res_tuple = controller.store(dummy_req()).await;
+        let res_tuple = controller.store(dummy_req()).await.to_response();
         assert_eq!(res_tuple.status, Status::Created);
         assert_eq!(res_tuple.status.code(), 201);
         assert_eq!(
@@ -103,7 +103,7 @@ mod tests {
         );
 
         // 3. Response return
-        let res_resp = controller.show(dummy_req()).await;
+        let res_resp = controller.show(dummy_req()).await.to_response();
         assert_eq!(res_resp.status, Status::Ok);
         assert_eq!(res_resp.status.code(), 200);
         assert_eq!(String::from_utf8(res_resp.body).unwrap(), r#"{"id": 1}"#);
