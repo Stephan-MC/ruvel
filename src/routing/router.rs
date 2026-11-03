@@ -1,4 +1,4 @@
-use crate::contracts::Responsable;
+use crate::contracts::support::Responsable;
 use crate::http::{BoxFuture, Next}; // Note: Pipeline is removed, Next is imported
 use crate::http::{Method, Middleware, Request, Response};
 use matchit::Router as MatchitRouter; // Alias to avoid naming conflicts
