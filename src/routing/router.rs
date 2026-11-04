@@ -1,7 +1,8 @@
 use crate::contracts::support::Responsable;
-use crate::http::{BoxFuture, Next}; // Note: Pipeline is removed, Next is imported
+use crate::http::{BoxFuture, Next};
 use crate::http::{Method, Middleware, Request, Response};
-use matchit::Router as MatchitRouter; // Alias to avoid naming conflicts
+use matchit::Router as MatchitRouter;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -168,9 +169,9 @@ impl Router {
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
         let (handler, pipeline) = if let Some(method_router) = self.routes.get(&req.method) {
             if let Ok(matched) = method_router.at(&req.path) {
-                // Warning: HashMap insertion here is the last remaining minor allocation
+                // Populate inline RouteParams without allocating dynamic HashMap nodes
                 for (key, value) in matched.params.iter() {
-                    req.params.insert(key.to_string(), value.to_string());
+                    req.params.insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
                 }
 
                 (&matched.value.handler, &matched.value.pipeline)

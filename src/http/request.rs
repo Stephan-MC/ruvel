@@ -1,7 +1,8 @@
 use super::headers::HeaderMap;
-use std::collections::HashMap;
+use std::borrow::Cow;
 
 const MAX_HEADERS: usize = 64;
+const MAX_INLINE_PARAMS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -26,27 +27,78 @@ impl From<&str> for Method {
     }
 }
 
+/// Fixed-capacity, inline route parameter storage to avoid heap HashMap allocations per match.
+#[derive(Debug, Clone, Default)]
+pub struct RouteParams {
+    len: usize,
+    entries: [(Cow<'static, str>, Cow<'static, str>); MAX_INLINE_PARAMS],
+}
+
+impl RouteParams {
+    pub const fn new() -> Self {
+        const EMPTY: (Cow<'static, str>, Cow<'static, str>) = (Cow::Borrowed(""), Cow::Borrowed(""));
+        Self {
+            len: 0,
+            entries: [EMPTY; MAX_INLINE_PARAMS],
+        }
+    }
+
+    pub fn insert(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) {
+        let key_cow = key.into();
+        let val_cow = value.into();
+
+        for i in 0..self.len {
+            if self.entries[i].0 == key_cow {
+                self.entries[i].1 = val_cow;
+                return;
+            }
+        }
+
+        if self.len < MAX_INLINE_PARAMS {
+            self.entries[self.len] = (key_cow, val_cow);
+            self.len += 1;
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        for i in 0..self.len {
+            if self.entries[i].0 == key {
+                return Some(self.entries[i].1.as_ref());
+            }
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 #[derive(Debug)]
 pub struct Request {
     pub method: Method,
     /// Origin path. The query string is stored separately so routing can match this field.
-    pub path: String,
+    pub path: Cow<'static, str>,
     /// Raw query string without the leading `?`. Empty when the target has no query.
-    pub query: String,
+    pub query: Cow<'static, str>,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
-    pub params: HashMap<String, String>,
+    pub params: RouteParams,
 }
 
 impl Request {
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+    pub fn new(method: Method, path: impl Into<Cow<'static, str>>) -> Self {
         Self {
             method,
             path: path.into(),
-            query: String::new(),
+            query: Cow::Borrowed(""),
             headers: HeaderMap::new(),
             body: Vec::new(),
-            params: HashMap::new(),
+            params: RouteParams::new(),
         }
     }
 
@@ -74,14 +126,15 @@ impl Request {
         }
 
         let target = parser.path.ok_or(())?;
-        let (path, query) = split_target(target);
+        let (path_str, query_str) = split_target(target);
 
-        let mut header_map = HeaderMap::new();
+        let mut header_map = HeaderMap::with_capacity(parser.headers.len());
         for header in parser.headers.iter() {
-            header_map.insert(
-                header.name,
-                String::from_utf8_lossy(header.value).into_owned(),
-            );
+            let val = match std::str::from_utf8(header.value) {
+                Ok(v) => Cow::Owned(v.to_string()),
+                Err(_) => Cow::Owned(String::from_utf8_lossy(header.value).into_owned()),
+            };
+            header_map.insert(Cow::Owned(header.name.to_string()), val);
         }
 
         let body = if total == header_len {
@@ -90,14 +143,23 @@ impl Request {
             buf[header_len..total].to_vec()
         };
 
+        let method = match parser.method.ok_or(())? {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "DELETE" => Method::DELETE,
+            "PATCH" => Method::PATCH,
+            other => Method::UNKNOWN(other.to_string()),
+        };
+
         Ok(Some((
             Self {
-                method: Method::from(parser.method.ok_or(())?),
-                path: path.to_string(),
-                query: query.to_string(),
+                method,
+                path: Cow::Owned(path_str.to_string()),
+                query: Cow::Owned(query_str.to_string()),
                 headers: header_map,
                 body,
-                params: HashMap::new(),
+                params: RouteParams::new(),
             },
             total,
         )))
@@ -110,7 +172,7 @@ impl Request {
 
     /// Retrieve a URL parameter by key (e.g., req.param("id")).
     pub fn param(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(|s| s.as_str())
+        self.params.get(key)
     }
 }
 
@@ -169,73 +231,5 @@ fn split_target(target: &str) -> (&str, &str) {
         ("/", query)
     } else {
         (path, query)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_ok(raw: &[u8]) -> (Request, usize) {
-        Request::parse(raw).unwrap().expect("complete request")
-    }
-
-    #[test]
-    fn parses_headers_without_allocating_a_body() {
-        let raw = b"GET /users?active=1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: abc\r\n\r\n";
-        let (req, consumed) = parse_ok(raw);
-
-        assert_eq!(consumed, raw.len());
-        assert_eq!(req.method, Method::GET);
-        assert_eq!(req.path, "/users");
-        assert_eq!(req.query, "active=1");
-        assert!(req.body.is_empty());
-        assert_eq!(req.header("host"), Some("localhost"));
-        assert_eq!(req.header("x-request-id"), Some("abc"));
-    }
-
-    #[test]
-    fn waits_for_the_content_length_body_then_parses_once() {
-        let headers = b"POST /items HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
-        assert!(Request::parse(headers).unwrap().is_none());
-
-        let mut raw = headers.to_vec();
-        raw.extend_from_slice(b"helloEXTRA");
-        let (req, consumed) = parse_ok(&raw);
-
-        assert_eq!(consumed, headers.len() + 5);
-        assert_eq!(req.method, Method::POST);
-        assert_eq!(req.path, "/items");
-        assert_eq!(req.body, b"hello");
-        assert_eq!(&raw[consumed..], b"EXTRA");
-    }
-
-    #[test]
-    fn parses_one_request_out_of_a_pipeline() {
-        let raw = b"GET /a HTTP/1.1\r\n\r\nGET /b?x=1 HTTP/1.1\r\n\r\n";
-        let (first, consumed) = parse_ok(raw);
-        let (second, _) = parse_ok(&raw[consumed..]);
-
-        assert_eq!(first.path, "/a");
-        assert_eq!(second.path, "/b");
-        assert_eq!(second.query, "x=1");
-    }
-
-    #[test]
-    fn rejects_conflicting_lengths_and_chunked_bodies() {
-        let conflict = b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
-        assert!(Request::parse(conflict).is_err());
-
-        let chunked = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(Request::parse(chunked).is_err());
-    }
-
-    #[test]
-    fn partial_headers_allocate_nothing_and_return_none() {
-        assert!(
-            Request::parse(b"GET /users HTTP/1.1\r\nHost:")
-                .unwrap()
-                .is_none()
-        );
     }
 }

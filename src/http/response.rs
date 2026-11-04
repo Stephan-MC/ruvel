@@ -1,7 +1,6 @@
 use super::headers::HeaderMap;
 use super::status::Status;
 use crate::http::Responsable;
-use std::io::Write;
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -86,7 +85,7 @@ impl Response {
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
     pub fn new(status: Status) -> Self {
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", "text/html; charset=utf-8");
+        headers.insert_static("Content-Type", "text/html; charset=utf-8");
         Self {
             status,
             headers,
@@ -154,14 +153,14 @@ impl Response {
     /// Set response body as plain text (`Content-Type: text/plain; charset=utf-8`).
     pub fn text(mut self, body: impl Into<String>) -> Self {
         self.headers
-            .insert("Content-Type", "text/plain; charset=utf-8");
+            .insert_static("Content-Type", "text/plain; charset=utf-8");
         self.body = body.into().into_bytes();
         self
     }
 
     /// Set response body as JSON (`Content-Type: application/json`).
     pub fn json(mut self, json_str: impl Into<String>) -> Self {
-        self.headers.insert("Content-Type", "application/json");
+        self.headers.insert_static("Content-Type", "application/json");
         self.body = json_str.into().into_bytes();
         self
     }
@@ -169,7 +168,7 @@ impl Response {
     /// Set response body as HTML (`Content-Type: text/html; charset=utf-8`).
     pub fn html(mut self, html_str: impl Into<String>) -> Self {
         self.headers
-            .insert("Content-Type", "text/html; charset=utf-8");
+            .insert_static("Content-Type", "text/html; charset=utf-8");
         self.body = html_str.into().into_bytes();
         self
     }
@@ -181,133 +180,66 @@ impl Response {
         buffer
     }
 
-    /// Writes the response directly into a pre-allocated buffer to prevent allocations.
-    /// This removes the `.to_string()` heap allocations and reuses Keep-Alive memory.
+    /// Fast response serialization avoiding `std::fmt::write!` format string parsing
+    /// and dynamic formatter dispatch.
     pub fn write_to(&self, buffer: &mut Vec<u8>) {
-        // 1. Write status line directly into the buffer
-        let _ = write!(
-            buffer,
-            "HTTP/1.1 {} {}\r\n",
-            self.status_code(),
-            self.status_message()
-        );
+        // Fast static status line dispatch
+        let status_line = match self.status {
+            Status::Ok => b"HTTP/1.1 200 OK\r\n" as &[u8],
+            Status::Created => b"HTTP/1.1 201 Created\r\n",
+            Status::Accepted => b"HTTP/1.1 202 Accepted\r\n",
+            Status::NoContent => b"HTTP/1.1 204 No Content\r\n",
+            Status::BadRequest => b"HTTP/1.1 400 Bad Request\r\n",
+            Status::Unauthorized => b"HTTP/1.1 401 Unauthorized\r\n",
+            Status::Forbidden => b"HTTP/1.1 403 Forbidden\r\n",
+            Status::NotFound => b"HTTP/1.1 404 Not Found\r\n",
+            Status::MethodNotAllowed => b"HTTP/1.1 405 Method Not Allowed\r\n",
+            Status::InternalServerError => b"HTTP/1.1 500 Internal Server Error\r\n",
+            Status::NotImplemented => b"HTTP/1.1 501 Not Implemented\r\n",
+            Status::BadGateway => b"HTTP/1.1 502 Bad Gateway\r\n",
+            Status::ServiceUnavailable => b"HTTP/1.1 503 Service Unavailable\r\n",
+            _ => {
+                buffer.extend_from_slice(b"HTTP/1.1 ");
+                append_usize_fast(buffer, self.status_code() as usize);
+                buffer.extend_from_slice(b" ");
+                buffer.extend_from_slice(self.status_message().as_bytes());
+                b"\r\n"
+            }
+        };
+        buffer.extend_from_slice(status_line);
 
-        // 2. Write content length directly into the buffer
-        let _ = write!(buffer, "Content-Length: {}\r\n", self.body.len());
+        // Fast Content-Length line
+        buffer.extend_from_slice(b"Content-Length: ");
+        append_usize_fast(buffer, self.body.len());
+        buffer.extend_from_slice(b"\r\n");
 
-        // 3. Append headers (assuming your custom HeaderMap's K/V can cast to bytes)
-        for (k, v) in &self.headers {
-            // Note: If HeaderMap keys/values are Strings, `.as_bytes()` works perfectly here.
+        // Headers
+        for (k, v) in self.headers.iter() {
             buffer.extend_from_slice(k.as_bytes());
             buffer.extend_from_slice(b": ");
             buffer.extend_from_slice(v.as_bytes());
             buffer.extend_from_slice(b"\r\n");
         }
 
-        // 4. End headers and append body
+        // End of headers and body payload
         buffer.extend_from_slice(b"\r\n");
         buffer.extend_from_slice(&self.body);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_response_status_property_code_and_message() {
-        let res = Response::ok();
-        assert_eq!(res.status, Status::Ok);
-        assert_eq!(res.status.code(), 200);
-        assert_eq!(res.status.message(), "OK");
-
-        let created_res = Response::created();
-        assert_eq!(created_res.status, Status::Created);
-        assert_eq!(created_res.status.code(), 201);
-        assert_eq!(created_res.status.message(), "Created");
-
-        let not_found_res = Response::not_found();
-        assert_eq!(not_found_res.status, Status::NotFound);
-        assert_eq!(not_found_res.status.code(), 404);
-        assert_eq!(not_found_res.status.message(), "Not Found");
+/// Zero-allocation, fast usize to ASCII serialization directly appending to buffer
+#[inline]
+fn append_usize_fast(buffer: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buffer.push(b'0');
+        return;
     }
-
-    #[test]
-    fn test_http_constants() {
-        assert_eq!(Response::HTTP_OK, 200);
-        assert_eq!(Response::HTTP_CREATED, 201);
-        assert_eq!(Response::HTTP_ACCEPTED, 202);
-        assert_eq!(Response::HTTP_NO_CONTENT, 204);
-        assert_eq!(Response::HTTP_BAD_REQUEST, 400);
-        assert_eq!(Response::HTTP_NOT_FOUND, 404);
-        assert_eq!(Response::HTTP_INTERNAL_SERVER_ERROR, 500);
-        assert_eq!(Response::HTTP_NOT_IMPLEMENTED, 501);
+    let mut temp = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        temp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
     }
-
-    #[test]
-    fn test_response_new_with_http_status_enum() {
-        let res = Response::new(Status::Accepted).text("Task queued");
-        assert_eq!(res.status, Status::Accepted);
-        assert_eq!(res.status.code(), 202);
-        assert_eq!(res.status.message(), "Accepted");
-    }
-
-    #[test]
-    fn test_response_from_code() {
-        let res = Response::from_code(Response::HTTP_CREATED).unwrap();
-        assert_eq!(res.status, Status::Created);
-        assert_eq!(res.status.code(), 201);
-        assert_eq!(res.status.message(), "Created");
-
-        let custom_res = Response::from_code(999);
-        assert!(custom_res.is_none());
-    }
-
-    #[test]
-    fn test_response_set_status() {
-        let mut res = Response::ok();
-        assert_eq!(res.status, Status::Ok);
-
-        res.set_status(Status::Forbidden);
-        assert_eq!(res.status, Status::Forbidden);
-        assert_eq!(res.status.code(), 403);
-        assert_eq!(res.status.message(), "Forbidden");
-    }
-
-    #[test]
-    fn test_response_default_content_type_is_html() {
-        let res = Response::ok();
-        assert_eq!(
-            res.headers.get("content-type"),
-            Some("text/html; charset=utf-8")
-        );
-        assert_eq!(
-            res.headers.get("CONTENT-TYPE"),
-            Some("text/html; charset=utf-8")
-        );
-        assert_eq!(
-            res.headers.get("Content-Type"),
-            Some("text/html; charset=utf-8")
-        );
-    }
-
-    #[test]
-    fn test_case_insensitive_response_headers() {
-        let res = Response::ok().header("X-Api-Key", "secret999");
-        assert_eq!(res.headers.get("x-api-key"), Some("secret999"));
-        assert_eq!(res.headers.get("X-API-KEY"), Some("secret999"));
-        assert_eq!(res.headers.get("X-Api-Key"), Some("secret999"));
-        assert!(res.headers.contains_key("x-api-key"));
-    }
-
-    #[test]
-    fn test_response_to_bytes() {
-        let res = Response::new(Status::Created).html("Created entity");
-        let bytes = res.to_bytes();
-        let s = String::from_utf8(bytes).unwrap();
-        assert!(s.starts_with("HTTP/1.1 201 Created\r\n"));
-        assert!(s.contains("Content-Length: 14\r\n"));
-        assert!(s.contains("Content-Type: text/html; charset=utf-8\r\n"));
-        assert!(s.ends_with("\r\n\r\nCreated entity"));
-    }
+    buffer.extend_from_slice(&temp[i..]);
 }

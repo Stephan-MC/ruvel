@@ -9,13 +9,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const READ_CHUNK_SIZE: usize = 8 * 1024; // 8 KiB read buffer to match standard MTU/TCP windows
 
 #[derive(Default)]
 pub struct Scheduler {}
 
 #[derive(Default)]
 pub struct Application {
-    base_path: String,
     pub container: Container,
     pub router: Router,
     pub scheduler: Scheduler,
@@ -24,9 +24,8 @@ pub struct Application {
 }
 
 impl Application {
-    pub fn new(base_path: &str) -> Self {
+    pub fn new(_base_path: &str) -> Self {
         Self {
-            base_path: base_path.to_string(),
             container: Container::new(),
             router: Router::new(),
             providers: Vec::new(),
@@ -37,8 +36,6 @@ impl Application {
 
     pub fn configure(base_path: &str) -> ApplicationBuilder {
         ApplicationBuilder::new(Self::new(base_path))
-        // .with_kernels()
-        // .with_events()
     }
 
     /// Register a service provider with the application.
@@ -94,44 +91,38 @@ impl Application {
             let router_clone = Arc::clone(&router);
 
             tokio::spawn(async move {
-                // 1. Fixed-size chunk for reading from the OS network stack
-                let mut chunk = [0u8; 2048];
-                // 2. Buffer for assembling fragmented packets and handling pipelining
-                let mut read_buffer = Vec::with_capacity(2048);
-                // 3. Pre-allocated response buffer (used repeatedly for keep-alive)
-                let mut response_buffer = Vec::with_capacity(1024);
+                let mut chunk = [0u8; READ_CHUNK_SIZE];
+                let mut read_buffer = Vec::with_capacity(READ_CHUNK_SIZE);
+                // Pre-allocated response buffer reused across pipelined requests
+                let mut response_buffer = Vec::with_capacity(4096);
 
                 'connection: loop {
-                    // Read directly from the raw TCP socket
                     match socket.read(&mut chunk).await {
                         Ok(0) => break, // Client gracefully closed connection
                         Ok(n) => {
-                            // Security: Prevent buffer overflow / memory exhaustion
                             if read_buffer.len().saturating_add(n) > MAX_REQUEST_BYTES {
                                 break;
                             }
                             read_buffer.extend_from_slice(&chunk[..n]);
 
                             let mut offset = 0;
+                            let mut responses_queued = 0;
+
                             loop {
                                 if offset >= read_buffer.len() {
-                                    // Fully consumed. `clear` keeps the allocation for the next read.
                                     read_buffer.clear();
                                     break;
                                 }
 
-                                // Attempt to parse a complete request from the unconsumed tail.
                                 let (req, consumed) = match Request::parse(&read_buffer[offset..]) {
                                     Ok(Some(parsed)) => parsed,
                                     Ok(None) => {
-                                        // One shift per read, and only when a previous request
-                                        // in this read left a partial one behind.
                                         if offset > 0 {
                                             read_buffer.drain(..offset);
                                         }
                                         break;
                                     }
-                                    Err(()) => break 'connection, // Malformed payload, drop connection
+                                    Err(()) => break 'connection,
                                 };
 
                                 let Some(end) = offset.checked_add(consumed) else {
@@ -141,22 +132,23 @@ impl Application {
                                     break 'connection;
                                 }
 
-                                // Dispatch to the Router
+                                // Dispatch request
                                 let response = router_clone.dispatch(req).await;
 
-                                // Reset the response buffer (keeps capacity)
-                                response_buffer.clear();
-
-                                // Format your response into the contiguous Vec<u8>
+                                // Serialize response into the write buffer
                                 response.write_to(&mut response_buffer);
+                                responses_queued += 1;
 
-                                // Performance: A single write_all syscall directly to the kernel,
-                                // completely bypassing the overhead of BufWriter.
+                                offset = end;
+                            }
+
+                            // Batched flush: If any responses were queued from this read chunk (pipelining),
+                            // flush them all in one single write_all syscall to the OS socket.
+                            if responses_queued > 0 {
                                 if socket.write_all(&response_buffer).await.is_err() {
                                     break 'connection;
                                 }
-
-                                offset = end;
+                                response_buffer.clear();
                             }
                         }
                         Err(_) => break, // Network error
