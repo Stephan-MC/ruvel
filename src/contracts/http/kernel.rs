@@ -1,1 +1,1 @@
-trait Kernel {}
+pub trait Kernel: Send + Sync + 'static {}

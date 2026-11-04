@@ -1,10 +1,13 @@
+use std::env;
+use std::error::Error;
+use std::sync::Arc;
+
 use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
-use crate::http::Request;
+use crate::http::{Kernel, Request};
 use crate::routing::Router;
 use crate::support::ServiceProvider;
 
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -73,12 +76,27 @@ impl Application {
         self.booted = true;
     }
 
+    /// Resolve an instance of type `T` from the application container.
+    /// Equivalent to Laravel's `$app->make()`.
+    pub fn make<T: Send + Sync + 'static>(&self) -> Result<Arc<T>, String> {
+        self.container.make()
+    }
+
+    pub async fn handle_requests(self) -> Result<(), Box<dyn Error>> {
+        let kernel = self.make::<Kernel>();
+
+        self.listen(
+            env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            env::var("PORT")
+                .unwrap_or_else(|_| "7883".to_string())
+                .parse::<u16>()
+                .unwrap(),
+        )
+        .await
+    }
+
     /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
-    pub async fn listen(
-        mut self,
-        host: String,
-        port: u16,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn listen(mut self, host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure all providers are booted before accepting traffic
         self.boot().await;
 
