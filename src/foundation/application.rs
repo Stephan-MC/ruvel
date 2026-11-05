@@ -80,7 +80,7 @@ impl Application {
     }
 
     pub async fn handle_requests(self) -> Result<(), Box<dyn Error>> {
-        let kernel = self.make::<Kernel>();
+        let _kernel = self.make::<Kernel>();
 
         self.listen(
             env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
