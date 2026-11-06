@@ -67,11 +67,14 @@ async fn test_http_kernel_handles_404_through_global_middleware() {
 }
 
 #[tokio::test]
-async fn test_console_kernel_registered_in_container() {
+async fn test_with_kernels_registers_both_kernels_in_container() {
     let app = Application::configure("")
         .with_kernels()
         .create();
 
     let console_kernel = app.make::<ConsoleKernel>();
     assert!(console_kernel.is_ok());
+
+    let http_kernel = app.make::<HttpKernel>();
+    assert!(http_kernel.is_ok());
 }

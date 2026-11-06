@@ -23,7 +23,6 @@ pub struct Application {
     pub router: Router,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
-    pub kernel: Arc<Kernel>,
     booted: bool,
 }
 
@@ -40,7 +39,6 @@ impl Application {
             router: Router::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
-            kernel: Arc::new(Kernel::default()),
             booted: false,
         }
     }
@@ -107,10 +105,10 @@ impl Application {
         let listener = TcpListener::bind(&addr).await?;
         println!("🚀 Ruvel native server running on http://{}", addr);
 
-        // Use the HTTP Kernel resolved from container or from self.kernel
+        // Resolve the HTTP Kernel directly from the container
         let kernel: Arc<dyn HttpKernelContract> = match self.make::<Kernel>() {
             Ok(k) => k as Arc<dyn HttpKernelContract>,
-            Err(_) => Arc::clone(&self.kernel) as Arc<dyn HttpKernelContract>,
+            Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
         loop {

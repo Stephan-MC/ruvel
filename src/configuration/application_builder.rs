@@ -65,6 +65,7 @@ impl ApplicationBuilder {
     /// Register HTTP and Console kernels in the container and application.
     pub fn with_kernels(self) -> Self {
         self.app.container.singleton(|_| ConsoleKernel::default());
+        self.app.container.singleton(|_| HttpKernel::default());
         self
     }
 
@@ -109,11 +110,9 @@ impl ApplicationBuilder {
 
         // 4. Register HTTP Kernel in the container (Option B: instance takes T and wraps in Arc)
         self.app.container.instance(http_kernel);
-        let http_kernel_arc = self.app.container.make::<HttpKernel>().unwrap();
 
         // 5. Restore router reference to application for backward compatibility
         self.app.router = (*router_arc).clone();
-        self.app.kernel = http_kernel_arc;
 
         self.app
     }
