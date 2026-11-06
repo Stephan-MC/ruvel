@@ -10,8 +10,11 @@ type BindingFactory = Arc<dyn Fn(&Container) -> Arc<dyn Any + Send + Sync> + Sen
 enum ServiceBinding {
     /// Singleton instance: evaluated once and stored.
     Singleton(Arc<dyn Any + Send + Sync>),
+
     /// Transient factory: invoked every time `make::<T>()` is called.
     Factory(BindingFactory),
+
+    Instance(Arc<dyn Any + Send + Sync>),
 }
 
 /// The core Container struct managing IoC resolution in `ruvel`.

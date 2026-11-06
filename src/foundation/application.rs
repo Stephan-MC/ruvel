@@ -28,13 +28,19 @@ pub struct Application {
 
 impl Application {
     pub fn new(_base_path: &str) -> Self {
-        Self {
+        let app = Self {
             container: Container::new(),
             router: Router::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
-        }
+        };
+
+        app.register_base_bindings();
+        app.register_base_service_providers();
+        app.register_core_container_aliases();
+
+        app
     }
 
     pub fn configure(base_path: &str) -> ApplicationBuilder {
@@ -174,5 +180,17 @@ impl Application {
                 }
             });
         }
+    }
+
+    fn register_base_bindings(&self) {
+        todo!()
+    }
+
+    fn register_base_service_providers(&self) {
+        todo!()
+    }
+
+    fn register_core_container_aliases(&self) {
+        todo!()
     }
 }

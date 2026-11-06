@@ -1,5 +1,7 @@
-use crate::contracts;
+use crate::{contracts, foundation::Application};
 
-pub struct Kernel {}
+pub struct Kernel {
+    app: Application,
+}
 
 impl contracts::http::Kernel for Kernel {}
