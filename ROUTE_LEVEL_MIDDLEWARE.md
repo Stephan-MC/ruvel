@@ -4,7 +4,7 @@ This document describes the design and implementation of route-level middleware 
 
 ## Overview
 
-Previously, middleware in Ruvel could only be attached globally or through `router.group(&["alias"], ...)`.
+Previously, middleware in Ruvel could only be attached globally.
 
 With the introduction of `PendingRouteRegistrar` and `IntoMiddleware`:
 1. Route registration methods (`router.get`, `router.post`, `router.put`, `router.delete`, `router.patch`, `router.any`, `router.match`, etc.) return a `PendingRouteRegistrar`.
@@ -12,7 +12,7 @@ With the introduction of `PendingRouteRegistrar` and `IntoMiddleware`:
 3. Middleware can be excluded from route groups using `.without_middleware(...)`.
 4. Route metadata and modifiers such as `.name(...)`, `.prefix(...)`, `.domain(...)`, `.where(...)`, `.where_number(...)`, and `.where_alpha(...)` can be chained fluently.
 5. `PendingRouteRegistrar` automatically registers and commits the finalized route definition into the router when dropped (or when `.commit()` is explicitly called).
-6. Fluent group registration is supported via `router.prefix(...).middleware(...).domain(...).group(|router| { ... })`.
+6. Fluent group registration is supported via `router.prefix(...).middleware(...).domain(...).group(|router| { ... })` and simple grouping via `router.group(|router| { ... })`.
 
 ---
 

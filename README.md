@@ -20,7 +20,7 @@ Ruvel is an asynchronous web framework for Rust, shaped after Laravel. It runs o
 - Verbs: `get`, `post`, `put`, `delete`, `patch`.
 - Path parameters use `{name}` segments. A match fills `Request::params`, and `Request::param("id")` reads one value.
 - The query string is split off the path and kept raw on `Request::query`. The router matches the path only.
-- `router.group(&["web", "auth"], ...)` attaches middleware group or alias names to the routes registered inside the closure. Names are resolved when the route is registered. An unknown name panics at startup.
+- `router.middleware("auth").group(...)` or `router.prefix("/api").group(...)` attaches middleware or prefixes to the routes registered inside the closure. Names are resolved when the route is registered. An unknown name panics at startup.
 - A missing route returns `404 Not Found`. Global middleware still runs for that response.
 - A route with an empty pipeline skips the middleware machinery and calls the handler directly.
 - A handler may return any type that implements `Responsable`.
@@ -39,7 +39,7 @@ let app = Application::configure("")
             format!("Post {}", req.param("id").unwrap_or("unknown"))
         });
 
-        router.group(&["auth"], |router| {
+        router.middleware("auth").group(|router| {
             router.post("/posts", |_req| async { "created" });
         });
     })

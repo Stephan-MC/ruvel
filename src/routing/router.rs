@@ -160,14 +160,9 @@ impl Router {
         }
     }
 
-    /// Register `configure`'s routes with these group or alias names.
-    pub fn group(&mut self, middleware: &[&str], configure: impl FnOnce(&mut Self)) {
-        let prev_middleware = self.group_middleware.clone();
-        for s in middleware {
-            self.group_middleware.push(MiddlewareItem::Alias(s.to_string()));
-        }
+    /// Register routes defined within the closure.
+    pub fn group(&mut self, configure: impl FnOnce(&mut Self)) {
         configure(self);
-        self.group_middleware = prev_middleware;
     }
 
     /// Begin a route group with a path prefix.
