@@ -1,97 +1,124 @@
-# Ruvel Framework
+# Ruvel
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-**Ruvel** is an asynchronous, expressive web framework for Rust inspired directly by **Laravel's architecture and developer ergonomics**. Built on top of [Tokio](https://tokio.rs/), Ruvel brings the elegant patterns of PHP's most beloved framework—Service Providers, IoC Containers, Resource Controllers, and `Responsable` contracts—into the high-performance, type-safe world of Rust.
+> **This framework is not ready for production.**
+>
+> Ruvel `0.1.x` is an early preview. Routing, middleware, the service container, controllers, and a small HTTP/1.1 server are far enough along to try locally. Authentication, validation, sessions, a real database layer, TLS, and several builder hooks are missing or panic when called. Do not deploy an application built on Ruvel.
+
+Ruvel is an asynchronous web framework for Rust, shaped after Laravel. It runs on [Tokio](https://tokio.rs/) and aims for the same split Laravel uses: service providers, an IoC container, resource controllers, and a `Responsable` contract.
 
 ---
 
-## Features
+## Implemented
 
-- **Application Kernel & Two-Phase Lifecycle**: Clean separation between service registration (`register`) and bootstrapping (`boot`).
-- **Laravel-Inspired Service Providers**: Decouple components with `ServiceProvider` contracts (`Illuminate\Support\ServiceProvider`).
-- **Flexible HTTP Routing**: Expressive routing for `GET`, `POST`, `PUT`, `DELETE`, and `PATCH`.
-- **`Responsable` Contract**: Route handlers can return anything implementing `Responsable` (`&'static str`, `String`, tuples, or models) without manual boilerplate.
-- **Smart Defaults**: Defaults to `Content-Type: text/html; charset=utf-8` for web responses, with fluent helpers for `.json()`, `.text()`, and `.html()`.
-- **RFC-Compliant `HttpStatus` & Case-Insensitive Headers**: Strongly typed `HttpStatus` enum with numeric codes, canonical reason phrases, and Symfony-style constants (`Response::HTTP_OK`, `Response::HTTP_CREATED`).
-- **Resource Controllers**: Pre-configured RESTful actions (`index`, `create`, `store`, `show`, `edit`, `update`, `destroy`) with sensible default fallback responses.
+### Routing
 
----
+`Router` stores one [matchit](https://docs.rs/matchit) radix tree per HTTP method.
 
-## Project Structure
+- Verbs: `get`, `post`, `put`, `delete`, `patch`.
+- Path parameters use `{name}` segments. A match fills `Request::params`, and `Request::param("id")` reads one value.
+- The query string is split off the path and kept raw on `Request::query`. The router matches the path only.
+- `router.middleware("auth").group(...)` or `router.prefix("/api").group(...)` attaches middleware or prefixes to the routes registered inside the closure. Names are resolved when the route is registered. An unknown name panics at startup.
+- A missing route returns `404 Not Found`. Global middleware still runs for that response.
+- A route with an empty pipeline skips the middleware machinery and calls the handler directly.
+- A handler may return any type that implements `Responsable`.
 
-```text
-src/
-├── config/             # Application configuration
-├── container/          # IoC / Dependency Injection container
-├── contracts/          # Core framework contracts & interfaces
-│   └── support/
-│       └── responsable.rs  # Responsable trait (Illuminate\Contracts\Support\Responsable)
-├── database/           # Database layer and Eloquent ORM
-│   └── eloquent/       # Eloquent model implementations
-├── foundation/         # Application bootstrap & TCP connection listener
-├── http/               # HTTP kernel, Request, Response, Headers, and Controllers
-│   ├── controllers.rs  # RESTful resource Controller trait
-│   ├── headers.rs      # Case-insensitive HeaderMap
-│   ├── request.rs      # HTTP Request parser & methods
-│   ├── response.rs     # Fluent HTTP Response builder
-│   └── status.rs       # Strongly-typed HttpStatus enum & RFC status codes
-├── routing/            # Router & dispatch engine
-└── support/            # ServiceProvider trait & utilities
-```
-
----
-
-## Quick Start
-
-### 1. Basic Application
+Register middleware before routes. `with_middleware` installs the stacks on the router, and each route copies its pipeline at registration time. Routes added earlier keep an empty pipeline.
 
 ```rust
 use ruvel::foundation::Application;
-use ruvel::http::{HttpStatus, Request, Response};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = Application::new();
+let app = Application::configure("")
+    .with_middleware(|middleware| {
+        middleware.alias("auth", Auth); // Auth: impl Middleware
+    })
+    .with_routing(|router| {
+        router.get("/posts/{id}", |req| async move {
+            format!("Post {}", req.param("id").unwrap_or("unknown"))
+        });
 
-    // 1. Returning a string literal (automatically 200 OK text/html)
-    app.router.get("/", |_req: Request| async {
-        "<h1>Welcome to Ruvel!</h1>"
-    });
+        router.middleware("auth").group(|router| {
+            router.post("/posts", |_req| async { "created" });
+        });
+    })
+    .create();
+```
 
-    // 2. Returning a dynamic String (200 OK text/html)
-    app.router.get("/greeting", |_req: Request| async {
-        format!("<h2>Hello from worker thread!</h2>")
-    });
+### Middleware
 
-    // 3. Returning a status tuple (201 Created)
-    app.router.post("/items", |_req: Request| async {
-        (HttpStatus::Created, "<p>Item created successfully</p>")
-    });
+The pipeline is the Laravel onion. Each layer receives the request and a `Next`. Calling `next.run(request).await` continues inward. The handler runs when the stack is exhausted. The response walks back out through the layers that called `next`.
 
-    // 4. Returning a fluent JSON Response
-    app.router.get("/api/health", |_req: Request| async {
-        Response::ok().json(r#"{"status": "healthy"}"#)
-    });
+The `Middleware` trait is object-safe. `handle` returns a boxed future:
 
-    // Start server on port 8080
-    app.listen(8080).await?;
+```rust
+use ruvel::http::{Middleware, Next, Request, Response};
+use std::future::Future;
+use std::pin::Pin;
 
-    Ok(())
+struct RequestId;
+
+impl Middleware for RequestId {
+    fn handle<'a>(
+        &'a self,
+        request: Request,
+        next: Next<'a>,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
+        Box::pin(async move {
+            next.run(request).await.header("X-Request-Id", "1")
+        })
+    }
 }
 ```
 
----
+`ApplicationBuilder::with_middleware` is the configuration surface, in the same spirit as Laravel's `bootstrap/app.php` middleware callback:
 
-## Core Concepts
+| Method | Effect |
+| --- | --- |
+| `append` | Add a layer at the end of the global stack. |
+| `prepend` | Add a layer at the front. The latest prepend runs first. |
+| `remove::<T>()` | Drop every global layer of type `T`. |
+| `replace::<T, _>(middleware)` | Swap every global layer of type `T`. |
+| `alias(name, middleware)` | Register one layer under a route name. |
+| `group(name, layers)` | Register an ordered list under a route name. |
 
-### Service Providers
+Global order is prepends, then the base stack, then appends. `remove` and `replace` apply to that combined stack. Groups and aliases are not part of the global stack. They are copied onto a route when that route names them.
 
-Just like Laravel's `AppServiceProvider`, providers in Ruvel have two distinct lifecycle stages:
+There is no `terminate` hook, and aliases do not take parameters (`auth:api` is not parsed).
 
-1. `register(&self, container: &mut Container)`: Bind singletons or services into the container.
-2. `boot(&self, container: &Container, router: &mut Router)`: Register routes or resolve initialized dependencies.
+### Service container
+
+`ruvel::container::Container` is a type-keyed IoC container. Lookups swap an `Arc` through `arc-swap`, so a resolve does not take a lock.
+
+| Method | Laravel equivalent | Behavior |
+| --- | --- | --- |
+| `bind` | `$container->bind()` | Store a factory. `make` calls it on every resolve. |
+| `singleton` | `$container->singleton()` | Store one instance and hand out clones of the `Arc`. |
+| `alias` | `$container->alias()` | Map a string name to a `TypeId`. |
+| `make::<T>()` | `$container->make()` | Resolve `T`. |
+| `make_alias::<T>(name)` | resolve by alias | Resolve the type registered under `name`. |
+
+```rust
+use ruvel::container::Container;
+use std::sync::Arc;
+
+struct Database {
+    url: String,
+}
+
+let container = Container::new();
+container.singleton(Database {
+    url: "postgres://localhost/app".into(),
+});
+
+let db: Arc<Database> = container.make()?;
+```
+
+`ServiceProvider` is the extension point, with Laravel's two phases:
+
+1. `register` runs immediately when the provider is added. It receives `&mut Container` and should only bind services.
+2. `boot` runs after every provider has been registered, when the application starts listening. It can resolve services and register routes. The default `boot` does nothing.
 
 ```rust
 use async_trait::async_trait;
@@ -99,117 +126,151 @@ use ruvel::container::Container;
 use ruvel::routing::Router;
 use ruvel::support::ServiceProvider;
 
-pub struct RouteServiceProvider;
+pub struct AppServiceProvider;
 
 #[async_trait]
-impl ServiceProvider for RouteServiceProvider {
-    async fn register(&self, _container: &mut Container) {
-        // Register service bindings here
+impl ServiceProvider for AppServiceProvider {
+    async fn register(&self, container: &mut Container) {
+        container.singleton(Database {
+            url: "postgres://localhost/app".into(),
+        });
     }
 
     async fn boot(&self, _container: &Container, router: &mut Router) {
-        router.get("/about", |_req| async {
-            "<h1>About Ruvel</h1>"
-        });
+        router.get("/health", |_req| async { "ok" });
     }
 }
 ```
 
-Register providers during application setup:
+Attach a provider with `ApplicationBuilder::with_provider`, which is async. The container is not passed into route closures or controller methods. Resolving a service inside a handler means reaching a container you stored yourself.
+
+### Controllers
+
+`ruvel::http::Controller` mirrors a Laravel resource controller. Each action takes a `Request` and returns `impl Responsable`. Override the actions you need. The others answer `501 Not Implemented`.
+
+| Action | Typical route |
+| --- | --- |
+| `index` | `GET /resources` |
+| `create` | `GET /resources/create` |
+| `store` | `POST /resources` |
+| `show` | `GET /resources/{id}` |
+| `edit` | `GET /resources/{id}/edit` |
+| `update` | `PUT` or `PATCH /resources/{id}` |
+| `destroy` | `DELETE /resources/{id}` |
 
 ```rust
-let app = Application::new()
-    .register_provider(RouteServiceProvider)
-    .await;
-```
-
----
-
-### The `Responsable` Contract
-
-Ruvel mirrors `Illuminate\Contracts\Support\Responsable`. Any type implementing `Responsable` can be returned directly from route handlers:
-
-```rust
-use ruvel::contracts::support::Responsable;
-use ruvel::http::Response;
-
-pub struct UserProfile {
-    pub username: String,
-}
-
-impl Responsable for UserProfile {
-    fn to_response(self) -> Response {
-        Response::ok().json(format!(r#"{{"user": "{}"}}"#, self.username))
-    }
-}
-
-// In your router:
-router.get("/me", |_req| async {
-    UserProfile {
-        username: "ferris".to_string(),
-    }
-});
-```
-
----
-
-### Resource Controllers
-
-Resource controllers provide default implementations for all standard actions. Implement only what your resource needs:
-
-```rust
-use async_trait::async_trait;
-use ruvel::contracts::support::Responsable;
-use ruvel::http::{Controller, HttpStatus, Request, Response};
+use ruvel::http::{Controller, Request, Responsable, Status};
 
 pub struct ArticleController;
 
-#[async_trait]
 impl Controller for ArticleController {
-    // Overriding index (GET /articles)
-    async fn index(&self, _req: Request) -> Response {
-        "<h1>Articles List</h1>".to_response()
+    async fn index(&self, _req: Request) -> impl Responsable {
+        "<h1>Articles</h1>"
     }
 
-    // Overriding store (POST /articles)
-    async fn store(&self, req: Request) -> Response {
-        (HttpStatus::Created, "<p>Article published</p>").to_response()
+    async fn store(&self, _req: Request) -> impl Responsable {
+        (Status::Created, "<p>Article published</p>")
     }
+}
+```
 
-    // show, edit, update, and destroy default to 501 Not Implemented
+You register each action on the router yourself. There is no `resource()` helper, no controller middleware attribute, and no constructor injection.
+
+### Also in place
+
+- **Application lifecycle.** `Application::configure(base_path)` returns a builder. `with_provider`, `with_routing`, and `with_middleware` shape it. `create()` returns the `Application`. `listen(host, port)` boots every provider, then accepts TCP connections.
+- **HTTP/1.1 server.** Requests are parsed with `httparse`. One connection can serve keep-alive and pipelined requests. The body is framed with `Content-Length`. A request larger than 64 KiB is dropped. A non-identity `Transfer-Encoding` closes the connection.
+- **`Responsable`.** Route handlers can return `&'static str`, `String`, `Cow<str>`, `Box<str>`, `Response`, `()`, `(Status, T)`, or `(u16, T)`. Strings become `200 OK` with `Content-Type: text/html; charset=utf-8`.
+- **Responses.** `Response::ok`, `created`, `no_content`, `bad_request`, `not_found`, and `not_implemented`, plus `.text()`, `.json()`, `.html()`, and `.header()`. Numeric constants such as `Response::HTTP_OK` are available. `Status` covers the usual RFC codes, with `code()` and `message()`.
+- **Headers.** `HeaderMap` looks up names without regard to case and writes the casing of the last insert.
+
+```rust
+use ruvel::foundation::Application;
+use ruvel::http::Response;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Application::configure("")
+        .with_routing(|router| {
+            router.get("/", |_req| async { "<h1>Welcome to Ruvel</h1>" });
+
+            router.get("/health", |_req| async {
+                Response::ok().json(r#"{"status":"healthy"}"#)
+            });
+        })
+        .create();
+
+    app.listen("127.0.0.1".into(), 8080).await?;
+    Ok(())
 }
 ```
 
 ---
 
-### HTTP Status Codes & Headers
+## Still to be done
 
-- **`HttpStatus`**: RFC-compliant enum with `status.code()` (e.g. `200`, `404`) and `status.message()` (e.g. `"OK"`, `"Not Found"`).
-- **Constants**: Access constants directly via `Response::HTTP_OK`, `Response::HTTP_CREATED`, `Response::HTTP_NOT_FOUND`, etc.
-- **Case-Insensitive Headers**: Headers can be fetched using any casing (`Content-Type`, `content-type`, `CONTENT-TYPE`).
+These builder methods are public and panic with `todo!` if you call them:
 
-```rust
-let res = Response::ok()
-    .header("X-Custom-Header", "value123")
-    .html("<h1>Rendered HTML</h1>");
+- `with_events`
+- `with_commands`
+- `with_kernels`
+- `with_scheduler`
 
-assert_eq!(res.headers.get("x-custom-header"), Some("value123"));
-assert_eq!(res.headers.get("X-CUSTOM-HEADER"), Some("value123"));
-```
+These types exist only as placeholders:
+
+- `database::eloquent::Model` is an empty struct. As a `Responsable` it returns an empty `200 OK`. There is no query builder, connection, migration runner, or seeder.
+- `config::Config` holds `name` and `debug`. Nothing loads `.env` files or config files, and the application does not read this struct.
+- `contracts::http::Kernel` and `contracts::container::Container` are empty traits. The working container is the concrete `container::Container`.
+
+Not started:
+
+- Validation and form requests
+- Authentication, authorization, sessions, cookies, and CSRF
+- Views and templating
+- Named routes, route-model binding, and automatic resource registration
+- `HEAD`, `OPTIONS`, `any`, `match`, and custom fallback routes
+- Middleware parameters and `terminate` callbacks
+- Injecting container services into closures or controller methods, and a request-scoped container
+- A parsed query map, multipart bodies, and file uploads
+- Redirect and cookie helpers
+- Chunked request bodies, TLS, and HTTP/2
+- An Artisan-style CLI, queues, mail, cache, and notifications
 
 ---
 
-## Roadmap
+## Layout
 
-- [ ] Route parameters & regex matching (`/posts/{id}`)
-- [ ] Onion-style HTTP middleware pipeline (`Request -> Next -> Response`)
-- [ ] Type-safe dependency resolution in IoC container (`Arc<dyn Any>`)
-- [ ] Validation & FormRequest abstractions
-- [ ] Eloquent query builder & migrations
-- [ ] Artisan CLI integration with `clap`
+```text
+src/
+├── config/                  # Config stub (name, debug)
+├── configuration/           # ApplicationBuilder and middleware config (crate-private)
+├── container/               # Service container
+├── contracts/
+│   ├── support/responsable.rs
+│   ├── container/           # Empty contract
+│   └── http/kernel.rs       # Empty contract
+├── database/eloquent/       # Empty Model stub
+├── foundation/              # Application bootstrap and TCP listener
+├── http/
+│   ├── controllers.rs       # Resource controller trait
+│   ├── headers.rs           # Case-insensitive HeaderMap
+│   ├── middleware.rs        # Middleware trait and Next pipeline
+│   ├── request.rs           # HTTP/1.1 parser
+│   ├── response.rs          # Response builder
+│   └── status.rs            # Status enum
+├── routing/                 # Router and dispatch
+└── support/                 # ServiceProvider
+```
+
+`configuration` is private. Call `Application::configure` and let the closure arguments infer `Middleware` and `Router`.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License or Apache-2.0 License.
+Licensed under either of:
+
+- MIT license
+- Apache License, Version 2.0
+
+at your option.
