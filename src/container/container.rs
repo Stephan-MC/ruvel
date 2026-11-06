@@ -1,16 +1,21 @@
 use arc_swap::ArcSwap;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-/// Dynamic factory closure type for resolving transient bindings.
+/// Dynamic factory closure type for resolving bindings.
 type BindingFactory = Arc<dyn Fn(&Container) -> Arc<dyn Any + Send + Sync> + Send + Sync>;
 
 #[derive(Clone)]
 enum ServiceBinding {
-    /// Singleton instance: evaluated once and stored.
-    Singleton(Arc<dyn Any + Send + Sync>),
-    /// Transient factory: invoked every time `make::<T>()` is called.
+    /// Instance binding: pre-constructed instance wrapped in Arc and stored directly into the container.
+    Instance(Arc<dyn Any + Send + Sync>),
+    /// Lazy singleton binding: instantiated once on the first request and cached for subsequent requests.
+    Singleton {
+        factory: BindingFactory,
+        instance: Arc<OnceLock<Arc<dyn Any + Send + Sync>>>,
+    },
+    /// Transient factory binding: invoked every time `make::<T>()` is called.
     Factory(BindingFactory),
 }
 
@@ -32,6 +37,7 @@ impl Container {
     }
 
     /// Bind a transient factory (equivalent to Laravel's `$container->bind()`).
+    /// Invoked every time `make::<T>()` is resolved.
     pub fn bind<T, F>(&self, factory: F)
     where
         T: Send + Sync + 'static,
@@ -43,15 +49,35 @@ impl Container {
         self.bindings.store(Arc::new(map));
     }
 
-    /// Bind a pre-constructed singleton instance (equivalent to Laravel's `$container->singleton()`).
-    pub fn singleton<T>(&self, instance: T)
+    /// Bind a lazy singleton (equivalent to Laravel's `$container->singleton()`).
+    /// Instantiated once on the first resolution and reused across subsequent requests.
+    pub fn singleton<T, F>(&self, factory: F)
+    where
+        T: Send + Sync + 'static,
+        F: Fn(&Container) -> T + Send + Sync + 'static,
+    {
+        let mut map = (**self.bindings.load()).clone();
+        let factory_fn: BindingFactory = Arc::new(move |c| Arc::new(factory(c)));
+        map.insert(
+            TypeId::of::<T>(),
+            ServiceBinding::Singleton {
+                factory: factory_fn,
+                instance: Arc::new(OnceLock::new()),
+            },
+        );
+        self.bindings.store(Arc::new(map));
+    }
+
+    /// Save an existing instance into the container (equivalent to Laravel's `$container->instance()`).
+    /// Automatically wraps the instance in `Arc::new(...)` before storing.
+    pub fn instance<T>(&self, instance: T)
     where
         T: Send + Sync + 'static,
     {
         let mut map = (**self.bindings.load()).clone();
         map.insert(
             TypeId::of::<T>(),
-            ServiceBinding::Singleton(Arc::new(instance)),
+            ServiceBinding::Instance(Arc::new(instance)),
         );
         self.bindings.store(Arc::new(map));
     }
@@ -86,8 +112,17 @@ impl Container {
         let bindings = self.bindings.load();
 
         match bindings.get(type_id) {
-            Some(ServiceBinding::Singleton(instance)) => {
+            Some(ServiceBinding::Instance(instance)) => {
                 instance.clone().downcast::<T>().map_err(|_| {
+                    format!(
+                        "Failed to downcast dependency to target type: {}",
+                        std::any::type_name::<T>()
+                    )
+                })
+            }
+            Some(ServiceBinding::Singleton { factory, instance }) => {
+                let resolved = instance.get_or_init(|| factory(self));
+                resolved.clone().downcast::<T>().map_err(|_| {
                     format!(
                         "Failed to downcast dependency to target type: {}",
                         std::any::type_name::<T>()

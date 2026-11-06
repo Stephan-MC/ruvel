@@ -1,17 +1,29 @@
 pub(crate) use crate::foundation::Application;
-use crate::{configuration::Middleware, routing::Router, support::ServiceProvider};
+use crate::{
+    configuration::Middleware,
+    console::Kernel as ConsoleKernel,
+    http::Kernel as HttpKernel,
+    routing::Router,
+    support::ServiceProvider,
+};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Scheduler {}
 
-#[derive(Default)]
 pub struct ApplicationBuilder {
     app: Application,
+    middleware: Option<Middleware>,
+    routing_callback: Option<Box<dyn FnOnce(&mut Router)>>,
 }
 
 impl ApplicationBuilder {
     pub fn new(app: Application) -> Self {
-        Self { app }
+        Self {
+            app,
+            middleware: None,
+            routing_callback: None,
+        }
     }
 
     pub async fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
@@ -26,13 +38,18 @@ impl ApplicationBuilder {
     }
 
     /// Register a route with a specified middleware group
-    ///
-    ///
     pub fn with_routing<F>(mut self, callback: F) -> Self
     where
-        F: FnOnce(&mut Router),
+        F: FnOnce(&mut Router) + 'static,
     {
-        callback(&mut self.app.router);
+        if let Some(prev) = self.routing_callback.take() {
+            self.routing_callback = Some(Box::new(move |router| {
+                prev(router);
+                callback(router);
+            }));
+        } else {
+            self.routing_callback = Some(Box::new(callback));
+        }
 
         self
     }
@@ -45,24 +62,20 @@ impl ApplicationBuilder {
         todo!("Not implemented");
     }
 
+    /// Register HTTP and Console kernels in the container and application.
     pub fn with_kernels(self) -> Self {
-        todo!("Not implemented");
+        self.app.container.singleton(|_| ConsoleKernel::default());
+        self
     }
 
-    /// Configure global middleware, groups, and aliases, then install them on the router.
+    /// Configure global middleware, groups, and aliases.
     pub fn with_middleware<F>(mut self, callback: F) -> Self
     where
         F: FnOnce(&mut Middleware),
     {
-        let mut middleware = Middleware::new();
+        let mut middleware = self.middleware.unwrap_or_default();
         callback(&mut middleware);
-
-        let resolved = middleware.resolve();
-        self.app.router.install_middleware(
-            resolved.global,
-            resolved.groups,
-            resolved.aliases,
-        );
+        self.middleware = Some(middleware);
 
         self
     }
@@ -74,7 +87,34 @@ impl ApplicationBuilder {
         todo!("Not yet implemented");
     }
 
-    pub fn create(self) -> Application {
+    pub fn create(mut self) -> Application {
+        // Automatically register kernels in the container
+        self.app.container.singleton(|_| ConsoleKernel::default());
+
+        let resolved = self.middleware.unwrap_or_default().resolve();
+
+        // 1. Install route groups and aliases on the router first
+        self.app
+            .router
+            .install_middleware(resolved.groups, resolved.aliases);
+
+        // 2. Execute routing callbacks so routes can resolve aliases/groups
+        if let Some(callback) = self.routing_callback.take() {
+            callback(&mut self.app.router);
+        }
+
+        // 3. Build the HTTP Kernel with global middleware and Router
+        let router_arc = Arc::new(std::mem::take(&mut self.app.router));
+        let http_kernel = HttpKernel::new(Arc::clone(&router_arc), resolved.global);
+
+        // 4. Register HTTP Kernel in the container (Option B: instance takes T and wraps in Arc)
+        self.app.container.instance(http_kernel);
+        let http_kernel_arc = self.app.container.make::<HttpKernel>().unwrap();
+
+        // 5. Restore router reference to application for backward compatibility
+        self.app.router = (*router_arc).clone();
+        self.app.kernel = http_kernel_arc;
+
         self.app
     }
 }
