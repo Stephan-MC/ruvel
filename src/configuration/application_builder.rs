@@ -65,6 +65,7 @@ impl ApplicationBuilder {
     /// Register HTTP and Console kernels in the container and application.
     pub fn with_kernels(self) -> Self {
         self.app.container.singleton(|_| ConsoleKernel::default());
+        self.app.container.singleton(|_| HttpKernel::default());
         self
     }
 
