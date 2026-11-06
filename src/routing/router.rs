@@ -25,22 +25,17 @@ pub(crate) struct RouteEntry {
     pub(crate) wheres: HashMap<String, String>,
 }
 
-#[derive(Default, Clone)]
-struct GroupScope {
-    prefix: Option<String>,
-    middleware: Vec<MiddlewareItem>,
-    #[allow(dead_code)]
-    domain: Option<String>,
-}
-
 pub struct Router {
     // Map each HTTP Method to its own Radix Tree of routes
     routes: HashMap<Method, MatchitRouter<RouteEntry>>,
     global: Vec<Arc<dyn Middleware>>,
     groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
     aliases: HashMap<String, Arc<dyn Middleware>>,
-    /// Scopes applied to routes registered inside groups
-    scopes: Vec<GroupScope>,
+
+    // Group properties applied to routes
+    pub(crate) group_prefix: Option<String>,
+    pub(crate) group_middleware: Vec<MiddlewareItem>,
+    pub(crate) group_domain: Option<String>,
 
     // Cached 404 Fallbacks to prevent allocations on unmatched routes
     fallback_handler: HandlerFn,
@@ -60,7 +55,9 @@ impl Router {
             global: Vec::new(),
             groups: HashMap::new(),
             aliases: HashMap::new(),
-            scopes: Vec::new(),
+            group_prefix: None,
+            group_middleware: Vec::new(),
+            group_domain: None,
 
             // Allocate the 404 handler ONCE at application boot
             fallback_handler: Arc::new(|_req| {
@@ -85,47 +82,29 @@ impl Router {
         self.fallback_pipeline = global.into();
     }
 
-    pub(crate) fn push_group_scope(
-        &mut self,
-        prefix: Option<String>,
-        middleware: Vec<MiddlewareItem>,
-        domain: Option<String>,
-    ) {
-        self.scopes.push(GroupScope {
-            prefix,
-            middleware,
-            domain,
-        });
-    }
-
-    pub(crate) fn pop_group_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    pub(crate) fn apply_stack_prefix(&self, path: &str) -> String {
-        let mut prefixes = Vec::new();
-        for scope in &self.scopes {
-            if let Some(ref p) = scope.prefix {
-                let trimmed = p.trim_matches('/');
-                if !trimmed.is_empty() {
-                    prefixes.push(trimmed);
+    pub(crate) fn combine_prefix(&self, path: &str) -> String {
+        let clean_path = path.trim_start_matches('/');
+        match &self.group_prefix {
+            Some(prefix) => {
+                let trimmed = prefix.trim_matches('/');
+                if trimmed.is_empty() {
+                    if clean_path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/{}", clean_path)
+                    }
+                } else if clean_path.is_empty() {
+                    format!("/{}", trimmed)
+                } else {
+                    format!("/{}/{}", trimmed, clean_path)
                 }
             }
-        }
-
-        let clean_path = path.trim_start_matches('/');
-        if prefixes.is_empty() {
-            if clean_path.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{}", clean_path)
-            }
-        } else {
-            let joined = prefixes.join("/");
-            if clean_path.is_empty() {
-                format!("/{}", joined)
-            } else {
-                format!("/{}/{}", joined, clean_path)
+            None => {
+                if clean_path.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", clean_path)
+                }
             }
         }
     }
@@ -135,7 +114,6 @@ impl Router {
         method_router.insert(path, entry).unwrap();
     }
 
-
     /// Pre-compiles the pipeline for a route at registration time.
     pub(crate) fn compile_route_pipeline(
         &self,
@@ -144,11 +122,9 @@ impl Router {
     ) -> Arc<[Arc<dyn Middleware>]> {
         let mut layers = self.global.clone();
 
-        // 1. Group scopes middleware
-        for scope in &self.scopes {
-            for item in &scope.middleware {
-                self.resolve_middleware_item(item, &mut layers, excluded_aliases);
-            }
+        // 1. Group middleware on the router
+        for item in &self.group_middleware {
+            self.resolve_middleware_item(item, &mut layers, excluded_aliases);
         }
 
         // 2. Local route-specific middleware
@@ -186,13 +162,12 @@ impl Router {
 
     /// Register `configure`'s routes with these group or alias names.
     pub fn group(&mut self, middleware: &[&str], configure: impl FnOnce(&mut Self)) {
-        let items: Vec<MiddlewareItem> = middleware
-            .iter()
-            .map(|s| MiddlewareItem::Alias(s.to_string()))
-            .collect();
-        self.push_group_scope(None, items, None);
+        let prev_middleware = self.group_middleware.clone();
+        for s in middleware {
+            self.group_middleware.push(MiddlewareItem::Alias(s.to_string()));
+        }
         configure(self);
-        self.pop_group_scope();
+        self.group_middleware = prev_middleware;
     }
 
     /// Begin a route group with a path prefix.

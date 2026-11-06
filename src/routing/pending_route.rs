@@ -113,18 +113,20 @@ impl<'a> PendingRouteRegistrar<'a> {
             }
         }
 
-        // Apply router stack group prefix if any
-        final_path = self.router.apply_stack_prefix(&final_path);
+        // Apply router prefix if any
+        final_path = self.router.combine_prefix(&final_path);
 
-        // Compile pipeline for this route including router stack, route-level middleware,
+        // Compile pipeline for this route including router middleware, route-level middleware,
         // and filtering excluded middleware
         let pipeline = self.router.compile_route_pipeline(&self.middleware, &self.excluded_middleware);
+
+        let final_domain = self.domain.clone().or_else(|| self.router.group_domain.clone());
 
         let entry = RouteEntry {
             handler: Arc::clone(&self.handler),
             pipeline,
             name: self.name.clone(),
-            domain: self.domain.clone(),
+            domain: final_domain,
             wheres: self.wheres.clone(),
         };
 
@@ -181,8 +183,43 @@ impl<'a> RouteGroupRegistrar<'a> {
     where
         F: FnOnce(&mut Router),
     {
-        self.router.push_group_scope(self.prefix, self.middleware, self.domain);
+        // Save current router group properties
+        let prev_prefix = self.router.group_prefix.clone();
+        let prev_middleware = self.router.group_middleware.clone();
+        let prev_domain = self.router.group_domain.clone();
+
+        // Push new group properties onto the router
+        if let Some(p) = self.prefix {
+            self.router.group_prefix = Some(match &self.router.group_prefix {
+                Some(parent) => {
+                    let parent_clean = parent.trim_matches('/');
+                    let p_clean = p.trim_matches('/');
+                    if parent_clean.is_empty() {
+                        format!("/{}", p_clean)
+                    } else if p_clean.is_empty() {
+                        format!("/{}", parent_clean)
+                    } else {
+                        format!("/{}/{}", parent_clean, p_clean)
+                    }
+                }
+                None => {
+                    let p_clean = p.trim_matches('/');
+                    format!("/{}", p_clean)
+                }
+            });
+        }
+
+        self.router.group_middleware.extend(self.middleware);
+
+        if self.domain.is_some() {
+            self.router.group_domain = self.domain;
+        }
+
         callback(self.router);
-        self.router.pop_group_scope();
+
+        // Restore previous router group properties
+        self.router.group_prefix = prev_prefix;
+        self.router.group_middleware = prev_middleware;
+        self.router.group_domain = prev_domain;
     }
 }
