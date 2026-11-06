@@ -39,8 +39,6 @@ pub struct Router {
     global: Vec<Arc<dyn Middleware>>,
     groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
     aliases: HashMap<String, Arc<dyn Middleware>>,
-    /// Named routes mapped to their registered paths
-    named_routes: HashMap<String, String>,
     /// Scopes applied to routes registered inside groups
     scopes: Vec<GroupScope>,
 
@@ -62,7 +60,6 @@ impl Router {
             global: Vec::new(),
             groups: HashMap::new(),
             aliases: HashMap::new(),
-            named_routes: HashMap::new(),
             scopes: Vec::new(),
 
             // Allocate the 404 handler ONCE at application boot
@@ -138,14 +135,6 @@ impl Router {
         method_router.insert(path, entry).unwrap();
     }
 
-    pub(crate) fn register_named_route(&mut self, name: String, path: String) {
-        self.named_routes.insert(name, path);
-    }
-
-    /// Retrieve the path for a named route if registered.
-    pub fn route(&self, name: &str) -> Option<&str> {
-        self.named_routes.get(name).map(|s| s.as_str())
-    }
 
     /// Pre-compiles the pipeline for a route at registration time.
     pub(crate) fn compile_route_pipeline(

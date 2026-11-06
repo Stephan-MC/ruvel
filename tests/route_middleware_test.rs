@@ -137,7 +137,7 @@ async fn test_route_level_middleware_slice_and_chaining() {
 }
 
 #[tokio::test]
-async fn test_route_naming_and_lookup() {
+async fn test_route_naming() {
     let app = Application::configure("")
         .with_routing(|router| {
             router
@@ -146,8 +146,9 @@ async fn test_route_naming_and_lookup() {
         })
         .create();
 
-    assert_eq!(app.router.route("users.profile"), Some("/users/profile"));
-    assert_eq!(app.router.route("unknown"), None);
+    let req = Request::new(Method::GET, "/users/profile");
+    let res = app.router.dispatch(req).await;
+    assert_eq!(res.body, b"profile");
 }
 
 #[tokio::test]

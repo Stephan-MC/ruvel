@@ -131,10 +131,6 @@ impl<'a> PendingRouteRegistrar<'a> {
         for method in &self.methods {
             self.router.insert_route(method.clone(), &final_path, entry.clone());
         }
-
-        if let Some(ref name) = self.name {
-            self.router.register_named_route(name.clone(), final_path);
-        }
     }
 }
 

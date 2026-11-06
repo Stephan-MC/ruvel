@@ -30,7 +30,7 @@ The `IntoMiddleware` trait enables flexible middleware attachment. It is impleme
 A RAII builder that wraps pending route registration:
 - **`.middleware(impl IntoMiddleware)`**: Attach one or multiple middleware (aliases, groups, or direct instances) to the specific route.
 - **`.without_middleware(impl IntoMiddleware)`**: Exclude specified middleware aliases or groups inherited from group scopes.
-- **`.name(impl Into<String>)`**: Assign a unique name to the route, retrievable via `router.route("name")`.
+- **`.name(impl Into<String>)`**: Assign a name to the route metadata.
 - **`.prefix(impl Into<String>)`**: Prepend an additional path prefix to this route.
 - **`.domain(impl Into<String>)`**: Attach a domain constraint or metadata.
 - **`.where(param, pattern)`**: Attach parameter validation regex pattern.
@@ -48,7 +48,6 @@ Enables fluent group definitions directly from `Router`:
 
 - All verb methods (`get`, `post`, `put`, `delete`, `patch`, `any`, `match`, and `add_route`) return `PendingRouteRegistrar`.
 - Group scoping with stacked prefixes and middleware layers.
-- Named route registry (`router.route(name) -> Option<&str>`).
 - Route pipeline compilation resolves global middleware + group middleware + route-level middleware, filtering out any excluded middleware specified by `.without_middleware(...)`.
 
 ---
