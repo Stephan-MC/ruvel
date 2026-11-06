@@ -8,7 +8,7 @@ type BindingFactory = Arc<dyn Fn(&Container) -> Arc<dyn Any + Send + Sync> + Sen
 
 #[derive(Clone)]
 enum ServiceBinding {
-    /// Instance binding: pre-constructed instance stored directly into the container.
+    /// Instance binding: pre-constructed instance wrapped in Arc and stored directly into the container.
     Instance(Arc<dyn Any + Send + Sync>),
     /// Lazy singleton binding: instantiated once on the first request and cached for subsequent requests.
     Singleton {
@@ -69,20 +69,16 @@ impl Container {
     }
 
     /// Save an existing instance into the container (equivalent to Laravel's `$container->instance()`).
+    /// Automatically wraps the instance in `Arc::new(...)` before storing.
     pub fn instance<T>(&self, instance: T)
     where
         T: Send + Sync + 'static,
     {
-        self.instance_arc(Arc::new(instance));
-    }
-
-    /// Save an existing Arc instance directly into the container.
-    pub fn instance_arc<T>(&self, instance: Arc<T>)
-    where
-        T: Send + Sync + 'static,
-    {
         let mut map = (**self.bindings.load()).clone();
-        map.insert(TypeId::of::<T>(), ServiceBinding::Instance(instance));
+        map.insert(
+            TypeId::of::<T>(),
+            ServiceBinding::Instance(Arc::new(instance)),
+        );
         self.bindings.store(Arc::new(map));
     }
 

@@ -105,14 +105,15 @@ impl ApplicationBuilder {
 
         // 3. Build the HTTP Kernel with global middleware and Router
         let router_arc = Arc::new(std::mem::take(&mut self.app.router));
-        let http_kernel = Arc::new(HttpKernel::new(router_arc, resolved.global));
+        let http_kernel = HttpKernel::new(Arc::clone(&router_arc), resolved.global);
 
-        // 4. Register HTTP Kernel in the container
-        self.app.container.instance_arc(Arc::clone(&http_kernel));
+        // 4. Register HTTP Kernel in the container (Option B: instance takes T and wraps in Arc)
+        self.app.container.instance(http_kernel);
+        let http_kernel_arc = self.app.container.make::<HttpKernel>().unwrap();
 
         // 5. Restore router reference to application for backward compatibility
-        self.app.router = (**http_kernel.router()).clone();
-        self.app.kernel = http_kernel;
+        self.app.router = (*router_arc).clone();
+        self.app.kernel = http_kernel_arc;
 
         self.app
     }
