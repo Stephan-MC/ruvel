@@ -1,6 +1,7 @@
 use crate::container::Container;
 use crate::routing::Router;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Equivalent to Illuminate\Support\ServiceProvider
 #[async_trait]
@@ -16,10 +17,10 @@ pub trait ServiceProvider: Send + Sync {
     /// Bootstrap any application services.
     /// This is called after ALL providers have been registered.
     ///
-    /// Note: You receive an immutable reference to the Container, and a mutable
-    /// reference to the Router to register routes. You can safely resolve
+    /// Note: You receive an immutable reference to the Container, and an
+    /// Arc<Router> reference to the Router to register routes. You can safely resolve
     /// dependencies from the container here.
-    async fn boot(&self, _container: &Container, _router: &mut Router) {
+    async fn boot(&self, _container: &Container, _router: &Arc<Router>) {
         // Default implementation does nothing.
         // Users can override this if they need to boot services.
     }

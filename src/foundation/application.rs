@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
+use crate::contracts::http::Kernel as HttpKernelContract;
 use crate::http::{Kernel, Request};
-use crate::routing::Router;
 use crate::support::ServiceProvider;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,28 +17,32 @@ const READ_CHUNK_SIZE: usize = 8 * 1024; // 8 KiB read buffer to match standard 
 #[derive(Default)]
 pub struct Scheduler {}
 
-#[derive(Default)]
 pub struct Application {
     pub container: Container,
-    pub router: Router,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
     booted: bool,
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self::new("")
+    }
 }
 
 impl Application {
     pub fn new(_base_path: &str) -> Self {
         Self {
             container: Container::new(),
-            router: Router::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
         }
     }
 
+    /// Configure the application and register default kernels.
     pub fn configure(base_path: &str) -> ApplicationBuilder {
-        ApplicationBuilder::new(Self::new(base_path))
+        ApplicationBuilder::new(Self::new(base_path)).with_kernels()
     }
 
     /// Register a service provider with the application.
@@ -51,7 +55,8 @@ impl Application {
 
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
-            provider.boot(&self.container, &mut self.router).await;
+            let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+            provider.boot(&self.container, &kernel.router).await;
         }
 
         self.providers.push(provider);
@@ -66,8 +71,10 @@ impl Application {
             return;
         }
 
+        let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+
         for provider in &self.providers {
-            provider.boot(&self.container, &mut self.router).await;
+            provider.boot(&self.container, &kernel.router).await;
         }
 
         self.booted = true;
@@ -80,8 +87,6 @@ impl Application {
     }
 
     pub async fn handle_requests(self) -> Result<(), Box<dyn Error>> {
-        let kernel = self.make::<Kernel>();
-
         self.listen(
             env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             env::var("PORT")
@@ -101,12 +106,16 @@ impl Application {
         let listener = TcpListener::bind(&addr).await?;
         println!("🚀 Ruvel native server running on http://{}", addr);
 
-        let router = Arc::new(self.router);
+        // Resolve the HTTP Kernel directly from the container
+        let kernel: Arc<dyn HttpKernelContract> = match self.make::<Kernel>() {
+            Ok(k) => k as Arc<dyn HttpKernelContract>,
+            Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
+        };
 
         loop {
             let (mut socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
-            let router_clone = Arc::clone(&router);
+            let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
                 let mut chunk = [0u8; READ_CHUNK_SIZE];
@@ -150,8 +159,8 @@ impl Application {
                                     break 'connection;
                                 }
 
-                                // Dispatch request
-                                let response = router_clone.dispatch(req).await;
+                                // Dispatch request through HTTP Kernel
+                                let response = kernel_clone.handle(req).await;
 
                                 // Serialize response into the write buffer
                                 response.write_to(&mut response_buffer);

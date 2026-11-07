@@ -1,17 +1,31 @@
 pub(crate) use crate::foundation::Application;
-use crate::{configuration::Middleware, routing::Router, support::ServiceProvider};
+use crate::{
+    configuration::Middleware,
+    console::Kernel as ConsoleKernel,
+    http::Kernel as HttpKernel,
+    routing::Router,
+    support::ServiceProvider,
+};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Scheduler {}
 
-#[derive(Default)]
 pub struct ApplicationBuilder {
     app: Application,
+    router: Router,
+    middleware: Option<Middleware>,
+    routing_callback: Option<Box<dyn FnOnce(&mut Router)>>,
 }
 
 impl ApplicationBuilder {
     pub fn new(app: Application) -> Self {
-        Self { app }
+        Self {
+            app,
+            router: Router::new(),
+            middleware: None,
+            routing_callback: None,
+        }
     }
 
     pub async fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
@@ -25,14 +39,19 @@ impl ApplicationBuilder {
         self
     }
 
-    /// Register a route with a specified middleware group
-    ///
-    ///
+    /// Register routes on the router
     pub fn with_routing<F>(mut self, callback: F) -> Self
     where
-        F: FnOnce(&mut Router),
+        F: FnOnce(&mut Router) + 'static,
     {
-        callback(&mut self.app.router);
+        if let Some(prev) = self.routing_callback.take() {
+            self.routing_callback = Some(Box::new(move |router| {
+                prev(router);
+                callback(router);
+            }));
+        } else {
+            self.routing_callback = Some(Box::new(callback));
+        }
 
         self
     }
@@ -45,24 +64,21 @@ impl ApplicationBuilder {
         todo!("Not implemented");
     }
 
+    /// Register HTTP and Console kernels in the container and application.
     pub fn with_kernels(self) -> Self {
-        todo!("Not implemented");
+        self.app.container.singleton(|_| ConsoleKernel::default());
+        self.app.container.singleton(|_| HttpKernel::default());
+        self
     }
 
-    /// Configure global middleware, groups, and aliases, then install them on the router.
+    /// Configure global middleware, groups, and aliases.
     pub fn with_middleware<F>(mut self, callback: F) -> Self
     where
         F: FnOnce(&mut Middleware),
     {
-        let mut middleware = Middleware::new();
+        let mut middleware = self.middleware.unwrap_or_default();
         callback(&mut middleware);
-
-        let resolved = middleware.resolve();
-        self.app.router.install_middleware(
-            resolved.global,
-            resolved.groups,
-            resolved.aliases,
-        );
+        self.middleware = Some(middleware);
 
         self
     }
@@ -74,7 +90,27 @@ impl ApplicationBuilder {
         todo!("Not yet implemented");
     }
 
-    pub fn create(self) -> Application {
+    pub fn create(mut self) -> Application {
+        let resolved = self.middleware.unwrap_or_default().resolve();
+
+        // 1. Install route groups and aliases on the router
+        self.router
+            .install_middleware(resolved.groups, resolved.aliases);
+
+        // 2. Execute routing callbacks
+        if let Some(callback) = self.routing_callback.take() {
+            callback(&mut self.router);
+        }
+
+        // 3. Construct HttpKernel with &app and Arc<Router>, attaching global middleware
+        let router_arc = Arc::new(self.router);
+        let http_kernel = HttpKernel::new(&self.app, router_arc)
+            .with_middleware(resolved.global);
+
+        // 4. Register HttpKernel and ConsoleKernel into the container
+        self.app.container.instance(http_kernel);
+        self.app.container.singleton(|_| ConsoleKernel::default());
+
         self.app
     }
 }
