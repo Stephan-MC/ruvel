@@ -107,9 +107,8 @@ impl ApplicationBuilder {
         let http_kernel = HttpKernel::new(&self.app, router_arc)
             .with_middleware(resolved.global);
 
-        // 4. Register HttpKernel and ConsoleKernel into the container
+        // 4. Register configured HttpKernel instance into the container
         self.app.container.instance(http_kernel);
-        self.app.container.singleton(|_| ConsoleKernel::default());
 
         self.app
     }
