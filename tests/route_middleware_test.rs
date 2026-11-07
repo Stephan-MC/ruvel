@@ -1,5 +1,5 @@
 use ruvel::foundation::Application;
-use ruvel::http::{Method, Middleware, Next, Request, Response};
+use ruvel::http::{Kernel, Method, Middleware, Next, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,15 +62,17 @@ async fn test_route_level_middleware_with_alias() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
+
     // /dashboard should have X-Auth header
     let req = Request::new(Method::GET, "/dashboard");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-Auth"), Some("passed"));
     assert_eq!(res.body, b"welcome");
 
     // /public should NOT have X-Auth header
     let req = Request::new(Method::GET, "/public");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-Auth"), None);
     assert_eq!(res.body, b"public-data");
 }
@@ -90,8 +92,9 @@ async fn test_route_level_middleware_with_direct_instance() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::GET, "/direct");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-Direct"), Some("yes"));
 }
 
@@ -129,8 +132,9 @@ async fn test_route_level_middleware_slice_and_chaining() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::POST, "/submit");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-M1"), Some("1"));
     assert_eq!(res.headers.get("X-M2"), Some("2"));
     assert_eq!(res.headers.get("X-M3"), Some("3"));
@@ -146,8 +150,9 @@ async fn test_route_naming() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::GET, "/users/profile");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.body, b"profile");
 }
 
@@ -167,12 +172,13 @@ async fn test_route_prefix_and_group_prefix() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::GET, "/api/v1/admin/users");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.body, b"users-list");
 
     let req = Request::new(Method::GET, "/api/v1/posts");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.body, b"posts-list");
 }
 
@@ -199,12 +205,13 @@ async fn test_without_middleware() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::GET, "/protected");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-Auth"), Some("checked"));
 
     let req = Request::new(Method::GET, "/bypass");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.headers.get("X-Auth"), None);
 }
 
@@ -216,6 +223,7 @@ async fn test_any_method() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     for method in [
         Method::GET,
         Method::POST,
@@ -224,7 +232,7 @@ async fn test_any_method() {
         Method::PATCH,
     ] {
         let req = Request::new(method, "/webhook");
-        let res = app.router.dispatch(req).await;
+        let res = kernel.handle(req).await;
         assert_eq!(res.body, b"handled");
     }
 }
@@ -247,8 +255,9 @@ async fn test_fluent_group_and_counter_middleware() {
         })
         .create();
 
+    let kernel = app.make::<Kernel>().unwrap();
     let req = Request::new(Method::GET, "/counter/inc");
-    let res = app.router.dispatch(req).await;
+    let res = kernel.handle(req).await;
     assert_eq!(res.body, b"incremented");
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }

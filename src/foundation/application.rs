@@ -6,7 +6,6 @@ use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::contracts::http::Kernel as HttpKernelContract;
 use crate::http::{Kernel, Request};
-use crate::routing::Router;
 use crate::support::ServiceProvider;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,7 +19,6 @@ pub struct Scheduler {}
 
 pub struct Application {
     pub container: Container,
-    pub router: Router,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
     booted: bool,
@@ -36,15 +34,15 @@ impl Application {
     pub fn new(_base_path: &str) -> Self {
         Self {
             container: Container::new(),
-            router: Router::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
         }
     }
 
+    /// Configure the application and register default kernels.
     pub fn configure(base_path: &str) -> ApplicationBuilder {
-        ApplicationBuilder::new(Self::new(base_path))
+        ApplicationBuilder::new(Self::new(base_path)).with_kernels()
     }
 
     /// Register a service provider with the application.
@@ -57,7 +55,10 @@ impl Application {
 
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
-            provider.boot(&self.container, &mut self.router).await;
+            let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+            let mut router_clone = (*kernel.get_router()).clone();
+            provider.boot(&self.container, &mut router_clone).await;
+            kernel.set_router(Arc::new(router_clone));
         }
 
         self.providers.push(provider);
@@ -72,9 +73,16 @@ impl Application {
             return;
         }
 
+        let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+        let mut router_clone = (*kernel.get_router()).clone();
+
         for provider in &self.providers {
-            provider.boot(&self.container, &mut self.router).await;
+            provider.boot(&self.container, &mut router_clone).await;
         }
+
+        let final_router = Arc::new(router_clone);
+        kernel.set_router(Arc::clone(&final_router));
+        self.container.instance((*final_router).clone());
 
         self.booted = true;
     }

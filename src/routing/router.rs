@@ -5,7 +5,10 @@ use matchit::Router as MatchitRouter;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+use super::into_middleware::{IntoMiddleware, MiddlewareItem};
+use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
 
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
 use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
@@ -29,8 +32,8 @@ pub(crate) struct RouteEntry {
 pub struct Router {
     // Map each HTTP Method to its own Radix Tree of routes
     routes: HashMap<Method, MatchitRouter<RouteEntry>>,
-    groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
-    aliases: HashMap<String, Arc<dyn Middleware>>,
+    groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
+    aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
 
     // Group properties applied to routes
     pub(crate) group_prefix: Option<String>,
@@ -51,8 +54,8 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            groups: HashMap::new(),
-            aliases: HashMap::new(),
+            groups: Arc::new(RwLock::new(HashMap::new())),
+            aliases: Arc::new(RwLock::new(HashMap::new())),
             group_prefix: None,
             group_middleware: Vec::new(),
             group_domain: None,
@@ -65,13 +68,13 @@ impl Router {
     }
 
     /// Install groups and aliases from application configuration.
-    pub(crate) fn install_middleware(
-        &mut self,
+    pub fn install_middleware(
+        &self,
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
         aliases: HashMap<String, Arc<dyn Middleware>>,
     ) {
-        self.groups = groups;
-        self.aliases = aliases;
+        *self.groups.write().unwrap() = groups;
+        *self.aliases.write().unwrap() = aliases;
     }
 
     pub(crate) fn combine_prefix(&self, path: &str) -> String {
@@ -138,9 +141,11 @@ impl Router {
                 if excluded_aliases.contains(name) {
                     return;
                 }
-                if let Some(group) = self.groups.get(name) {
+                let groups = self.groups.read().unwrap();
+                let aliases = self.aliases.read().unwrap();
+                if let Some(group) = groups.get(name) {
                     layers.extend(group.iter().cloned());
-                } else if let Some(alias) = self.aliases.get(name) {
+                } else if let Some(alias) = aliases.get(name) {
                     layers.push(Arc::clone(alias));
                 } else {
                     panic!("Unknown middleware [{name}]");
