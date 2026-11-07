@@ -14,7 +14,7 @@ pub struct Scheduler {}
 pub struct ApplicationBuilder {
     app: Application,
     router: Router,
-    middleware: Option<Middleware>,
+    middleware_callback: Option<Box<dyn FnOnce(&mut Middleware)>>,
     routing_callback: Option<Box<dyn FnOnce(&mut Router)>>,
 }
 
@@ -23,7 +23,7 @@ impl ApplicationBuilder {
         Self {
             app,
             router: Router::new(),
-            middleware: None,
+            middleware_callback: None,
             routing_callback: None,
         }
     }
@@ -71,14 +71,19 @@ impl ApplicationBuilder {
         self
     }
 
-    /// Configure global middleware, groups, and aliases.
+    /// Configure middleware callback for the HTTP Kernel.
     pub fn with_middleware<F>(mut self, callback: F) -> Self
     where
-        F: FnOnce(&mut Middleware),
+        F: FnOnce(&mut Middleware) + 'static,
     {
-        let mut middleware = self.middleware.unwrap_or_default();
-        callback(&mut middleware);
-        self.middleware = Some(middleware);
+        if let Some(prev) = self.middleware_callback.take() {
+            self.middleware_callback = Some(Box::new(move |m| {
+                prev(m);
+                callback(m);
+            }));
+        } else {
+            self.middleware_callback = Some(Box::new(callback));
+        }
 
         self
     }
@@ -91,24 +96,29 @@ impl ApplicationBuilder {
     }
 
     pub fn create(mut self) -> Application {
-        let resolved = self.middleware.unwrap_or_default().resolve();
+        // Construct the HTTP Kernel with &app and Arc<Router>
+        let mut router = self.router;
 
-        // 1. Install route groups and aliases on the router
-        self.router
-            .install_middleware(resolved.groups, resolved.aliases);
-
-        // 2. Execute routing callbacks
-        if let Some(callback) = self.routing_callback.take() {
-            callback(&mut self.router);
+        // If there's a middleware callback, resolve it through Kernel
+        let mut kernel = HttpKernel::new(&self.app, Arc::new(Router::new()));
+        if let Some(callback) = self.middleware_callback.take() {
+            kernel.configure_middleware(callback);
+            let groups = kernel.middleware_groups.read().unwrap().clone();
+            let aliases = kernel.middleware_aliases.read().unwrap().clone();
+            router.install_middleware(groups, aliases);
         }
 
-        // 3. Construct HttpKernel with &app and Arc<Router>, attaching global middleware
-        let router_arc = Arc::new(self.router);
-        let http_kernel = HttpKernel::new(&self.app, router_arc)
-            .with_middleware(resolved.global);
+        // Execute routing callbacks
+        if let Some(callback) = self.routing_callback.take() {
+            callback(&mut router);
+        }
 
-        // 4. Register configured HttpKernel instance into the container
-        self.app.container.instance(http_kernel);
+        // Attach final router to kernel
+        kernel.router = Arc::new(router);
+        kernel.sync_router_handler();
+
+        // Register HttpKernel in the container
+        self.app.container.instance(kernel);
 
         self.app
     }
