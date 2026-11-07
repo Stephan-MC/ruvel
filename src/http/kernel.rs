@@ -1,72 +1,62 @@
 use crate::configuration::Middleware as MiddlewareConfig;
 use crate::contracts;
-use crate::foundation::Application;
 use crate::http::{BoxFuture, HandlerFn, Middleware, Next, Request, Response};
 use crate::routing::Router;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct Kernel {
-    pub router: Arc<Router>,
-    pub middleware: Arc<[Arc<dyn Middleware>]>,
+    pub router: Arc<RwLock<Arc<Router>>>,
+    pub middleware: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
     pub middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
     pub middleware_aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
-    router_handler: HandlerFn,
 }
 
 impl Kernel {
-    pub fn new(_app: &Application, router: Arc<Router>) -> Self {
-        let r = Arc::clone(&router);
-        let router_handler: HandlerFn = Arc::new(move |req| {
-            let r = Arc::clone(&r);
-            Box::pin(async move { r.dispatch(req).await })
-        });
-
+    pub fn new(router: Arc<Router>) -> Self {
         Self {
-            router,
-            middleware: Arc::new([]),
+            router: Arc::new(RwLock::new(router)),
+            middleware: Arc::new(RwLock::new(Vec::new())),
             middleware_groups: Arc::new(RwLock::new(HashMap::new())),
             middleware_aliases: Arc::new(RwLock::new(HashMap::new())),
-            router_handler,
         }
     }
 
-    pub fn sync_router_handler(&mut self) {
-        let r = Arc::clone(&self.router);
-        self.router_handler = Arc::new(move |req| {
-            let r = Arc::clone(&r);
-            Box::pin(async move { r.dispatch(req).await })
-        });
+    /// Set the router instance on the kernel.
+    pub fn set_router(&self, router: Arc<Router>) {
+        *self.router.write().unwrap() = router;
+    }
+
+    /// Get a clone of the inner router Arc.
+    pub fn get_router(&self) -> Arc<Router> {
+        self.router.read().unwrap().clone()
     }
 
     /// Set global middleware on the kernel.
-    pub fn set_global_middleware(&mut self, middleware: Vec<Arc<dyn Middleware>>) -> &mut Self {
-        self.middleware = middleware.into();
-        self
+    pub fn set_global_middleware(&self, middleware: Vec<Arc<dyn Middleware>>) {
+        *self.middleware.write().unwrap() = middleware;
     }
 
     /// Set route middleware groups on the kernel and sync to the router.
     pub fn set_middleware_groups(
-        &mut self,
+        &self,
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
-    ) -> &mut Self {
+    ) {
         *self.middleware_groups.write().unwrap() = groups;
         self.sync_middleware_to_router();
-        self
     }
 
     /// Set route middleware aliases on the kernel and sync to the router.
     pub fn set_middleware_aliases(
-        &mut self,
+        &self,
         aliases: HashMap<String, Arc<dyn Middleware>>,
-    ) -> &mut Self {
+    ) {
         *self.middleware_aliases.write().unwrap() = aliases;
         self.sync_middleware_to_router();
-        self
     }
 
     /// Configure middleware via the Laravel-style Middleware configuration object.
-    pub fn configure_middleware<F>(&mut self, callback: F) -> &mut Self
+    pub fn configure_middleware<F>(&self, callback: F)
     where
         F: FnOnce(&mut MiddlewareConfig),
     {
@@ -78,26 +68,34 @@ impl Kernel {
         *self.middleware_groups.write().unwrap() = resolved.groups;
         *self.middleware_aliases.write().unwrap() = resolved.aliases;
         self.sync_middleware_to_router();
-        self
     }
 
     /// Sync the current state of route middleware groups and aliases to the router.
     pub fn sync_middleware_to_router(&self) {
         let groups = self.middleware_groups.read().unwrap().clone();
         let aliases = self.middleware_aliases.read().unwrap().clone();
-        self.router.install_middleware(groups, aliases);
+        self.get_router().install_middleware(groups, aliases);
     }
 
     pub fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
-        if self.middleware.is_empty() {
-            return self.router.dispatch(req);
+        let layers = self.middleware.read().unwrap().clone();
+        let router = self.get_router();
+        if layers.is_empty() {
+            let r = Arc::clone(&router);
+            return Box::pin(async move { r.dispatch(req).await });
         }
+
+        let router_clone = Arc::clone(&router);
+        let router_handler: HandlerFn = Arc::new(move |req| {
+            let r = Arc::clone(&router_clone);
+            Box::pin(async move { r.dispatch(req).await })
+        });
 
         Box::pin(async move {
             let next = Next {
-                layers: &self.middleware,
+                layers: &layers,
                 index: 0,
-                handler: &self.router_handler,
+                handler: &router_handler,
             };
 
             next.run(req).await
@@ -107,20 +105,7 @@ impl Kernel {
 
 impl Default for Kernel {
     fn default() -> Self {
-        let r: Arc<Router> = Arc::new(Router::new());
-        let r_clone = Arc::clone(&r);
-        let router_handler: HandlerFn = Arc::new(move |req| {
-            let r = Arc::clone(&r_clone);
-            Box::pin(async move { r.dispatch(req).await })
-        });
-
-        Self {
-            router: r,
-            middleware: Arc::new([]),
-            middleware_groups: Arc::new(RwLock::new(HashMap::new())),
-            middleware_aliases: Arc::new(RwLock::new(HashMap::new())),
-            router_handler,
-        }
+        Self::new(Arc::new(Router::new()))
     }
 }
 

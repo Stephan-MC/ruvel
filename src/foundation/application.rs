@@ -56,7 +56,9 @@ impl Application {
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
             let kernel = self.make::<Kernel>().expect("Kernel not found in container");
-            provider.boot(&self.container, &kernel.router).await;
+            let mut router_clone = (*kernel.get_router()).clone();
+            provider.boot(&self.container, &mut router_clone).await;
+            kernel.set_router(Arc::new(router_clone));
         }
 
         self.providers.push(provider);
@@ -72,10 +74,15 @@ impl Application {
         }
 
         let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+        let mut router_clone = (*kernel.get_router()).clone();
 
         for provider in &self.providers {
-            provider.boot(&self.container, &kernel.router).await;
+            provider.boot(&self.container, &mut router_clone).await;
         }
+
+        let final_router = Arc::new(router_clone);
+        kernel.set_router(Arc::clone(&final_router));
+        self.container.instance((*final_router).clone());
 
         self.booted = true;
     }
