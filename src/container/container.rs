@@ -6,6 +6,12 @@ use std::sync::{Arc, OnceLock};
 /// Dynamic factory closure type for resolving bindings.
 type BindingFactory = Arc<dyn Fn(&Container) -> Arc<dyn Any + Send + Sync> + Send + Sync>;
 
+/// Callback executed before an item is resolved.
+type BeforeResolvingCallback = Arc<dyn Fn(&Container) + Send + Sync>;
+
+/// Callback executed after an item is resolved.
+type AfterResolvingCallback = Arc<dyn Fn(&Arc<dyn Any + Send + Sync>, &Container) + Send + Sync>;
+
 #[derive(Clone)]
 enum ServiceBinding {
     /// Instance binding: pre-constructed instance wrapped in Arc and stored directly into the container.
@@ -26,6 +32,10 @@ pub struct Container {
     bindings: ArcSwap<HashMap<TypeId, ServiceBinding>>,
     /// Named string aliases for abstract types (e.g., "db" -> TypeId of DatabasePool).
     aliases: ArcSwap<HashMap<String, TypeId>>,
+    /// Callbacks invoked before resolving a type.
+    before_resolving: ArcSwap<HashMap<TypeId, Vec<BeforeResolvingCallback>>>,
+    /// Callbacks invoked after resolving a type.
+    after_resolving: ArcSwap<HashMap<TypeId, Vec<AfterResolvingCallback>>>,
 }
 
 impl Container {
@@ -33,7 +43,39 @@ impl Container {
         Self {
             bindings: ArcSwap::from_pointee(HashMap::new()),
             aliases: ArcSwap::from_pointee(HashMap::new()),
+            before_resolving: ArcSwap::from_pointee(HashMap::new()),
+            after_resolving: ArcSwap::from_pointee(HashMap::new()),
         }
+    }
+
+    /// Register a callback to be run before an item of type `T` is resolved.
+    pub fn before_resolving<T: 'static, F>(&self, callback: F)
+    where
+        F: Fn(&Container) + Send + Sync + 'static,
+    {
+        let mut map = (**self.before_resolving.load()).clone();
+        map.entry(TypeId::of::<T>())
+            .or_default()
+            .push(Arc::new(callback));
+        self.before_resolving.store(Arc::new(map));
+    }
+
+    /// Register a callback to be run after an item of type `T` is resolved.
+    pub fn after_resolving<T: Send + Sync + 'static, F>(&self, callback: F)
+    where
+        F: Fn(&Arc<T>, &Container) + Send + Sync + 'static,
+    {
+        let callback_wrapper: AfterResolvingCallback = Arc::new(move |any_arc, container| {
+            if let Ok(downcasted) = any_arc.clone().downcast::<T>() {
+                callback(&downcasted, container);
+            }
+        });
+
+        let mut map = (**self.after_resolving.load()).clone();
+        map.entry(TypeId::of::<T>())
+            .or_default()
+            .push(callback_wrapper);
+        self.after_resolving.store(Arc::new(map));
     }
 
     /// Bind a transient factory (equivalent to Laravel's `$container->bind()`).
@@ -109,39 +151,43 @@ impl Container {
         &self,
         type_id: &TypeId,
     ) -> Result<Arc<T>, String> {
-        let bindings = self.bindings.load();
-
-        match bindings.get(type_id) {
-            Some(ServiceBinding::Instance(instance)) => {
-                instance.clone().downcast::<T>().map_err(|_| {
-                    format!(
-                        "Failed to downcast dependency to target type: {}",
-                        std::any::type_name::<T>()
-                    )
-                })
+        // 1. Fire beforeResolving callbacks for this type
+        if let Some(callbacks) = self.before_resolving.load().get(type_id) {
+            for callback in callbacks {
+                callback(self);
             }
+        }
+
+        // 2. Resolve or build the instance
+        let bindings = self.bindings.load();
+        let raw_instance: Arc<dyn Any + Send + Sync> = match bindings.get(type_id) {
+            Some(ServiceBinding::Instance(instance)) => Arc::clone(instance),
             Some(ServiceBinding::Singleton { factory, instance }) => {
                 let resolved = instance.get_or_init(|| factory(self));
-                resolved.clone().downcast::<T>().map_err(|_| {
-                    format!(
-                        "Failed to downcast dependency to target type: {}",
-                        std::any::type_name::<T>()
-                    )
-                })
+                Arc::clone(resolved)
             }
-            Some(ServiceBinding::Factory(factory)) => {
-                let raw_instance = factory(self);
-                raw_instance.downcast::<T>().map_err(|_| {
-                    format!(
-                        "Failed to downcast dependency to target type: {}",
-                        std::any::type_name::<T>()
-                    )
-                })
+            Some(ServiceBinding::Factory(factory)) => factory(self),
+            None => {
+                return Err(format!(
+                    "Unbound dependency requested: {:?}",
+                    std::any::type_name::<T>()
+                ))
             }
-            None => Err(format!(
-                "Unbound dependency requested: {:?}",
-                std::any::type_name::<T>()
-            )),
+        };
+
+        // 3. Fire afterResolving callbacks for this type
+        if let Some(callbacks) = self.after_resolving.load().get(type_id) {
+            for callback in callbacks {
+                callback(&raw_instance, self);
+            }
         }
+
+        // 4. Downcast and return typed Arc<T>
+        raw_instance.downcast::<T>().map_err(|_| {
+            format!(
+                "Failed to downcast dependency to target type: {}",
+                std::any::type_name::<T>()
+            )
+        })
     }
 }
