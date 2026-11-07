@@ -24,7 +24,23 @@ impl Kernel {
         }
     }
 
-    pub fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
+    pub fn router(&self) -> &Arc<Router> {
+        &self.router
+    }
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self::new(Arc::new(Router::new()), Vec::new())
+    }
+}
+
+impl contracts::http::Kernel for Kernel {
+    /// Dispatch one request through global middleware and the router.
+    ///
+    /// Takes `&self` because the server shares one kernel across connections
+    /// through `Arc<dyn contracts::http::Kernel>`.
+    fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
         if self.middleware.is_empty() {
             return self.router.dispatch(req);
         }
@@ -38,21 +54,5 @@ impl Kernel {
 
             next.run(req).await
         })
-    }
-
-    pub fn router(&self) -> &Arc<Router> {
-        &self.router
-    }
-}
-
-impl Default for Kernel {
-    fn default() -> Self {
-        Self::new(Arc::new(Router::new()), Vec::new())
-    }
-}
-
-impl contracts::http::Kernel for Kernel {
-    fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
-        self.handle(req)
     }
 }

@@ -1,8 +1,10 @@
 use ruvel::console::Kernel as ConsoleKernel;
+use ruvel::contracts::http::Kernel as HttpKernelContract;
 use ruvel::foundation::Application;
 use ruvel::http::{Kernel as HttpKernel, Method, Middleware, Next, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 struct GlobalHeaderMiddleware {
     key: &'static str,
@@ -64,6 +66,31 @@ async fn test_http_kernel_handles_404_through_global_middleware() {
 
     assert_eq!(res.status.code(), 404);
     assert_eq!(res.headers.get("X-Global-404"), Some("applied"));
+}
+
+#[tokio::test]
+async fn test_http_kernel_trait_object_dispatches() {
+    let app = Application::configure("")
+        .with_middleware(|m| {
+            m.append(GlobalHeaderMiddleware {
+                key: "X-Global",
+                val: "true",
+            });
+        })
+        .with_routing(|router| {
+            router.get("/hello", |_req| async { "world" });
+        })
+        .create();
+
+    // Same cast Application::listen uses for every accepted connection.
+    let kernel: Arc<dyn HttpKernelContract> = app
+        .make::<HttpKernel>()
+        .expect("Kernel must be in container");
+
+    let res = kernel.handle(Request::new(Method::GET, "/hello")).await;
+
+    assert_eq!(res.body, b"world");
+    assert_eq!(res.headers.get("X-Global"), Some("true"));
 }
 
 #[tokio::test]
