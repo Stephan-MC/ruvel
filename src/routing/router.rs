@@ -25,10 +25,10 @@ pub(crate) struct RouteEntry {
     pub(crate) wheres: HashMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct Router {
     // Map each HTTP Method to its own Radix Tree of routes
     routes: HashMap<Method, MatchitRouter<RouteEntry>>,
-    global: Vec<Arc<dyn Middleware>>,
     groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
     aliases: HashMap<String, Arc<dyn Middleware>>,
 
@@ -37,9 +37,8 @@ pub struct Router {
     pub(crate) group_middleware: Vec<MiddlewareItem>,
     pub(crate) group_domain: Option<String>,
 
-    // Cached 404 Fallbacks to prevent allocations on unmatched routes
+    // Cached 404 Fallback
     fallback_handler: HandlerFn,
-    fallback_pipeline: Arc<[Arc<dyn Middleware>]>,
 }
 
 impl Default for Router {
@@ -52,7 +51,6 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            global: Vec::new(),
             groups: HashMap::new(),
             aliases: HashMap::new(),
             group_prefix: None,
@@ -63,23 +61,17 @@ impl Router {
             fallback_handler: Arc::new(|_req| {
                 Box::pin(async { Response::not_found().text("404 Not Found") })
             }),
-            fallback_pipeline: Arc::new([]),
         }
     }
 
-    /// Install global middleware, groups, and aliases from application configuration.
+    /// Install groups and aliases from application configuration.
     pub(crate) fn install_middleware(
         &mut self,
-        global: Vec<Arc<dyn Middleware>>,
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
         aliases: HashMap<String, Arc<dyn Middleware>>,
     ) {
-        self.global = global.clone();
         self.groups = groups;
         self.aliases = aliases;
-
-        // Ensure 404 routes still pass through global middleware
-        self.fallback_pipeline = global.into();
     }
 
     pub(crate) fn combine_prefix(&self, path: &str) -> String {
@@ -120,7 +112,7 @@ impl Router {
         local_items: &[MiddlewareItem],
         excluded_aliases: &[String],
     ) -> Arc<[Arc<dyn Middleware>]> {
-        let mut layers = self.global.clone();
+        let mut layers = Vec::new();
 
         // 1. Group middleware on the router
         for item in &self.group_middleware {
@@ -287,35 +279,33 @@ impl Router {
     }
 
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
-        let (handler, pipeline) = if let Some(method_router) = self.routes.get(&req.method) {
+        if let Some(method_router) = self.routes.get(&req.method) {
             if let Ok(matched) = method_router.at(&req.path) {
                 // Populate inline RouteParams without allocating dynamic HashMap nodes
                 for (key, value) in matched.params.iter() {
                     req.params.insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
                 }
 
-                (&matched.value.handler, &matched.value.pipeline)
-            } else {
-                (&self.fallback_handler, &self.fallback_pipeline)
-            }
-        } else {
-            (&self.fallback_handler, &self.fallback_pipeline)
-        };
+                let handler = &matched.value.handler;
+                let pipeline = &matched.value.pipeline;
 
-        // FAST-PATH: Bypass middleware machinery completely if there are no layers
-        if pipeline.is_empty() {
-            return (handler)(req);
+                // FAST-PATH: Bypass middleware machinery completely if there are no layers
+                if pipeline.is_empty() {
+                    return (handler)(req);
+                }
+
+                return Box::pin(async move {
+                    let next = Next {
+                        layers: pipeline,
+                        index: 0,
+                        handler,
+                    };
+
+                    next.run(req).await
+                });
+            }
         }
 
-        // We explicitly wrap the `Next` run in a BoxFuture here so it matches the return type
-        Box::pin(async move {
-            let next = Next {
-                layers: pipeline,
-                index: 0,
-                handler,
-            };
-
-            next.run(req).await
-        })
+        (self.fallback_handler)(req)
     }
 }
