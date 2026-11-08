@@ -1,11 +1,11 @@
 use crate::contracts::pipeline::Pipeable;
 use crate::http::{Request, Response};
-use crate::pipeline::Pipeline as BasePipeline;
+use crate::pipeline;
 use std::future::Future;
 
 /// A specialized routing pipeline extending Ruvel's base pipeline for HTTP Request and Response.
 pub struct Pipeline {
-    inner: BasePipeline<Request, Response>,
+    inner: pipeline::Pipeline<Request, Response>,
 }
 
 impl Default for Pipeline {
@@ -17,7 +17,7 @@ impl Default for Pipeline {
 impl Pipeline {
     pub fn new() -> Self {
         Self {
-            inner: BasePipeline::new(),
+            inner: pipeline::Pipeline::new(),
         }
     }
 
