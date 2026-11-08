@@ -1,24 +1,21 @@
 use crate::configuration::Middleware as MiddlewareConfig;
 use crate::contracts;
-use crate::http::{BoxFuture, HandlerFn, Middleware, Next, Request, Response};
+use crate::http::{BoxFuture, Middleware, Request, Response};
+use crate::pipeline::Pipeline;
 use crate::routing::Router;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct Kernel {
-    pub router: Arc<RwLock<Arc<Router>>>,
-    pub middleware: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
-    pub middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
-    pub middleware_aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
+    router: Arc<Router>,
+    middleware: Arc<[Arc<dyn Middleware>]>,
 }
 
 impl Kernel {
-    pub fn new(router: Arc<Router>) -> Self {
+    pub fn new(router: Arc<Router>, global_middleware: Vec<Arc<dyn Middleware>>) -> Self {
         Self {
-            router: Arc::new(RwLock::new(router)),
-            middleware: Arc::new(RwLock::new(Vec::new())),
-            middleware_groups: Arc::new(RwLock::new(HashMap::new())),
-            middleware_aliases: Arc::new(RwLock::new(HashMap::new())),
+            router,
+            middleware: global_middleware.into(),
         }
     }
 
@@ -85,20 +82,18 @@ impl Kernel {
             return Box::pin(async move { r.dispatch(req).await });
         }
 
-        let router_clone = Arc::clone(&router);
-        let router_handler: HandlerFn = Arc::new(move |req| {
-            let r = Arc::clone(&router_clone);
-            Box::pin(async move { r.dispatch(req).await })
-        });
+        let router = Arc::clone(&self.router);
+        let middleware = Arc::clone(&self.middleware);
 
         Box::pin(async move {
-            let next = Next {
-                layers: &layers,
-                index: 0,
-                handler: &router_handler,
-            };
-
-            next.run(req).await
+            Pipeline::new()
+                .send(req)
+                .through(middleware.iter().cloned())
+                .then(move |r| {
+                    let router = Arc::clone(&router);
+                    async move { router.dispatch(r).await }
+                })
+                .await
         })
     }
 }
