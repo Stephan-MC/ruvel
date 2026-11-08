@@ -285,7 +285,7 @@ impl Status {
         }
     }
 
-    /// Try resolving an [`HttpStatus`] from a numeric code. Returns [`None`] if unrecognized.
+    /// Try resolving an [`Status`] from a numeric code. Returns [`None`] if unrecognized.
     pub fn from_code(code: u16) -> Option<Self> {
         Self::try_from(code).ok()
     }

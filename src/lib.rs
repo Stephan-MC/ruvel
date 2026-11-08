@@ -6,5 +6,6 @@ pub mod contracts;
 pub mod database;
 pub mod foundation;
 pub mod http;
+pub mod pipeline;
 pub mod routing;
 pub mod support;
