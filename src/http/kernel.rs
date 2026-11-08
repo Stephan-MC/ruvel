@@ -1,21 +1,26 @@
 use crate::configuration::Middleware as MiddlewareConfig;
 use crate::contracts;
-use crate::http::{BoxFuture, Middleware, Request, Response};
+use crate::http::middleware::{BoxFuture, Middleware};
+use crate::http::{Request, Response};
 use crate::pipeline::Pipeline;
 use crate::routing::Router;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct Kernel {
-    router: Arc<Router>,
-    middleware: Arc<[Arc<dyn Middleware>]>,
+    pub router: Arc<RwLock<Arc<Router>>>,
+    pub middleware: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
+    pub middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
+    pub middleware_aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
 }
 
 impl Kernel {
-    pub fn new(router: Arc<Router>, global_middleware: Vec<Arc<dyn Middleware>>) -> Self {
+    pub fn new(router: Arc<Router>) -> Self {
         Self {
-            router,
-            middleware: global_middleware.into(),
+            router: Arc::new(RwLock::new(router)),
+            middleware: Arc::new(RwLock::new(Vec::new())),
+            middleware_groups: Arc::new(RwLock::new(HashMap::new())),
+            middleware_aliases: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -82,13 +87,10 @@ impl Kernel {
             return Box::pin(async move { r.dispatch(req).await });
         }
 
-        let router = Arc::clone(&self.router);
-        let middleware = Arc::clone(&self.middleware);
-
         Box::pin(async move {
             Pipeline::new()
                 .send(req)
-                .through(middleware.iter().cloned())
+                .through(layers)
                 .then(move |r| {
                     let router = Arc::clone(&router);
                     async move { router.dispatch(r).await }

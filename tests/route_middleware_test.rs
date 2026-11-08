@@ -1,5 +1,5 @@
 use ruvel::foundation::Application;
-use ruvel::http::{Kernel, Method, Middleware, Next, Request, Response};
+use ruvel::http::{Method, Middleware, Next, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
