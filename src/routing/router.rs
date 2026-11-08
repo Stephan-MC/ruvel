@@ -1,7 +1,7 @@
 use crate::contracts::support::Responsable;
 use crate::http::BoxFuture;
 use crate::http::{Method, Middleware, Request, Response};
-use crate::routing::pipeline::RoutingPipeline;
+use crate::routing::pipeline::Pipeline;
 use matchit::Router as MatchitRouter;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -298,7 +298,7 @@ impl Router {
                 let pipeline_cloned = Arc::clone(pipeline);
                 let handler_cloned = Arc::clone(handler);
                 return Box::pin(async move {
-                    RoutingPipeline::new()
+                    Pipeline::new()
                         .send(req)
                         .through(pipeline_cloned.iter().cloned())
                         .then(move |r| {

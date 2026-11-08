@@ -5,5 +5,5 @@ mod router;
 
 pub use into_middleware::{IntoMiddleware, MiddlewareItem};
 pub use pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
-pub use pipeline::RoutingPipeline;
+pub use pipeline::Pipeline;
 pub use router::{HandlerFn, Router};

@@ -1,19 +1,7 @@
-use super::pipe::{DestinationFn, Next};
+use super::pipe::{Next, StepFn};
 use crate::contracts::pipeline::Pipeable;
 use std::future::Future;
 use std::sync::Arc;
-
-/// Trait converting items to `Arc<dyn Pipeable<T, R>>` avoiding duplicate Arc allocations.
-pub trait IntoPipeable<T, R> {
-    fn into_pipeable(self) -> Arc<dyn Pipeable<T, R>>;
-}
-
-impl<T: Send + 'static, R: Send + 'static> IntoPipeable<T, R> for Arc<dyn Pipeable<T, R>> {
-    #[inline]
-    fn into_pipeable(self) -> Arc<dyn Pipeable<T, R>> {
-        self
-    }
-}
 
 /// Pipeline builder that passes a payload through a sequence of pipes (middleware layers).
 pub struct Pipeline<T, R = T> {
@@ -50,11 +38,7 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
     {
         self.pipes = pipes
             .into_iter()
-            .map(|p| -> Arc<dyn Pipeable<T, R>> {
-                // If already an Arc<P>, the compiler sees P implements Pipeable
-                // and Into/Arc cleanly encapsulates it.
-                Arc::new(p)
-            })
+            .map(|p| -> Arc<dyn Pipeable<T, R>> { Arc::new(p) })
             .collect();
         self
     }
@@ -78,20 +62,21 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
             .passable
             .expect("Cannot execute pipeline without setting a passable payload via send()");
 
-        let destination_fn: DestinationFn<T, R> =
+        let mut current_step: StepFn<T, R> =
             Arc::new(move |passable| Box::pin(destination(passable)));
 
-        if self.pipes.is_empty() {
-            return (destination_fn)(passable).await;
+        // Compose the onion layers in reverse order: innermost layer wraps destination,
+        // outermost layer is called first (identical to Laravel's array_reduce pipeline).
+        for pipe in self.pipes.into_iter().rev() {
+            let next_step = current_step;
+            current_step = Arc::new(move |passable| {
+                let p = Arc::clone(&pipe);
+                let n = Next::new(Arc::clone(&next_step));
+                Box::pin(async move { p.handle(passable, n).await })
+            });
         }
 
-        let next = Next {
-            pipes: self.pipes.into(),
-            index: 0,
-            destination: destination_fn,
-        };
-
-        next.run(passable).await
+        current_step(passable).await
     }
 }
 
