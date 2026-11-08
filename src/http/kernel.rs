@@ -1,26 +1,19 @@
 use crate::contracts;
-use crate::http::{BoxFuture, HandlerFn, Middleware, Next, Request, Response};
+use crate::http::{BoxFuture, Middleware, Request, Response};
+use crate::pipeline::Pipeline;
 use crate::routing::Router;
 use std::sync::Arc;
 
 pub struct Kernel {
     router: Arc<Router>,
     middleware: Arc<[Arc<dyn Middleware>]>,
-    router_handler: HandlerFn,
 }
 
 impl Kernel {
     pub fn new(router: Arc<Router>, global_middleware: Vec<Arc<dyn Middleware>>) -> Self {
-        let r = Arc::clone(&router);
-        let router_handler: HandlerFn = Arc::new(move |req| {
-            let r = Arc::clone(&r);
-            Box::pin(async move { r.dispatch(req).await })
-        });
-
         Self {
             router,
             middleware: global_middleware.into(),
-            router_handler,
         }
     }
 
@@ -29,14 +22,18 @@ impl Kernel {
             return self.router.dispatch(req);
         }
 
-        Box::pin(async move {
-            let next = Next {
-                layers: &self.middleware,
-                index: 0,
-                handler: &self.router_handler,
-            };
+        let router = Arc::clone(&self.router);
+        let middleware = Arc::clone(&self.middleware);
 
-            next.run(req).await
+        Box::pin(async move {
+            Pipeline::new()
+                .send(req)
+                .through(middleware.iter().cloned())
+                .then(move |r| {
+                    let router = Arc::clone(&router);
+                    async move { router.dispatch(r).await }
+                })
+                .await
         })
     }
 

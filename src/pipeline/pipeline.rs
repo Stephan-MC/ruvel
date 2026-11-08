@@ -1,11 +1,24 @@
-use super::pipe::{DestinationFn, Next, Pipe};
+use super::pipe::{DestinationFn, Next};
+use crate::contracts::pipeline::Pipeable;
 use std::future::Future;
 use std::sync::Arc;
+
+/// Trait converting items to `Arc<dyn Pipeable<T, R>>` avoiding duplicate Arc allocations.
+pub trait IntoPipeable<T, R> {
+    fn into_pipeable(self) -> Arc<dyn Pipeable<T, R>>;
+}
+
+impl<T: Send + 'static, R: Send + 'static> IntoPipeable<T, R> for Arc<dyn Pipeable<T, R>> {
+    #[inline]
+    fn into_pipeable(self) -> Arc<dyn Pipeable<T, R>> {
+        self
+    }
+}
 
 /// Pipeline builder that passes a payload through a sequence of pipes (middleware layers).
 pub struct Pipeline<T, R = T> {
     passable: Option<T>,
-    pipes: Vec<Arc<dyn Pipe<T, R>>>,
+    pipes: Vec<Arc<dyn Pipeable<T, R>>>,
 }
 
 impl<T: Send + 'static, R: Send + 'static> Default for Pipeline<T, R> {
@@ -33,11 +46,15 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
     pub fn through<I, P>(mut self, pipes: I) -> Self
     where
         I: IntoIterator<Item = P>,
-        P: Pipe<T, R> + 'static,
+        P: Pipeable<T, R> + 'static,
     {
         self.pipes = pipes
             .into_iter()
-            .map(|p| -> Arc<dyn Pipe<T, R>> { Arc::new(p) })
+            .map(|p| -> Arc<dyn Pipeable<T, R>> {
+                // If already an Arc<P>, the compiler sees P implements Pipeable
+                // and Into/Arc cleanly encapsulates it.
+                Arc::new(p)
+            })
             .collect();
         self
     }
@@ -45,7 +62,7 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
     /// Add a single pipe to the pipeline.
     pub fn pipe<P>(mut self, pipe: P) -> Self
     where
-        P: Pipe<T, R> + 'static,
+        P: Pipeable<T, R> + 'static,
     {
         self.pipes.push(Arc::new(pipe));
         self

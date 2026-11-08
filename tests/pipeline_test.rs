@@ -1,10 +1,11 @@
-use ruvel::pipeline::{BoxFuture, Next, Pipe, Pipeline};
+use ruvel::contracts::pipeline::Pipeable;
+use ruvel::pipeline::{BoxFuture, FnPipe, Next, Pipeline};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct AddPrefixPipe;
 
-impl Pipe<String> for AddPrefixPipe {
+impl Pipeable<String> for AddPrefixPipe {
     fn handle<'a>(&'a self, passable: String, next: Next<String, String>) -> BoxFuture<'a, String> {
         Box::pin(async move {
             let res = next.run(format!("prefix_{}", passable)).await;
@@ -15,7 +16,7 @@ impl Pipe<String> for AddPrefixPipe {
 
 struct StopEarlyPipe;
 
-impl Pipe<String> for StopEarlyPipe {
+impl Pipeable<String> for StopEarlyPipe {
     fn handle<'a>(&'a self, _passable: String, _next: Next<String, String>) -> BoxFuture<'a, String> {
         Box::pin(async move { "stopped_early".to_string() })
     }
@@ -26,7 +27,7 @@ struct TrackingPipe {
     log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl Pipe<String> for TrackingPipe {
+impl Pipeable<String> for TrackingPipe {
     fn handle<'a>(&'a self, passable: String, next: Next<String, String>) -> BoxFuture<'a, String> {
         Box::pin(async move {
             self.log
@@ -69,14 +70,14 @@ async fn test_pipeline_with_then_return() {
 async fn test_pipeline_onion_order() {
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let pipe1 = TrackingPipe {
+    let pipe1: Arc<dyn Pipeable<String>> = Arc::new(TrackingPipe {
         id: 1,
         log: Arc::clone(&log),
-    };
-    let pipe2 = TrackingPipe {
+    });
+    let pipe2: Arc<dyn Pipeable<String>> = Arc::new(TrackingPipe {
         id: 2,
         log: Arc::clone(&log),
-    };
+    });
 
     let result = Pipeline::new()
         .send("core".to_string())
@@ -115,27 +116,21 @@ async fn test_pipeline_short_circuit() {
 async fn test_pipeline_closure_pipe() {
     let result = Pipeline::new()
         .send(10)
-        .pipe(|val: i32, next: Next<i32, i32>| -> BoxFuture<'static, i32> {
+        .pipe(FnPipe(|val: i32, next: Next<i32, i32>| -> BoxFuture<'static, i32> {
             Box::pin(async move {
                 let res = next.run(val * 2).await;
                 res + 1
             })
-        })
-        .pipe(|val: i32, next: Next<i32, i32>| -> BoxFuture<'static, i32> {
+        }))
+        .pipe(FnPipe(|val: i32, next: Next<i32, i32>| -> BoxFuture<'static, i32> {
             Box::pin(async move {
                 let res = next.run(val + 5).await;
                 res * 3
             })
-        })
+        }))
         .then(|val| async move { val })
         .await;
 
-    // val = 10
-    // pipe 1 sends val * 2 = 20
-    // pipe 2 sends val + 5 = 25
-    // destination returns 25
-    // pipe 2 unwinds: 25 * 3 = 75
-    // pipe 1 unwinds: 75 + 1 = 76
     assert_eq!(result, 76);
 }
 
@@ -159,7 +154,7 @@ async fn test_pipeline_different_input_and_output_types() {
 
     let result = Pipeline::<RequestWrapper, ResponseWrapper>::new()
         .send(RequestWrapper("hello world".to_string()))
-        .pipe(
+        .pipe(FnPipe(
             |req: RequestWrapper,
              next: Next<RequestWrapper, ResponseWrapper>|
              -> BoxFuture<'static, ResponseWrapper> {
@@ -169,10 +164,9 @@ async fn test_pipeline_different_input_and_output_types() {
                     res
                 })
             },
-        )
+        ))
         .then(|req| async move { ResponseWrapper(req.0.len()) })
         .await;
 
-    // "hello world".len() = 11, + 10 = 21
     assert_eq!(result.0, 21);
 }

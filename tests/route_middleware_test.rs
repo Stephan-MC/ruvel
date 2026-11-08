@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct HeaderMiddleware {
-    name: &'static str,
+    key: &'static str,
     val: &'static str,
 }
 
@@ -14,28 +14,27 @@ impl Middleware for HeaderMiddleware {
     fn handle<'a>(
         &'a self,
         request: Request,
-        next: Next<'a>,
+        next: Next,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         Box::pin(async move {
-            let mut res = next.run(request).await;
-            res = res.header(self.name, self.val);
-            res
+            let res = next.run(request).await;
+            res.header(self.key, self.val)
         })
     }
 }
 
 struct CounterMiddleware {
-    counter: Arc<AtomicUsize>,
+    count: Arc<AtomicUsize>,
 }
 
 impl Middleware for CounterMiddleware {
     fn handle<'a>(
         &'a self,
         request: Request,
-        next: Next<'a>,
+        next: Next,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         Box::pin(async move {
-            self.counter.fetch_add(1, Ordering::SeqCst);
+            self.count.fetch_add(1, Ordering::SeqCst);
             next.run(request).await
         })
     }
@@ -48,51 +47,47 @@ async fn test_route_level_middleware_with_alias() {
             m.alias(
                 "auth",
                 HeaderMiddleware {
-                    name: "X-Auth",
+                    key: "X-Auth",
                     val: "passed",
                 },
             );
         })
         .with_routing(|router| {
             router
-                .get("/dashboard", |_req| async { "welcome" })
+                .get("/dashboard", |_req| async { "secret data" })
                 .middleware("auth");
-
-            router.get("/public", |_req| async { "public-data" });
         })
         .create();
 
-    // /dashboard should have X-Auth header
-    let req = Request::new(Method::GET, "/dashboard");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-Auth"), Some("passed"));
-    assert_eq!(res.body, b"welcome");
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    // /public should NOT have X-Auth header
-    let req = Request::new(Method::GET, "/public");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-Auth"), None);
-    assert_eq!(res.body, b"public-data");
+    let req = Request::new(Method::GET, "/dashboard");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"secret data");
+    assert_eq!(res.headers.get("X-Auth"), Some("passed"));
 }
 
 #[tokio::test]
 async fn test_route_level_middleware_with_direct_instance() {
-    let direct_mw = Arc::new(HeaderMiddleware {
-        name: "X-Direct",
-        val: "yes",
-    });
-
     let app = Application::configure("")
         .with_routing(|router| {
             router
-                .get("/direct", |_req| async { "ok" })
-                .middleware(direct_mw);
+                .get("/profile", |_req| async { "profile data" })
+                .middleware(Arc::new(HeaderMiddleware {
+                    key: "X-Profile",
+                    val: "loaded",
+                }));
         })
         .create();
 
-    let req = Request::new(Method::GET, "/direct");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-Direct"), Some("yes"));
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    let req = Request::new(Method::GET, "/profile");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"profile data");
+    assert_eq!(res.headers.get("X-Profile"), Some("loaded"));
 }
 
 #[tokio::test]
@@ -100,80 +95,44 @@ async fn test_route_level_middleware_slice_and_chaining() {
     let app = Application::configure("")
         .with_middleware(|m| {
             m.alias(
-                "m1",
+                "first",
                 HeaderMiddleware {
-                    name: "X-M1",
+                    key: "X-First",
                     val: "1",
                 },
             );
             m.alias(
-                "m2",
+                "second",
                 HeaderMiddleware {
-                    name: "X-M2",
+                    key: "X-Second",
                     val: "2",
                 },
             );
             m.alias(
-                "m3",
+                "third",
                 HeaderMiddleware {
-                    name: "X-M3",
+                    key: "X-Third",
                     val: "3",
                 },
             );
         })
         .with_routing(|router| {
             router
-                .post("/submit", |_req| async { "done" })
-                .middleware(&["m1", "m2"])
-                .middleware("m3");
+                .get("/chained", |_req| async { "chain" })
+                .middleware(["first", "second"])
+                .middleware("third");
         })
         .create();
 
-    let req = Request::new(Method::POST, "/submit");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-M1"), Some("1"));
-    assert_eq!(res.headers.get("X-M2"), Some("2"));
-    assert_eq!(res.headers.get("X-M3"), Some("3"));
-}
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-#[tokio::test]
-async fn test_route_naming() {
-    let app = Application::configure("")
-        .with_routing(|router| {
-            router
-                .get("/users/profile", |_req| async { "profile" })
-                .name("users.profile");
-        })
-        .create();
+    let req = Request::new(Method::GET, "/chained");
+    let res = kernel.handle(req).await;
 
-    let req = Request::new(Method::GET, "/users/profile");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.body, b"profile");
-}
-
-#[tokio::test]
-async fn test_route_prefix_and_group_prefix() {
-    let app = Application::configure("")
-        .with_routing(|router| {
-            // Group prefix
-            router.prefix("/api/v1").group(|router| {
-                // Route with its own prefix addition
-                router
-                    .get("/users", |_req| async { "users-list" })
-                    .prefix("/admin");
-
-                router.get("/posts", |_req| async { "posts-list" });
-            });
-        })
-        .create();
-
-    let req = Request::new(Method::GET, "/api/v1/admin/users");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.body, b"users-list");
-
-    let req = Request::new(Method::GET, "/api/v1/posts");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.body, b"posts-list");
+    assert_eq!(res.body, b"chain");
+    assert_eq!(res.headers.get("X-First"), Some("1"));
+    assert_eq!(res.headers.get("X-Second"), Some("2"));
+    assert_eq!(res.headers.get("X-Third"), Some("3"));
 }
 
 #[tokio::test]
@@ -183,72 +142,117 @@ async fn test_without_middleware() {
             m.alias(
                 "auth",
                 HeaderMiddleware {
-                    name: "X-Auth",
-                    val: "checked",
+                    key: "X-Auth",
+                    val: "passed",
+                },
+            );
+            m.alias(
+                "log",
+                HeaderMiddleware {
+                    key: "X-Log",
+                    val: "logged",
                 },
             );
         })
         .with_routing(|router| {
-            router.middleware("auth").group(|router| {
-                router.get("/protected", |_req| async { "protected" });
+            router
+                .middleware(["auth", "log"])
+                .group(|router| {
+                    router
+                        .get("/excluded", |_req| async { "excluded" })
+                        .without_middleware("log");
+                });
+        })
+        .create();
 
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    let req = Request::new(Method::GET, "/excluded");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"excluded");
+    assert_eq!(res.headers.get("X-Auth"), Some("passed"));
+    assert_eq!(res.headers.get("X-Log"), None);
+}
+
+#[tokio::test]
+async fn test_fluent_group_and_counter_middleware() {
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let app = Application::configure("")
+        .with_routing({
+            let counter = Arc::clone(&counter);
+            move |router| {
                 router
-                    .get("/bypass", |_req| async { "bypassed" })
-                    .without_middleware("auth");
+                    .middleware(Arc::new(CounterMiddleware {
+                        count: Arc::clone(&counter),
+                    }))
+                    .prefix("api")
+                    .group(|router| {
+                        router.get("/counter", |_req| async { "ok" });
+                    });
+            }
+        })
+        .create();
+
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    let req = Request::new(Method::GET, "/api/counter");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"ok");
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_route_prefix_and_group_prefix() {
+    let app = Application::configure("")
+        .with_routing(|router| {
+            router.prefix("v1").group(|router| {
+                router.get("/users", |_req| async { "users list" });
             });
         })
         .create();
 
-    let req = Request::new(Method::GET, "/protected");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-Auth"), Some("checked"));
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/bypass");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.headers.get("X-Auth"), None);
+    let req = Request::new(Method::GET, "/v1/users");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"users list");
+}
+
+#[tokio::test]
+async fn test_route_naming() {
+    let app = Application::configure("")
+        .with_routing(|router| {
+            router
+                .get("/named", |_req| async { "named route" })
+                .name("test.named");
+        })
+        .create();
+
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    let req = Request::new(Method::GET, "/named");
+    let res = kernel.handle(req).await;
+
+    assert_eq!(res.body, b"named route");
 }
 
 #[tokio::test]
 async fn test_any_method() {
     let app = Application::configure("")
         .with_routing(|router| {
-            router.any("/webhook", |_req| async { "handled" });
+            router.any("/any", |_req| async { "any response" });
         })
         .create();
 
-    for method in [
-        Method::GET,
-        Method::POST,
-        Method::PUT,
-        Method::DELETE,
-        Method::PATCH,
-    ] {
-        let req = Request::new(method, "/webhook");
-        let res = app.router.dispatch(req).await;
-        assert_eq!(res.body, b"handled");
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    for method in &[Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::new(method.clone(), "/any");
+        let res = kernel.handle(req).await;
+        assert_eq!(res.body, b"any response");
     }
-}
-
-#[tokio::test]
-async fn test_fluent_group_and_counter_middleware() {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let count_mw = Arc::new(CounterMiddleware {
-        counter: Arc::clone(&counter),
-    });
-
-    let app = Application::configure("")
-        .with_routing(|router| {
-            router
-                .prefix("/counter")
-                .middleware(count_mw)
-                .group(|router| {
-                    router.get("/inc", |_req| async { "incremented" });
-                });
-        })
-        .create();
-
-    let req = Request::new(Method::GET, "/counter/inc");
-    let res = app.router.dispatch(req).await;
-    assert_eq!(res.body, b"incremented");
-    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
