@@ -1,5 +1,6 @@
 use crate::contracts;
-use crate::http::{BoxFuture, Middleware, Request, Response};
+use crate::http::middleware::{BoxFuture, Middleware};
+use crate::http::{Request, Response};
 use crate::pipeline::Pipeline;
 use crate::routing::Router;
 use std::sync::Arc;
