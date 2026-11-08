@@ -10,9 +10,6 @@ use std::sync::{Arc, RwLock};
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
 use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
 
-use super::into_middleware::{IntoMiddleware, MiddlewareItem};
-use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
-
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
 
 #[derive(Clone)]
@@ -288,7 +285,8 @@ impl Router {
             if let Ok(matched) = method_router.at(&req.path) {
                 // Populate inline RouteParams without allocating dynamic HashMap nodes
                 for (key, value) in matched.params.iter() {
-                    req.params.insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
+                    req.params
+                        .insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
                 }
 
                 let handler = &matched.value.handler;

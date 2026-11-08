@@ -81,7 +81,7 @@ impl Response {
     pub const HTTP_GATEWAY_TIMEOUT: u16 = 504;
     pub const HTTP_VERSION_NOT_SUPPORTED: u16 = 505;
 
-    /// Create a new Response initialized from an [`HttpStatus`].
+    /// Create a new Response initialized from an [`Status`].
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
     pub fn new(status: Status) -> Self {
         let mut headers = HeaderMap::new();
@@ -99,7 +99,7 @@ impl Response {
         Status::from_code(code).map(Self::new)
     }
 
-    /// Convenience constructor with [`HttpStatus`].
+    /// Convenience constructor with [`Status`].
     pub fn status(status: Status) -> Self {
         Self::new(status)
     }
