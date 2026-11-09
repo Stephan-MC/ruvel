@@ -1,6 +1,6 @@
 use crate::database::connection::DatabaseConnection;
 use crate::database::error::DatabaseError;
-use crate::database::manager::DB;
+use crate::database::database_manager::DB;
 use serde::de::DeserializeOwned;
 use sqlx::{Column, Row};
 use std::marker::PhantomData;

@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use crate::database::connection::DatabaseConnection;
 use crate::database::error::{DatabaseError, ModelNotFoundException};
-use crate::database::manager::DB;
+use crate::database::database_manager::DB;
 use crate::database::query::{QueryBuilder, QueryValue};
 use crate::http::{Responsable, Response, Status};
 

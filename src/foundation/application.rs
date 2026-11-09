@@ -6,11 +6,10 @@ use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::contracts::http::Kernel as HttpKernelContract;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
+use crate::events::EventServiceProvider;
 use crate::http::{Kernel, Request};
-use crate::routing::Router;
-use crate::support::{
-    EventServiceProvider, LogServiceProvider, RoutingServiceProvider, ServiceProvider,
-};
+use crate::routing::{Router, RoutingServiceProvider};
+use crate::support::{LogServiceProvider, ServiceProvider};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
