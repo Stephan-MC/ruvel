@@ -116,15 +116,15 @@ impl<'a> PendingRouteRegistrar<'a> {
         // Apply router prefix if any
         final_path = self.router.combine_prefix(&final_path);
 
-        // Compile pipeline for this route including router middleware, route-level middleware,
+        // Compile middlewares for this route including router middleware, route-level middleware,
         // and filtering excluded middleware
-        let pipeline = self.router.compile_route_pipeline(&self.middleware, &self.excluded_middleware);
+        let middlewares = self.router.compile_route_middlewares(&self.middleware, &self.excluded_middleware);
 
         let final_domain = self.domain.clone().or_else(|| self.router.group_domain.clone());
 
         let entry = RouteEntry {
             handler: Arc::clone(&self.handler),
-            pipeline,
+            middlewares,
             name: self.name.clone(),
             domain: final_domain,
             wheres: self.wheres.clone(),
