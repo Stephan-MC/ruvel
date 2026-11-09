@@ -32,12 +32,10 @@ async fn test_database_manager_and_eloquent_crud() {
     .await
     .unwrap();
 
-    let _app = Application::configure("")
-        .with_database(move |db| {
-            db.add_connection("sqlite", DatabaseConnection::Sqlite(pool));
-            db.set_default_connection("sqlite");
-        })
-        .create();
+    let app = Application::configure("").create();
+    let db = app.make::<ruvel::database::DatabaseManager>().expect("DatabaseManager registered by DatabaseServiceProvider");
+    db.add_connection("sqlite", DatabaseConnection::Sqlite(pool));
+    db.set_default_connection("sqlite");
 
     // 1. Create records
     let user1 = User::create(User {

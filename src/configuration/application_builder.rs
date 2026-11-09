@@ -2,7 +2,6 @@ pub(crate) use crate::foundation::Application;
 use crate::{
     configuration::Middleware,
     console::Kernel as ConsoleKernel,
-    database::DatabaseManager,
     http::Kernel as HttpKernel,
     routing::Router,
     support::ServiceProvider,
@@ -15,7 +14,6 @@ pub struct Scheduler {}
 pub struct ApplicationBuilder {
     app: Application,
     routing_callbacks: Vec<Box<dyn FnOnce(&mut Router)>>,
-    database_callbacks: Vec<Box<dyn FnOnce(&mut DatabaseManager) + Send + 'static>>,
 }
 
 impl ApplicationBuilder {
@@ -23,7 +21,6 @@ impl ApplicationBuilder {
         Self {
             app,
             routing_callbacks: Vec::new(),
-            database_callbacks: Vec::new(),
         }
     }
 
@@ -44,15 +41,6 @@ impl ApplicationBuilder {
         F: FnOnce(&mut Router) + 'static,
     {
         self.routing_callbacks.push(Box::new(callback));
-        self
-    }
-
-    /// Configure database connections on the DatabaseManager
-    pub fn with_database<F>(mut self, callback: F) -> Self
-    where
-        F: FnOnce(&mut DatabaseManager) + Send + 'static,
-    {
-        self.database_callbacks.push(Box::new(callback));
         self
     }
 
@@ -96,15 +84,6 @@ impl ApplicationBuilder {
     }
 
     pub fn create(mut self) -> Application {
-        // 0. Initialize and configure DatabaseManager
-        let mut db_manager = DatabaseManager::new();
-        for callback in self.database_callbacks.drain(..) {
-            callback(&mut db_manager);
-        }
-        let db_manager_arc = Arc::new(db_manager);
-        DatabaseManager::register_global(Arc::clone(&db_manager_arc));
-        self.app.container.instance((*db_manager_arc).clone());
-
         // 1. Instantiate the Router
         let mut router = Router::new();
 

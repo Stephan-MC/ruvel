@@ -5,8 +5,12 @@ use std::sync::Arc;
 use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::contracts::http::Kernel as HttpKernelContract;
+use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::http::{Kernel, Request};
-use crate::support::ServiceProvider;
+use crate::routing::Router;
+use crate::support::{
+    EventServiceProvider, LogServiceProvider, RoutingServiceProvider, ServiceProvider,
+};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -32,12 +36,48 @@ impl Default for Application {
 
 impl Application {
     pub fn new(_base_path: &str) -> Self {
-        Self {
+        let mut app = Self {
             container: Container::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
-        }
+        };
+
+        app.register_base_bindings();
+        app.register_base_service_providers();
+        app.register_core_container_aliases();
+
+        app
+    }
+
+    /// Register the basic bindings into the container.
+    pub fn register_base_bindings(&mut self) {
+        // Register static container instance
+        self.container.instance(Container::new());
+    }
+
+    /// Register the base service providers for the application.
+    pub fn register_base_service_providers(&mut self) {
+        self.providers.push(Box::new(EventServiceProvider));
+        self.providers.push(Box::new(LogServiceProvider));
+        self.providers.push(Box::new(RoutingServiceProvider));
+
+        let db_provider = Box::new(DatabaseServiceProvider);
+        // Synchronously initialize the database service provider bindings into container
+        let db_manager = Arc::new(DatabaseManager::new());
+        DatabaseManager::register_global(Arc::clone(&db_manager));
+        self.container.instance((*db_manager).clone());
+        self.providers.push(db_provider);
+    }
+
+    /// Register the core class aliases in the container.
+    pub fn register_core_container_aliases(&mut self) {
+        self.container.alias::<Container>("app");
+        self.container.alias::<DatabaseManager>("db");
+        self.container.alias::<Router>("router");
+        self.container.alias::<Kernel>("kernel");
+        self.container.alias::<EventServiceProvider>("events");
+        self.container.alias::<LogServiceProvider>("log");
     }
 
     /// Configure the application and register default kernels.

@@ -1,9 +1,14 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use crate::database::connection::DatabaseConnection;
 use crate::database::error::DatabaseError;
+use std::sync::OnceLock;
 
-static GLOBAL_DB_MANAGER: OnceLock<Arc<DatabaseManager>> = OnceLock::new();
+static GLOBAL_DB_MANAGER: OnceLock<RwLock<Option<Arc<DatabaseManager>>>> = OnceLock::new();
+
+fn get_global_slot() -> &'static RwLock<Option<Arc<DatabaseManager>>> {
+    GLOBAL_DB_MANAGER.get_or_init(|| RwLock::new(None))
+}
 
 #[derive(Default, Clone)]
 pub struct DatabaseManager {
@@ -54,11 +59,15 @@ impl DatabaseManager {
     }
 
     pub fn register_global(manager: Arc<DatabaseManager>) {
-        let _ = GLOBAL_DB_MANAGER.set(manager);
+        let slot = get_global_slot();
+        let mut lock = slot.write().unwrap();
+        *lock = Some(manager);
     }
 
     pub fn global() -> Result<Arc<DatabaseManager>, DatabaseError> {
-        GLOBAL_DB_MANAGER.get().cloned().ok_or(DatabaseError::NoDefaultConnection)
+        let slot = get_global_slot();
+        let lock = slot.read().unwrap();
+        lock.clone().ok_or(DatabaseError::NoDefaultConnection)
     }
 }
 
