@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-app-v0.3.0...ruvel-app-v0.4.0) (2026-11-09)
+
+
+### Features
+
+* implement crate::pipeline module for onion layer ([d29a253](https://github.com/Stephan-MC/ruvel/commit/d29a2538e0da7c59fb0423ad9d93bdea80dd7135))
+* implement pipeline onion layer with Pipeable contract ([7672e2d](https://github.com/Stephan-MC/ruvel/commit/7672e2dc008706a2081811f65b54c18742f5db7a))
+* optimize onion pipeline and decouple Next from pipes ([aa55c7e](https://github.com/Stephan-MC/ruvel/commit/aa55c7e8a46b7d4329c5ca93a65eecac5b6fd443))
+* split pipeline and pipe implementations into separate files ([1e96e22](https://github.com/Stephan-MC/ruvel/commit/1e96e22f8548b3ad52d42ebd116906fc97c3d164))
+
+
+### Bug Fixes
+
+* Little formatting tweaks. ([29e203f](https://github.com/Stephan-MC/ruvel/commit/29e203f6a839a54f874a31bfe30636479e169a9c))
+* Moved middleware into a separate path ([7836416](https://github.com/Stephan-MC/ruvel/commit/7836416e3e6381dcde49766fd04f6efb440fec66))
+* Moved middleware into a separate path ([7e72286](https://github.com/Stephan-MC/ruvel/commit/7e7228639de2d6960e5e760796384047db844405))
+* Removed duplicate imports ([1f0f58f](https://github.com/Stephan-MC/ruvel/commit/1f0f58f05f231cccdaa743f291a8c5ee7e75e93f))
+* resolve kernel merge conflict and http re-exports ([9578c5d](https://github.com/Stephan-MC/ruvel/commit/9578c5dd90a4ee589b65282a427cd3e4f2fffa84))
+
 ## [0.3.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-app-v0.2.0...ruvel-app-v0.3.0) (2026-11-07)
 
 
