@@ -86,17 +86,17 @@ impl Application {
 
     /// Register a service provider with the application.
     /// This immediately calls the provider's `register` method.
-    pub async fn register_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
+    pub fn register_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
         let provider = Box::new(provider);
 
         // 1. Run the register method immediately upon binding
-        provider.register(&mut self.container).await;
+        provider.register(&mut self.container);
 
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
             let kernel = self.make::<Kernel>().expect("Kernel not found in container");
             let mut router_clone = (*kernel.get_router()).clone();
-            provider.boot(&self.container, &mut router_clone).await;
+            provider.boot(&self.container, &mut router_clone);
             kernel.set_router(Arc::new(router_clone));
         }
 
@@ -107,7 +107,7 @@ impl Application {
 
     /// Boot the application's service providers.
     /// This loops through all registered providers and calls their `boot` methods.
-    pub async fn boot(&mut self) {
+    pub fn boot(&mut self) {
         if self.booted {
             return;
         }
@@ -116,7 +116,7 @@ impl Application {
         let mut router_clone = (*kernel.get_router()).clone();
 
         for provider in &self.providers {
-            provider.boot(&self.container, &mut router_clone).await;
+            provider.boot(&self.container, &mut router_clone);
         }
 
         let final_router = Arc::new(router_clone);
@@ -146,7 +146,7 @@ impl Application {
     /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
     async fn listen(mut self, host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure all providers are booted before accepting traffic
-        self.boot().await;
+        self.boot();
 
         let addr = format!("{}:{}", host, port);
         let listener = TcpListener::bind(&addr).await?;

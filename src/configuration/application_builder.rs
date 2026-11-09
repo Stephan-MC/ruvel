@@ -24,8 +24,8 @@ impl ApplicationBuilder {
         }
     }
 
-    pub async fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
-        self.app = self.app.register_provider(provider).await;
+    pub fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
+        self.app = self.app.register_provider(provider);
 
         self
     }

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use crate::database::connection::DatabaseConnection;
@@ -7,7 +6,7 @@ use crate::database::database_manager::DB;
 use crate::database::query::{QueryBuilder, QueryValue};
 use crate::http::{Responsable, Response, Status};
 
-#[async_trait]
+#[allow(async_fn_in_trait)]
 pub trait Model: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static {
     fn table() -> &'static str;
 
