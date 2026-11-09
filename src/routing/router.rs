@@ -16,8 +16,8 @@ pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send 
 #[derive(Clone)]
 pub(crate) struct RouteEntry {
     pub(crate) handler: HandlerFn,
-    /// Pre-resolved, flattened pipeline stored natively on the route.
-    pub(crate) pipeline: Arc<[Arc<dyn Middleware>]>,
+    /// Pre-resolved, flattened middleware list stored directly on the route.
+    pub(crate) middlewares: Arc<[Arc<dyn Middleware>]>,
     #[allow(dead_code)]
     pub(crate) name: Option<String>,
     #[allow(dead_code)]
@@ -107,8 +107,8 @@ impl Router {
         method_router.insert(path, entry).unwrap();
     }
 
-    /// Pre-compiles the pipeline for a route at registration time.
-    pub(crate) fn compile_route_pipeline(
+    /// Pre-compiles and resolves all middlewares for a route at registration time.
+    pub(crate) fn compile_route_middlewares(
         &self,
         local_items: &[MiddlewareItem],
         excluded_aliases: &[String],
@@ -291,19 +291,19 @@ impl Router {
                 }
 
                 let handler = &matched.value.handler;
-                let pipeline = &matched.value.pipeline;
+                let middlewares = &matched.value.middlewares;
 
                 // FAST-PATH: Bypass middleware machinery completely if there are no layers
-                if pipeline.is_empty() {
+                if middlewares.is_empty() {
                     return (handler)(req);
                 }
 
-                let pipeline_cloned = Arc::clone(pipeline);
+                let middlewares_cloned = Arc::clone(middlewares);
                 let handler_cloned = Arc::clone(handler);
                 return Box::pin(async move {
                     Pipeline::new()
                         .send(req)
-                        .through(pipeline_cloned.iter().cloned())
+                        .through(middlewares_cloned.iter().cloned())
                         .then(move |r| {
                             let h = Arc::clone(&handler_cloned);
                             async move { (h)(r).await }
