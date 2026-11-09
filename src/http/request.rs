@@ -14,6 +14,12 @@ pub enum Method {
     UNKNOWN(String),
 }
 
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
 impl From<&str> for Method {
     fn from(s: &str) -> Self {
         match s {
@@ -36,14 +42,19 @@ pub struct RouteParams {
 
 impl RouteParams {
     pub const fn new() -> Self {
-        const EMPTY: (Cow<'static, str>, Cow<'static, str>) = (Cow::Borrowed(""), Cow::Borrowed(""));
+        const EMPTY: (Cow<'static, str>, Cow<'static, str>) =
+            (Cow::Borrowed(""), Cow::Borrowed(""));
         Self {
             len: 0,
             entries: [EMPTY; MAX_INLINE_PARAMS],
         }
     }
 
-    pub fn insert(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) {
+    pub fn insert(
+        &mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) {
         let key_cow = key.into();
         let val_cow = value.into();
 
