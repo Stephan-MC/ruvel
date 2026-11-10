@@ -1,6 +1,7 @@
 use super::headers::HeaderMap;
 use super::status::Status;
 use crate::http::Responsable;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -85,7 +86,7 @@ impl Response {
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
     pub fn new(status: Status) -> Self {
         let mut headers = HeaderMap::new();
-        headers.insert_static("Content-Type", "text/html; charset=utf-8");
+        headers.insert("Content-Type", "text/html; charset=utf-8");
         Self {
             status,
             headers,
@@ -145,7 +146,11 @@ impl Response {
     }
 
     /// Insert a header key and value (case-insensitive key).
-    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn header(
+        mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) -> Self {
         self.headers.insert(key, value);
         self
     }
@@ -153,14 +158,14 @@ impl Response {
     /// Set response body as plain text (`Content-Type: text/plain; charset=utf-8`).
     pub fn text(mut self, body: impl Into<String>) -> Self {
         self.headers
-            .insert_static("Content-Type", "text/plain; charset=utf-8");
+            .insert("Content-Type", "text/plain; charset=utf-8");
         self.body = body.into().into_bytes();
         self
     }
 
     /// Set response body as JSON (`Content-Type: application/json`).
     pub fn json(mut self, json_str: impl Into<String>) -> Self {
-        self.headers.insert_static("Content-Type", "application/json");
+        self.headers.insert("Content-Type", "application/json");
         self.body = json_str.into().into_bytes();
         self
     }
@@ -168,7 +173,7 @@ impl Response {
     /// Set response body as HTML (`Content-Type: text/html; charset=utf-8`).
     pub fn html(mut self, html_str: impl Into<String>) -> Self {
         self.headers
-            .insert_static("Content-Type", "text/html; charset=utf-8");
+            .insert("Content-Type", "text/html; charset=utf-8");
         self.body = html_str.into().into_bytes();
         self
     }
