@@ -9,6 +9,15 @@ pub struct Pipeline<T, R = T> {
     pipes: Vec<Arc<dyn Pipeable<T, R>>>,
 }
 
+impl<T, R> Clone for Pipeline<T, R> {
+    fn clone(&self) -> Self {
+        Self {
+            passable: None,
+            pipes: self.pipes.clone(),
+        }
+    }
+}
+
 impl<T: Send + 'static, R: Send + 'static> Default for Pipeline<T, R> {
     fn default() -> Self {
         Self::new()
@@ -22,6 +31,11 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
             passable: None,
             pipes: Vec::new(),
         }
+    }
+
+    /// Returns `true` if the pipeline contains no pipes.
+    pub fn is_empty(&self) -> bool {
+        self.pipes.is_empty()
     }
 
     /// Set the object being sent through the pipeline.
@@ -40,6 +54,37 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
             .into_iter()
             .map(|p| -> Arc<dyn Pipeable<T, R>> { Arc::new(p) })
             .collect();
+        self
+    }
+
+    /// Prepend a collection of pipes to the front of the current pipes.
+    pub fn prepend<I, P>(mut self, pipes: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Pipeable<T, R> + 'static,
+    {
+        let prepended: Vec<Arc<dyn Pipeable<T, R>>> = pipes
+            .into_iter()
+            .map(|p| -> Arc<dyn Pipeable<T, R>> { Arc::new(p) })
+            .collect();
+
+        self.pipes.splice(0..0, prepended);
+
+        self
+    }
+
+    /// Append a collection of pipes to the end of the current pipes.
+    pub fn append<I, P>(mut self, pipes: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Pipeable<T, R> + 'static,
+    {
+        self.pipes.extend(
+            pipes
+                .into_iter()
+                .map(|p| -> Arc<dyn Pipeable<T, R>> { Arc::new(p) }),
+        );
+
         self
     }
 
