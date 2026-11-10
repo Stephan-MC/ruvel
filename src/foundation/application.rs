@@ -5,8 +5,11 @@ use std::sync::Arc;
 use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::contracts::http::Kernel as HttpKernelContract;
+use crate::database::{DatabaseManager, DatabaseServiceProvider};
+use crate::events::EventServiceProvider;
 use crate::http::{Kernel, Request};
-use crate::support::ServiceProvider;
+use crate::routing::{Router, RoutingServiceProvider};
+use crate::support::{LogServiceProvider, ServiceProvider};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -32,12 +35,48 @@ impl Default for Application {
 
 impl Application {
     pub fn new(_base_path: &str) -> Self {
-        Self {
+        let mut app = Self {
             container: Container::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
-        }
+        };
+
+        app.register_base_bindings();
+        app.register_base_service_providers();
+        app.register_core_container_aliases();
+
+        app
+    }
+
+    /// Register the basic bindings into the container.
+    pub fn register_base_bindings(&mut self) {
+        // Register static container instance
+        self.container.instance(Container::new());
+    }
+
+    /// Register the base service providers for the application.
+    pub fn register_base_service_providers(&mut self) {
+        self.providers.push(Box::new(EventServiceProvider));
+        self.providers.push(Box::new(LogServiceProvider));
+        self.providers.push(Box::new(RoutingServiceProvider));
+
+        let db_provider = Box::new(DatabaseServiceProvider);
+        // Synchronously initialize the database service provider bindings into container
+        let db_manager = Arc::new(DatabaseManager::new());
+        DatabaseManager::register_global(Arc::clone(&db_manager));
+        self.container.instance((*db_manager).clone());
+        self.providers.push(db_provider);
+    }
+
+    /// Register the core class aliases in the container.
+    pub fn register_core_container_aliases(&mut self) {
+        self.container.alias::<Container>("app");
+        self.container.alias::<DatabaseManager>("db");
+        self.container.alias::<Router>("router");
+        self.container.alias::<Kernel>("kernel");
+        self.container.alias::<EventServiceProvider>("events");
+        self.container.alias::<LogServiceProvider>("log");
     }
 
     /// Configure the application and register default kernels.
@@ -47,17 +86,17 @@ impl Application {
 
     /// Register a service provider with the application.
     /// This immediately calls the provider's `register` method.
-    pub async fn register_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
+    pub fn register_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
         let provider = Box::new(provider);
 
         // 1. Run the register method immediately upon binding
-        provider.register(&mut self.container).await;
+        provider.register(&mut self.container);
 
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
             let kernel = self.make::<Kernel>().expect("Kernel not found in container");
             let mut router_clone = (*kernel.get_router()).clone();
-            provider.boot(&self.container, &mut router_clone).await;
+            provider.boot(&self.container, &mut router_clone);
             kernel.set_router(Arc::new(router_clone));
         }
 
@@ -68,7 +107,7 @@ impl Application {
 
     /// Boot the application's service providers.
     /// This loops through all registered providers and calls their `boot` methods.
-    pub async fn boot(&mut self) {
+    pub fn boot(&mut self) {
         if self.booted {
             return;
         }
@@ -77,7 +116,7 @@ impl Application {
         let mut router_clone = (*kernel.get_router()).clone();
 
         for provider in &self.providers {
-            provider.boot(&self.container, &mut router_clone).await;
+            provider.boot(&self.container, &mut router_clone);
         }
 
         let final_router = Arc::new(router_clone);
@@ -107,7 +146,7 @@ impl Application {
     /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
     async fn listen(mut self, host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure all providers are booted before accepting traffic
-        self.boot().await;
+        self.boot();
 
         let addr = format!("{}:{}", host, port);
         let listener = TcpListener::bind(&addr).await?;
