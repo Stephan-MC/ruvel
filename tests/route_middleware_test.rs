@@ -156,12 +156,9 @@ async fn test_without_middleware() {
         })
         .with_routing(|router| {
             router
+                .get("/excluded", |_req| async { "excluded" })
                 .middleware(["auth", "log"])
-                .group(|router| {
-                    router
-                        .get("/excluded", |_req| async { "excluded" })
-                        .without_middleware("log");
-                });
+                .without_middleware("log");
         })
         .create();
 
@@ -184,12 +181,13 @@ async fn test_fluent_group_and_counter_middleware() {
             let counter = Arc::clone(&counter);
             move |router| {
                 router
-                    .middleware(Arc::new(CounterMiddleware {
-                        count: Arc::clone(&counter),
-                    }))
                     .prefix("api")
                     .group(|router| {
-                        router.get("/counter", |_req| async { "ok" });
+                        router
+                            .get("/counter", |_req| async { "ok" })
+                            .middleware(Arc::new(CounterMiddleware {
+                                count: Arc::clone(&counter),
+                            }));
                     });
             }
         })

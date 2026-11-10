@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
-use super::into_middleware::{IntoMiddleware, MiddlewareItem};
+use super::into_middleware::MiddlewareItem;
 use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
 
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
@@ -16,8 +16,8 @@ pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send 
 #[derive(Clone)]
 pub(crate) struct RouteEntry {
     pub(crate) handler: HandlerFn,
-    /// Pre-resolved, flattened middleware list stored directly on the route.
-    pub(crate) middlewares: Arc<[Arc<dyn Middleware>]>,
+    /// Pre-built middleware pipeline (global + group + route middlewares) stored on the route.
+    pub(crate) middleware: Pipeline,
     #[allow(dead_code)]
     pub(crate) name: Option<String>,
     #[allow(dead_code)]
@@ -30,12 +30,12 @@ pub(crate) struct RouteEntry {
 pub struct Router {
     // Map each HTTP Method to its own Radix Tree of routes
     routes: HashMap<Method, MatchitRouter<RouteEntry>>,
-    groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
+    middlewares: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
+    middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
     aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
 
     // Group properties applied to routes
     pub(crate) group_prefix: Option<String>,
-    pub(crate) group_middleware: Vec<MiddlewareItem>,
     pub(crate) group_domain: Option<String>,
 
     // Cached 404 Fallback
@@ -52,10 +52,10 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            groups: Arc::new(RwLock::new(HashMap::new())),
+            middlewares: Arc::new(RwLock::new(Vec::new())),
+            middleware_groups: Arc::new(RwLock::new(HashMap::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
             group_prefix: None,
-            group_middleware: Vec::new(),
             group_domain: None,
 
             // Allocate the 404 handler ONCE at application boot
@@ -65,13 +65,30 @@ impl Router {
         }
     }
 
-    /// Install groups and aliases from application configuration.
+    /// Set global middlewares on the router.
+    pub fn set_middlewares(&self, global: Vec<Arc<dyn Middleware>>) {
+        *self.middlewares.write().unwrap() = global;
+    }
+
+    /// Set route middleware groups on the router.
+    pub fn set_middleware_groups(&self, groups: HashMap<String, Vec<Arc<dyn Middleware>>>) {
+        *self.middleware_groups.write().unwrap() = groups;
+    }
+
+    /// Set route middleware aliases on the router.
+    pub fn set_middleware_aliases(&self, aliases: HashMap<String, Arc<dyn Middleware>>) {
+        *self.aliases.write().unwrap() = aliases;
+    }
+
+    /// Install global middleware, groups, and aliases from application configuration.
     pub fn install_middleware(
         &self,
+        global: Vec<Arc<dyn Middleware>>,
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
         aliases: HashMap<String, Arc<dyn Middleware>>,
     ) {
-        *self.groups.write().unwrap() = groups;
+        *self.middlewares.write().unwrap() = global;
+        *self.middleware_groups.write().unwrap() = groups;
         *self.aliases.write().unwrap() = aliases;
     }
 
@@ -107,52 +124,56 @@ impl Router {
         method_router.insert(path, entry).unwrap();
     }
 
-    /// Pre-compiles and resolves all middlewares for a route at registration time.
+    /// Pre-compiles and resolves all middlewares (global + route-specific) into a [`Pipeline`] at registration time.
     pub(crate) fn compile_route_middlewares(
         &self,
         local_items: &[MiddlewareItem],
         excluded_aliases: &[String],
-    ) -> Arc<[Arc<dyn Middleware>]> {
-        let mut layers = Vec::new();
+    ) -> Pipeline {
+        let mut pipeline = Pipeline::new();
 
-        // 1. Group middleware on the router
-        for item in &self.group_middleware {
-            self.resolve_middleware_item(item, &mut layers, excluded_aliases);
+        // 1. Append global middlewares from the router
+        let global = self.middlewares.read().unwrap();
+        if !global.is_empty() {
+            pipeline = pipeline.append(global.iter().cloned());
         }
 
-        // 2. Local route-specific middleware
+        // 2. Local route-specific middleware (aliases, groups, or direct instances)
         for item in local_items {
-            self.resolve_middleware_item(item, &mut layers, excluded_aliases);
+            pipeline = self.resolve_middleware_item(pipeline, item, excluded_aliases);
         }
 
-        layers.into()
+        pipeline
     }
 
     fn resolve_middleware_item(
         &self,
+        mut pipeline: Pipeline,
         item: &MiddlewareItem,
-        layers: &mut Vec<Arc<dyn Middleware>>,
         excluded_aliases: &[String],
-    ) {
+    ) -> Pipeline {
         match item {
             MiddlewareItem::Alias(name) => {
                 if excluded_aliases.contains(name) {
-                    return;
+                    return pipeline;
                 }
-                let groups = self.groups.read().unwrap();
                 let aliases = self.aliases.read().unwrap();
+                if let Some(alias) = aliases.get(name) {
+                    pipeline = pipeline.pipe(Arc::clone(alias));
+                    return pipeline;
+                }
+                let groups = self.middleware_groups.read().unwrap();
                 if let Some(group) = groups.get(name) {
-                    layers.extend(group.iter().cloned());
-                } else if let Some(alias) = aliases.get(name) {
-                    layers.push(Arc::clone(alias));
+                    pipeline = pipeline.append(group.iter().cloned());
                 } else {
                     panic!("Unknown middleware [{name}]");
                 }
             }
             MiddlewareItem::Instance(instance) => {
-                layers.push(Arc::clone(instance));
+                pipeline = pipeline.pipe(Arc::clone(instance));
             }
         }
+        pipeline
     }
 
     /// Register routes defined within the closure.
@@ -163,11 +184,6 @@ impl Router {
     /// Begin a route group with a path prefix.
     pub fn prefix(&mut self, prefix: impl Into<String>) -> RouteGroupRegistrar<'_> {
         RouteGroupRegistrar::new(self).prefix(prefix)
-    }
-
-    /// Begin a route group with middleware.
-    pub fn middleware(&mut self, middleware: impl IntoMiddleware) -> RouteGroupRegistrar<'_> {
-        RouteGroupRegistrar::new(self).middleware(middleware)
     }
 
     /// Begin a route group with a domain.
@@ -291,19 +307,18 @@ impl Router {
                 }
 
                 let handler = &matched.value.handler;
-                let middlewares = &matched.value.middlewares;
+                let pipeline = &matched.value.middleware;
 
                 // FAST-PATH: Bypass middleware machinery completely if there are no layers
-                if middlewares.is_empty() {
+                if pipeline.is_empty() {
                     return (handler)(req);
                 }
 
-                let middlewares_cloned = Arc::clone(middlewares);
+                let pipeline_cloned = pipeline.clone();
                 let handler_cloned = Arc::clone(handler);
                 return Box::pin(async move {
-                    Pipeline::new()
+                    pipeline_cloned
                         .send(req)
-                        .through(middlewares_cloned.iter().cloned())
                         .then(move |r| {
                             let h = Arc::clone(&handler_cloned);
                             async move { (h)(r).await }
@@ -313,6 +328,21 @@ impl Router {
             }
         }
 
-        (self.fallback_handler)(req)
+        let global = self.middlewares.read().unwrap().clone();
+        if global.is_empty() {
+            return (self.fallback_handler)(req);
+        }
+
+        let fallback = Arc::clone(&self.fallback_handler);
+        Box::pin(async move {
+            Pipeline::new()
+                .send(req)
+                .append(global)
+                .then(move |r| {
+                    let h = Arc::clone(&fallback);
+                    async move { (h)(r).await }
+                })
+                .await
+        })
     }
 }

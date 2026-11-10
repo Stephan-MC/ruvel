@@ -23,7 +23,12 @@ pub struct PendingRouteRegistrar<'a> {
 }
 
 impl<'a> PendingRouteRegistrar<'a> {
-    pub(crate) fn new(router: &'a mut Router, methods: Vec<Method>, path: &str, handler: HandlerFn) -> Self {
+    pub(crate) fn new(
+        router: &'a mut Router,
+        methods: Vec<Method>,
+        path: &str,
+        handler: HandlerFn,
+    ) -> Self {
         Self {
             router,
             methods,
@@ -116,22 +121,27 @@ impl<'a> PendingRouteRegistrar<'a> {
         // Apply router prefix if any
         final_path = self.router.combine_prefix(&final_path);
 
-        // Compile middlewares for this route including router middleware, route-level middleware,
-        // and filtering excluded middleware
-        let middlewares = self.router.compile_route_middlewares(&self.middleware, &self.excluded_middleware);
+        // Build the route's middleware pipeline (global + group + route-specific, minus excluded)
+        let middleware = self
+            .router
+            .compile_route_middlewares(&self.middleware, &self.excluded_middleware);
 
-        let final_domain = self.domain.clone().or_else(|| self.router.group_domain.clone());
+        let final_domain = self
+            .domain
+            .clone()
+            .or_else(|| self.router.group_domain.clone());
 
         let entry = RouteEntry {
             handler: Arc::clone(&self.handler),
-            middlewares,
+            middleware,
             name: self.name.clone(),
             domain: final_domain,
             wheres: self.wheres.clone(),
         };
 
         for method in &self.methods {
-            self.router.insert_route(method.clone(), &final_path, entry.clone());
+            self.router
+                .insert_route(method.clone(), &final_path, entry.clone());
         }
     }
 }
@@ -142,11 +152,10 @@ impl<'a> Drop for PendingRouteRegistrar<'a> {
     }
 }
 
-/// A builder for configuring a group of routes with shared attributes (prefix, middleware, domain).
+/// A builder for configuring a group of routes with shared attributes (prefix, domain).
 pub struct RouteGroupRegistrar<'a> {
     router: &'a mut Router,
     prefix: Option<String>,
-    middleware: Vec<MiddlewareItem>,
     domain: Option<String>,
 }
 
@@ -155,7 +164,6 @@ impl<'a> RouteGroupRegistrar<'a> {
         Self {
             router,
             prefix: None,
-            middleware: Vec::new(),
             domain: None,
         }
     }
@@ -163,12 +171,6 @@ impl<'a> RouteGroupRegistrar<'a> {
     /// Add a path prefix for all routes in this group.
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
-        self
-    }
-
-    /// Attach middleware to all routes in this group.
-    pub fn middleware(mut self, middleware: impl IntoMiddleware) -> Self {
-        self.middleware.extend(middleware.into_middleware_items());
         self
     }
 
@@ -185,7 +187,6 @@ impl<'a> RouteGroupRegistrar<'a> {
     {
         // Save current router group properties
         let prev_prefix = self.router.group_prefix.clone();
-        let prev_middleware = self.router.group_middleware.clone();
         let prev_domain = self.router.group_domain.clone();
 
         // Push new group properties onto the router
@@ -209,8 +210,6 @@ impl<'a> RouteGroupRegistrar<'a> {
             });
         }
 
-        self.router.group_middleware.extend(self.middleware);
-
         if self.domain.is_some() {
             self.router.group_domain = self.domain;
         }
@@ -219,7 +218,6 @@ impl<'a> RouteGroupRegistrar<'a> {
 
         // Restore previous router group properties
         self.router.group_prefix = prev_prefix;
-        self.router.group_middleware = prev_middleware;
         self.router.group_domain = prev_domain;
     }
 }

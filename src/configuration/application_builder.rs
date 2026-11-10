@@ -84,27 +84,19 @@ impl ApplicationBuilder {
     }
 
     pub fn create(mut self) -> Application {
-        // 1. Instantiate the Router
-        let mut router = Router::new();
-
-        // 2. Resolve the HttpKernel from the container (which runs after_resolving to configure middleware)
+        // 1. Resolve the HttpKernel from the container (which runs after_resolving to configure
+        //    global middleware, groups, and aliases directly on the router)
         let kernel = self.app.make::<HttpKernel>().expect("HttpKernel must be registered");
 
-        // 3. Inherit groups and aliases configured on the kernel
-        let groups = kernel.middleware_groups.read().unwrap().clone();
-        let aliases = kernel.middleware_aliases.read().unwrap().clone();
-        router.install_middleware(groups, aliases);
-
-        // 4. Execute all routing callbacks on the router
+        // 2. Clone the router (preserving its global middleware, groups, and aliases) and run routing callbacks
+        let mut router = (*kernel.get_router()).clone();
         for callback in self.routing_callbacks.drain(..) {
             callback(&mut router);
         }
 
-        // 5. Update the kernel's router so dispatch routes match!
+        // 3. Set the router on the kernel and bind it in the container
         let router_arc = Arc::new(router);
         kernel.set_router(Arc::clone(&router_arc));
-
-        // 6. Bind the router as an instance in the container
         self.app.container.instance((*router_arc).clone());
 
         self.app
