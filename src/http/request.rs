@@ -16,7 +16,14 @@ pub enum Method {
 
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match self {
+            Method::GET => f.write_str("GET"),
+            Method::POST => f.write_str("POST"),
+            Method::PUT => f.write_str("PUT"),
+            Method::DELETE => f.write_str("DELETE"),
+            Method::PATCH => f.write_str("PATCH"),
+            Method::UNKNOWN(other) => f.write_str(other),
+        }
     }
 }
 
@@ -145,7 +152,7 @@ impl Request {
                 Ok(v) => Cow::Owned(v.to_string()),
                 Err(_) => Cow::Owned(String::from_utf8_lossy(header.value).into_owned()),
             };
-            header_map.insert(Cow::Owned(header.name.to_string()), val);
+            header_map.insert(header.name.to_string(), val);
         }
 
         let body = if total == header_len {
