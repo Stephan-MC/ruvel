@@ -15,9 +15,9 @@ Ruvel is an asynchronous web framework for Rust, shaped after Laravel. It runs o
 
 ### Routing
 
-`Router` stores one [matchit](https://docs.rs/matchit) radix tree per HTTP method.
+`Router` implements the `RouteRegistrar` trait and stores one [matchit](https://docs.rs/matchit) radix tree per HTTP method.
 
-- Verbs: `get`, `post`, `put`, `delete`, `patch`.
+- Verbs & methods on `RouteRegistrar`: `get`, `post`, `put`, `delete`, `patch`, `any`, `r#match`, plus fluent route/group attributes (`domain`, `prefix`, `name`, `r#where`, `where_number`, `where_alpha`, `middleware`, `without_middleware`), each returning a `PendingRouteRegistrar`.
 - Path parameters use `{name}` segments. A match fills `Request::params`, and `Request::param("id")` reads one value.
 - The query string is split off the path and kept raw on `Request::query`. The router matches the path only.
 - `router.middleware("auth").group(...)` or `router.prefix("/api").group(...)` attaches middleware or prefixes to the routes registered inside the closure. Names are resolved when the route is registered. An unknown name panics at startup.

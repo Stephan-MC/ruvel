@@ -2,8 +2,8 @@ use ruvel::foundation::Application;
 use ruvel::http::{Method, Middleware, Next, Request, Response};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct HeaderMiddleware {
     key: &'static str,
@@ -180,15 +180,13 @@ async fn test_fluent_group_and_counter_middleware() {
         .with_routing({
             let counter = Arc::clone(&counter);
             move |router| {
-                router
-                    .prefix("api")
-                    .group(|router| {
-                        router
-                            .get("/counter", |_req| async { "ok" })
-                            .middleware(Arc::new(CounterMiddleware {
-                                count: Arc::clone(&counter),
-                            }));
-                    });
+                router.prefix("api").group(|router| {
+                    router
+                        .get("/counter", |_req| async { "ok" })
+                        .middleware(Arc::new(CounterMiddleware {
+                            count: Arc::clone(&counter),
+                        }));
+                });
             }
         })
         .create();
@@ -248,9 +246,73 @@ async fn test_any_method() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    for method in &[Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+    for method in &[
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::PATCH,
+    ] {
         let req = Request::new(method.clone(), "/any");
         let res = kernel.handle(req).await;
         assert_eq!(res.body, b"any response");
     }
+}
+
+#[tokio::test]
+async fn test_route_registrar_attribute_first_and_group_middleware() {
+    let app = Application::configure("")
+        .with_middleware(|m| {
+            m.alias(
+                "auth",
+                HeaderMiddleware {
+                    key: "X-Auth",
+                    val: "ok",
+                },
+            );
+            m.alias(
+                "audit",
+                HeaderMiddleware {
+                    key: "X-Audit",
+                    val: "logged",
+                },
+            );
+        })
+        .with_routing(|router| {
+            router
+                .middleware(["auth", "audit"])
+                .prefix("admin")
+                .domain("admin.example.com")
+                .name("admin.")
+                .where_number("id")
+                .group(|router| {
+                    router
+                        .without_middleware("audit")
+                        .get("/users/{id}", |req| async move {
+                            format!("user:{}", req.param("id").unwrap_or("0"))
+                        })
+                        .name("users.show");
+
+                    router
+                        .where_alpha("slug")
+                        .post("/posts/{slug}", |_req| async { "created" });
+                });
+        })
+        .create();
+
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    let res = kernel
+        .handle(Request::new(Method::GET, "/admin/users/42"))
+        .await;
+    assert_eq!(res.body, b"user:42");
+    assert_eq!(res.headers.get("X-Auth"), Some("ok"));
+    assert_eq!(res.headers.get("X-Audit"), None);
+
+    let res_post = kernel
+        .handle(Request::new(Method::POST, "/admin/posts/hello"))
+        .await;
+    assert_eq!(res_post.body, b"created");
+    assert_eq!(res_post.headers.get("X-Auth"), Some("ok"));
+    assert_eq!(res_post.headers.get("X-Audit"), Some("logged"));
 }
