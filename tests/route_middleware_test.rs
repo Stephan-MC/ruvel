@@ -316,3 +316,41 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
     assert_eq!(res_post.headers.get("X-Auth"), Some("ok"));
     assert_eq!(res_post.headers.get("X-Audit"), Some("logged"));
 }
+
+#[tokio::test]
+async fn test_trailing_slash_normalization() {
+    let app = Application::configure("")
+        .with_routing(|router| {
+            router.get("/", |_req| async { "root" });
+            router.get("/users", |_req| async { "users" });
+            router.get("/posts/", |_req| async { "posts" });
+            router.prefix("api/").group(|router| {
+                router.get("/items/{id}/", |req| async move {
+                    format!("item:{}", req.param("id").unwrap_or("0"))
+                });
+            });
+        })
+        .create();
+
+    let kernel = app.make::<ruvel::http::Kernel>().unwrap();
+
+    // Root route
+    let res_root = kernel.handle(Request::new(Method::GET, "/")).await;
+    assert_eq!(res_root.body, b"root");
+
+    // Registered without trailing slash, requested with trailing slash
+    let res_users_slash = kernel.handle(Request::new(Method::GET, "/users/")).await;
+    assert_eq!(res_users_slash.body, b"users");
+
+    // Registered with trailing slash, requested both ways
+    let res_posts = kernel.handle(Request::new(Method::GET, "/posts")).await;
+    assert_eq!(res_posts.body, b"posts");
+    let res_posts_slash = kernel.handle(Request::new(Method::GET, "/posts/")).await;
+    assert_eq!(res_posts_slash.body, b"posts");
+
+    // Parameterized route inside a group requested with trailing slash
+    let res_item = kernel
+        .handle(Request::new(Method::GET, "/api/items/99/"))
+        .await;
+    assert_eq!(res_item.body, b"item:99");
+}

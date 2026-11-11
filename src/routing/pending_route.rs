@@ -320,7 +320,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         let mut final_path = raw_path.to_string();
         if let Some(ref p) = self.prefix {
             let trimmed_prefix = p.trim_matches('/');
-            let trimmed_path = final_path.trim_start_matches('/');
+            let trimmed_path = final_path.trim_matches('/');
             if trimmed_prefix.is_empty() {
                 final_path = if trimmed_path.is_empty() {
                     "/".to_string()

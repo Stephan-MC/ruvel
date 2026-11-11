@@ -105,7 +105,7 @@ impl Router {
     }
 
     pub(crate) fn combine_prefix(&self, path: &str) -> String {
-        let clean_path = path.trim_start_matches('/');
+        let clean_path = path.trim_matches('/');
         match &self.group_prefix {
             Some(prefix) => {
                 let trimmed = prefix.trim_matches('/');
@@ -285,8 +285,13 @@ impl Router {
     }
 
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
+        let lookup_path = {
+            let trimmed = req.path.trim_end_matches('/');
+            if trimmed.is_empty() { "/" } else { trimmed }
+        };
+
         if let Some(method_router) = self.routes.get(&req.method)
-            && let Ok(matched) = method_router.at(&req.path)
+            && let Ok(matched) = method_router.at(lookup_path)
         {
             // Populate inline RouteParams without allocating dynamic HashMap nodes
             for (key, value) in matched.params.iter() {
