@@ -56,8 +56,7 @@ impl ApplicationBuilder {
     pub fn with_kernels(self) -> Self {
         self.app.container.singleton(|_| ConsoleKernel::default());
         self.app.container.singleton(|c| {
-            let router = c.make::<Router>().unwrap_or_else(|_| Arc::new(Router::new()));
-            HttpKernel::new(router)
+            HttpKernel::new(c.make<Router>())
         });
         self
     }
