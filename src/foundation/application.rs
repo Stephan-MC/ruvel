@@ -57,9 +57,9 @@ impl Application {
 
     /// Register the base service providers for the application.
     pub fn register_base_service_providers(&mut self) {
-        self.providers.push(Box::new(EventServiceProvider));
-        self.providers.push(Box::new(LogServiceProvider));
-        self.providers.push(Box::new(RoutingServiceProvider));
+        self.register_provider(EventServiceProvider);
+        self.register_provider(LogServiceProvider);
+        self.register_provider(RoutingServiceProvider);
 
         let db_provider = Box::new(DatabaseServiceProvider);
         // Synchronously initialize the database service provider bindings into container
@@ -94,7 +94,9 @@ impl Application {
 
         // 2. If the application is already booted, boot this provider immediately
         if self.booted {
-            let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+            let kernel = self
+                .make::<Kernel>()
+                .expect("Kernel not found in container");
             let mut router_clone = (*kernel.get_router()).clone();
             provider.boot(&self.container, &mut router_clone);
             kernel.set_router(Arc::new(router_clone));
@@ -112,7 +114,9 @@ impl Application {
             return;
         }
 
-        let kernel = self.make::<Kernel>().expect("Kernel not found in container");
+        let kernel = self
+            .make::<Kernel>()
+            .expect("Kernel not found in container");
         let mut router_clone = (*kernel.get_router()).clone();
 
         for provider in &self.providers {
