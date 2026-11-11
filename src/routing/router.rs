@@ -8,10 +8,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
-use super::into_middleware::MiddlewareItem;
-use super::pending_route::{PendingRouteRegistrar, RouteGroupRegistrar};
+use super::into_middleware::{IntoMiddleware, MiddlewareItem};
+use super::pending_route::PendingRouteRegistrar;
+use super::route_registrar::RouteRegistrar;
 
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
+type MiddlewareList = Vec<Arc<dyn Middleware>>;
+type MiddlewareGroupMap = HashMap<String, MiddlewareList>;
+type MiddlewareAliasMap = HashMap<String, Arc<dyn Middleware>>;
 
 #[derive(Clone)]
 pub(crate) struct RouteEntry {
@@ -30,13 +34,17 @@ pub(crate) struct RouteEntry {
 pub struct Router {
     // Map each HTTP Method to its own Radix Tree of routes
     routes: HashMap<Method, MatchitRouter<RouteEntry>>,
-    middlewares: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
-    middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
-    aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
+    middlewares: Arc<RwLock<MiddlewareList>>,
+    middleware_groups: Arc<RwLock<MiddlewareGroupMap>>,
+    aliases: Arc<RwLock<MiddlewareAliasMap>>,
 
     // Group properties applied to routes
     pub(crate) group_prefix: Option<String>,
     pub(crate) group_domain: Option<String>,
+    pub(crate) group_name: Option<String>,
+    pub(crate) group_wheres: HashMap<String, String>,
+    pub(crate) group_middleware: Vec<MiddlewareItem>,
+    pub(crate) group_excluded_middleware: Vec<String>,
 
     // Cached 404 Fallback
     fallback_handler: HandlerFn,
@@ -57,6 +65,10 @@ impl Router {
             aliases: Arc::new(RwLock::new(HashMap::new())),
             group_prefix: None,
             group_domain: None,
+            group_name: None,
+            group_wheres: HashMap::new(),
+            group_middleware: Vec::new(),
+            group_excluded_middleware: Vec::new(),
 
             // Allocate the 404 handler ONCE at application boot
             fallback_handler: Arc::new(|_req| {
@@ -181,42 +193,13 @@ impl Router {
         configure(self);
     }
 
-    /// Begin a route group with a path prefix.
-    pub fn prefix(&mut self, prefix: impl Into<String>) -> RouteGroupRegistrar<'_> {
-        RouteGroupRegistrar::new(self).prefix(prefix)
-    }
-
-    /// Begin a route group with a domain.
-    pub fn domain(&mut self, domain: impl Into<String>) -> RouteGroupRegistrar<'_> {
-        RouteGroupRegistrar::new(self).domain(domain)
-    }
-
-    pub fn add_route<F, Fut, R>(
-        &mut self,
-        method: Method,
-        path: &str,
-        handler: F,
-    ) -> PendingRouteRegistrar<'_>
-    where
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R: Responsable,
-    {
-        let h: HandlerFn = Arc::new(move |req| {
-            let fut = handler(req);
-            Box::pin(async move { fut.await.to_response() })
-        });
-
-        PendingRouteRegistrar::new(self, vec![method], path, h)
-    }
-
     pub fn get<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::GET, path, handler)
+        <Self as RouteRegistrar>::get(self, path, handler)
     }
 
     pub fn post<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
@@ -225,7 +208,7 @@ impl Router {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::POST, path, handler)
+        <Self as RouteRegistrar>::post(self, path, handler)
     }
 
     pub fn put<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
@@ -234,16 +217,7 @@ impl Router {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::PUT, path, handler)
-    }
-
-    pub fn delete<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
-    where
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R: Responsable,
-    {
-        self.add_route(Method::DELETE, path, handler)
+        <Self as RouteRegistrar>::put(self, path, handler)
     }
 
     pub fn patch<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
@@ -252,32 +226,27 @@ impl Router {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::PATCH, path, handler)
+        <Self as RouteRegistrar>::patch(self, path, handler)
     }
 
-    /// Register a route that responds to all standard HTTP methods.
+    pub fn delete<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        <Self as RouteRegistrar>::delete(self, path, handler)
+    }
+
     pub fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        let methods = vec![
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::PATCH,
-        ];
-        let h: HandlerFn = Arc::new(move |req| {
-            let fut = handler(req);
-            Box::pin(async move { fut.await.to_response() })
-        });
-
-        PendingRouteRegistrar::new(self, methods, path, h)
+        <Self as RouteRegistrar>::any(self, path, handler)
     }
 
-    /// Register a route with multiple specific HTTP methods.
     pub fn r#match<F, Fut, R>(
         &mut self,
         methods: &[Method],
@@ -289,43 +258,73 @@ impl Router {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        let h: HandlerFn = Arc::new(move |req| {
-            let fut = handler(req);
-            Box::pin(async move { fut.await.to_response() })
-        });
+        <Self as RouteRegistrar>::r#match(self, methods, path, handler)
+    }
 
-        PendingRouteRegistrar::new(self, methods.to_vec(), path, h)
+    pub fn domain(&mut self, domain: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::domain(self, domain)
+    }
+
+    pub fn prefix(&mut self, prefix: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::prefix(self, prefix)
+    }
+
+    pub fn name(&mut self, name: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::name(self, name)
+    }
+
+    pub fn r#where(&mut self, param: &str, pattern: &str) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::r#where(self, param, pattern)
+    }
+
+    pub fn where_number(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::where_number(self, param)
+    }
+
+    pub fn where_alpha(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::where_alpha(self, param)
+    }
+
+    pub fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::middleware(self, middleware)
+    }
+
+    pub fn without_middleware(
+        &mut self,
+        middleware: impl IntoMiddleware,
+    ) -> PendingRouteRegistrar<'_> {
+        <Self as RouteRegistrar>::without_middleware(self, middleware)
     }
 
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
-        if let Some(method_router) = self.routes.get(&req.method) {
-            if let Ok(matched) = method_router.at(&req.path) {
-                // Populate inline RouteParams without allocating dynamic HashMap nodes
-                for (key, value) in matched.params.iter() {
-                    req.params
-                        .insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
-                }
-
-                let handler = &matched.value.handler;
-                let pipeline = &matched.value.middleware;
-
-                // FAST-PATH: Bypass middleware machinery completely if there are no layers
-                if pipeline.is_empty() {
-                    return (handler)(req);
-                }
-
-                let pipeline_cloned = pipeline.clone();
-                let handler_cloned = Arc::clone(handler);
-                return Box::pin(async move {
-                    pipeline_cloned
-                        .send(req)
-                        .then(move |r| {
-                            let h = Arc::clone(&handler_cloned);
-                            async move { (h)(r).await }
-                        })
-                        .await
-                });
+        if let Some(method_router) = self.routes.get(&req.method)
+            && let Ok(matched) = method_router.at(&req.path)
+        {
+            // Populate inline RouteParams without allocating dynamic HashMap nodes
+            for (key, value) in matched.params.iter() {
+                req.params
+                    .insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
             }
+
+            let handler = &matched.value.handler;
+            let pipeline = &matched.value.middleware;
+
+            // FAST-PATH: Bypass middleware machinery completely if there are no layers
+            if pipeline.is_empty() {
+                return (handler)(req);
+            }
+
+            let pipeline_cloned = pipeline.clone();
+            let handler_cloned = Arc::clone(handler);
+            return Box::pin(async move {
+                pipeline_cloned
+                    .send(req)
+                    .then(move |r| {
+                        let h = Arc::clone(&handler_cloned);
+                        async move { (h)(r).await }
+                    })
+                    .await
+            });
         }
 
         let global = self.middlewares.read().unwrap().clone();
@@ -344,5 +343,107 @@ impl Router {
                 })
                 .await
         })
+    }
+}
+
+impl RouteRegistrar for Router {
+    fn get<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).get(path, handler)
+    }
+
+    fn post<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).post(path, handler)
+    }
+
+    fn put<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).put(path, handler)
+    }
+
+    fn patch<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).patch(path, handler)
+    }
+
+    fn delete<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).delete(path, handler)
+    }
+
+    fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).any(path, handler)
+    }
+
+    fn r#match<F, Fut, R>(
+        &mut self,
+        methods: &[Method],
+        path: &str,
+        handler: F,
+    ) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).r#match(methods, path, handler)
+    }
+
+    fn domain(&mut self, domain: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).domain(domain)
+    }
+
+    fn prefix(&mut self, prefix: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).prefix(prefix)
+    }
+
+    fn name(&mut self, name: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).name(name)
+    }
+
+    fn r#where(&mut self, param: &str, pattern: &str) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).r#where(param, pattern)
+    }
+
+    fn where_number(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).where_number(param)
+    }
+
+    fn where_alpha(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).where_alpha(param)
+    }
+
+    fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).middleware(middleware)
+    }
+
+    fn without_middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
+        PendingRouteRegistrar::new(self).without_middleware(middleware)
     }
 }
