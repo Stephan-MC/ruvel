@@ -294,8 +294,8 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
                         .name("users.show");
 
                     router
-                        .where_alpha("slug")
-                        .post("/posts/{slug}", |_req| async { "created" });
+                        .post("/posts/{slug}", |_req| async { "created" })
+                        .where_alpha("slug");
                 });
         })
         .create();

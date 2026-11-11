@@ -273,18 +273,6 @@ impl Router {
         <Self as RouteRegistrar>::name(self, name)
     }
 
-    pub fn r#where(&mut self, param: &str, pattern: &str) -> PendingRouteRegistrar<'_> {
-        <Self as RouteRegistrar>::r#where(self, param, pattern)
-    }
-
-    pub fn where_number(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
-        <Self as RouteRegistrar>::where_number(self, param)
-    }
-
-    pub fn where_alpha(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
-        <Self as RouteRegistrar>::where_alpha(self, param)
-    }
-
     pub fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
         <Self as RouteRegistrar>::middleware(self, middleware)
     }
@@ -425,18 +413,6 @@ impl RouteRegistrar for Router {
 
     fn name(&mut self, name: impl Into<String>) -> PendingRouteRegistrar<'_> {
         PendingRouteRegistrar::new(self).name(name)
-    }
-
-    fn r#where(&mut self, param: &str, pattern: &str) -> PendingRouteRegistrar<'_> {
-        PendingRouteRegistrar::new(self).r#where(param, pattern)
-    }
-
-    fn where_number(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
-        PendingRouteRegistrar::new(self).where_number(param)
-    }
-
-    fn where_alpha(&mut self, param: &str) -> PendingRouteRegistrar<'_> {
-        PendingRouteRegistrar::new(self).where_alpha(param)
     }
 
     fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {

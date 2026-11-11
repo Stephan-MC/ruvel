@@ -70,15 +70,6 @@ pub trait RouteRegistrar {
     /// Begin configuring a route or group with a route name or name prefix.
     fn name(&mut self, name: impl Into<String>) -> PendingRouteRegistrar<'_>;
 
-    /// Begin configuring a route or group with a regular expression parameter constraint.
-    fn r#where(&mut self, param: &str, pattern: &str) -> PendingRouteRegistrar<'_>;
-
-    /// Begin configuring a route or group with a numeric parameter constraint (`^[0-9]+$`).
-    fn where_number(&mut self, param: &str) -> PendingRouteRegistrar<'_>;
-
-    /// Begin configuring a route or group with an alphabetic parameter constraint (`^[a-zA-Z]+$`).
-    fn where_alpha(&mut self, param: &str) -> PendingRouteRegistrar<'_>;
-
     /// Begin configuring a route or group with middleware.
     fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_>;
 
