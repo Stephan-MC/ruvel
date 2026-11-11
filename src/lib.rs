@@ -10,3 +10,5 @@ pub mod http;
 pub mod pipeline;
 pub mod routing;
 pub mod support;
+
+pub use routing::RouteRegistrar;

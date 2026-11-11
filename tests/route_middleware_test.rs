@@ -1,5 +1,6 @@
 use ruvel::foundation::Application;
 use ruvel::http::{Method, Middleware, Next, Request, Response};
+use ruvel::routing::RouteRegistrar;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -294,8 +295,12 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
                         .name("users.show");
 
                     router
-                        .post("/posts/{slug}", |_req| async { "created" })
-                        .where_alpha("slug");
+                        .prefix("v1")
+                        .group(|router| {
+                            router
+                                .post("/posts/{slug}", |_req| async { "created" })
+                                .where_alpha("slug");
+                        });
                 });
         })
         .create();
@@ -310,7 +315,7 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
     assert_eq!(res.headers.get("X-Audit"), None);
 
     let res_post = kernel
-        .handle(Request::new(Method::POST, "/admin/posts/hello"))
+        .handle(Request::new(Method::POST, "/admin/v1/posts/hello"))
         .await;
     assert_eq!(res_post.body, b"created");
     assert_eq!(res_post.headers.get("X-Auth"), Some("ok"));
