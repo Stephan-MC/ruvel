@@ -7,8 +7,8 @@ use std::borrow::Cow;
 /// or owned (`Cow::Owned`), avoiding unnecessary heap allocations on parse and lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeaderMap {
-    // Stores (original_key, lowercased_key, value)
-    entries: Vec<(Cow<'static, str>, String, Cow<'static, str>)>,
+    // Stores (original_key, value)
+    entries: Vec<(Cow<'static, str>, Cow<'static, str>)>,
 }
 
 impl HeaderMap {
@@ -26,41 +26,24 @@ impl HeaderMap {
         }
     }
 
-    /// Insert a static header key and value with 0 heap allocations for string buffers.
-    pub fn insert_static(&mut self, key: &'static str, value: &'static str) {
-        let lower = key.to_ascii_lowercase();
-        if let Some(entry) = self.entries.iter_mut().find(|(_, l, _)| l == &lower) {
-            entry.0 = Cow::Borrowed(key);
-            entry.2 = Cow::Borrowed(value);
-        } else {
-            self.entries.push((Cow::Borrowed(key), lower, Cow::Borrowed(value)));
-        }
-    }
-
     /// Insert a header name-value pair.
     ///
+    /// Accepts `&'static str` (0 heap allocations), `String`, or `Cow<'static, str>`.
     /// If a header with the same name (case-insensitive) already exists,
     /// its value and casing are updated.
-    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        let key_str = key.into();
-        let val_str = value.into();
-        let lower = key_str.to_ascii_lowercase();
+    pub fn insert(
+        &mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) {
+        let key = key.into();
+        let value = value.into();
 
-        if let Some(entry) = self.entries.iter_mut().find(|(_, l, _)| l == &lower) {
-            entry.0 = Cow::Owned(key_str);
-            entry.2 = Cow::Owned(val_str);
-        } else {
-            self.entries.push((Cow::Owned(key_str), lower, Cow::Owned(val_str)));
-        }
-    }
-
-    pub fn insert_cow(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
-        let lower = key.to_ascii_lowercase();
-        if let Some(entry) = self.entries.iter_mut().find(|(_, l, _)| l == &lower) {
+        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&key)) {
             entry.0 = key;
-            entry.2 = value;
+            entry.1 = value;
         } else {
-            self.entries.push((key, lower, value));
+            self.entries.push((key, value));
         }
     }
 
@@ -68,15 +51,15 @@ impl HeaderMap {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries
             .iter()
-            .find(|(_, l, _)| l.eq_ignore_ascii_case(key))
-            .map(|(_, _, v)| v.as_ref())
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_ref())
     }
 
     /// Check if a header exists (case-insensitive).
     pub fn contains_key(&self, key: &str) -> bool {
         self.entries
             .iter()
-            .any(|(_, l, _)| l.eq_ignore_ascii_case(key))
+            .any(|(k, _)| k.eq_ignore_ascii_case(key))
     }
 
     /// Remove a header by name (case-insensitive) and return its value if present.
@@ -84,9 +67,9 @@ impl HeaderMap {
         if let Some(idx) = self
             .entries
             .iter()
-            .position(|(_, l, _)| l.eq_ignore_ascii_case(key))
+            .position(|(k, _)| k.eq_ignore_ascii_case(key))
         {
-            Some(self.entries.remove(idx).2.into_owned())
+            Some(self.entries.remove(idx).1.into_owned())
         } else {
             None
         }
@@ -106,7 +89,7 @@ impl HeaderMap {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries
             .iter()
-            .map(|(k, _, v)| (k.as_ref(), v.as_ref()))
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
     }
 }
 
@@ -118,7 +101,7 @@ impl<'a> IntoIterator for &'a HeaderMap {
         let items: Vec<Self::Item> = self
             .entries
             .iter()
-            .map(|(k, _, v)| (k.as_ref(), v.as_ref()))
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
             .collect();
         items.into_iter()
     }
@@ -129,16 +112,11 @@ impl IntoIterator for HeaderMap {
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let items: Vec<Self::Item> = self
-            .entries
-            .into_iter()
-            .map(|(k, _, v)| (k, v))
-            .collect();
-        items.into_iter()
+        self.entries.into_iter()
     }
 }
 
-impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for HeaderMap {
+impl<K: Into<Cow<'static, str>>, V: Into<Cow<'static, str>>> FromIterator<(K, V)> for HeaderMap {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut map = HeaderMap::new();
         for (k, v) in iter {

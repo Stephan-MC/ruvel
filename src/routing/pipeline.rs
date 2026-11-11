@@ -4,6 +4,7 @@ use crate::pipeline;
 use std::future::Future;
 
 /// A specialized routing pipeline extending Ruvel's base pipeline for HTTP Request and Response.
+#[derive(Clone)]
 pub struct Pipeline {
     inner: pipeline::Pipeline<Request, Response>,
 }
@@ -21,6 +22,10 @@ impl Pipeline {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn send(mut self, request: Request) -> Self {
         self.inner = self.inner.send(request);
         self
@@ -32,6 +37,24 @@ impl Pipeline {
         P: Pipeable<Request, Response> + 'static,
     {
         self.inner = self.inner.through(pipes);
+        self
+    }
+
+    pub fn prepend<I, P>(mut self, pipes: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Pipeable<Request, Response> + 'static,
+    {
+        self.inner = self.inner.prepend(pipes);
+        self
+    }
+
+    pub fn append<I, P>(mut self, pipes: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Pipeable<Request, Response> + 'static,
+    {
+        self.inner = self.inner.append(pipes);
         self
     }
 

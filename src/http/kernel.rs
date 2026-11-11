@@ -2,25 +2,18 @@ use crate::configuration::Middleware as MiddlewareConfig;
 use crate::contracts;
 use crate::http::middleware::{BoxFuture, Middleware};
 use crate::http::{Request, Response};
-use crate::pipeline::Pipeline;
 use crate::routing::Router;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct Kernel {
     pub router: Arc<RwLock<Arc<Router>>>,
-    pub middleware: Arc<RwLock<Vec<Arc<dyn Middleware>>>>,
-    pub middleware_groups: Arc<RwLock<HashMap<String, Vec<Arc<dyn Middleware>>>>>,
-    pub middleware_aliases: Arc<RwLock<HashMap<String, Arc<dyn Middleware>>>>,
 }
 
 impl Kernel {
     pub fn new(router: Arc<Router>) -> Self {
         Self {
             router: Arc::new(RwLock::new(router)),
-            middleware: Arc::new(RwLock::new(Vec::new())),
-            middleware_groups: Arc::new(RwLock::new(HashMap::new())),
-            middleware_aliases: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -34,27 +27,25 @@ impl Kernel {
         self.router.read().unwrap().clone()
     }
 
-    /// Set global middleware on the kernel.
+    /// Set global middleware on the router.
     pub fn set_global_middleware(&self, middleware: Vec<Arc<dyn Middleware>>) {
-        *self.middleware.write().unwrap() = middleware;
+        self.get_router().set_middlewares(middleware);
     }
 
-    /// Set route middleware groups on the kernel and sync to the router.
+    /// Set route middleware groups on the router.
     pub fn set_middleware_groups(
         &self,
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
     ) {
-        *self.middleware_groups.write().unwrap() = groups;
-        self.sync_middleware_to_router();
+        self.get_router().set_middleware_groups(groups);
     }
 
-    /// Set route middleware aliases on the kernel and sync to the router.
+    /// Set route middleware aliases on the router.
     pub fn set_middleware_aliases(
         &self,
         aliases: HashMap<String, Arc<dyn Middleware>>,
     ) {
-        *self.middleware_aliases.write().unwrap() = aliases;
-        self.sync_middleware_to_router();
+        self.get_router().set_middleware_aliases(aliases);
     }
 
     /// Configure middleware via the Laravel-style Middleware configuration object.
@@ -66,37 +57,16 @@ impl Kernel {
         callback(&mut config);
         let resolved = config.resolve();
 
-        self.set_global_middleware(resolved.global);
-        *self.middleware_groups.write().unwrap() = resolved.groups;
-        *self.middleware_aliases.write().unwrap() = resolved.aliases;
-        self.sync_middleware_to_router();
-    }
-
-    /// Sync the current state of route middleware groups and aliases to the router.
-    pub fn sync_middleware_to_router(&self) {
-        let groups = self.middleware_groups.read().unwrap().clone();
-        let aliases = self.middleware_aliases.read().unwrap().clone();
-        self.get_router().install_middleware(groups, aliases);
+        self.get_router().install_middleware(
+            resolved.global,
+            resolved.groups,
+            resolved.aliases,
+        );
     }
 
     pub fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
-        let layers = self.middleware.read().unwrap().clone();
         let router = self.get_router();
-        if layers.is_empty() {
-            let r = Arc::clone(&router);
-            return Box::pin(async move { r.dispatch(req).await });
-        }
-
-        Box::pin(async move {
-            Pipeline::new()
-                .send(req)
-                .through(layers)
-                .then(move |r| {
-                    let router = Arc::clone(&router);
-                    async move { router.dispatch(r).await }
-                })
-                .await
-        })
+        Box::pin(async move { router.dispatch(req).await })
     }
 }
 
