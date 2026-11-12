@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.5.0...ruvel-v0.6.0) (2026-11-12)
+
+
+### Features
+
+* Added RoutingServiceProvider ([7103651](https://github.com/Stephan-MC/ruvel/commit/7103651281f4670f2c05dcb8b8f0227a06226503))
+* **configuration:** implement Routing builder and update with_routing callback ([2e68bda](https://github.com/Stephan-MC/ruvel/commit/2e68bda9a24be4aa9165e9fb9972af20a650fc46))
+
+
+### Bug Fixes
+
+* Adjusted single registration for RoutingServiceProvider ([4fc5435](https://github.com/Stephan-MC/ruvel/commit/4fc54352333d34e7ceeb0d34aefaaaf9efec9a01))
+* Fix http::Kernel container binding to used already bound router instance from container ([eb5f1dd](https://github.com/Stephan-MC/ruvel/commit/eb5f1dd6574bab8f412155eb547079040baa13e2))
+
 ## [0.5.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.4.0...ruvel-v0.5.0) (2026-11-11)
 
 
