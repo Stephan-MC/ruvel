@@ -260,6 +260,16 @@ impl<'a> PendingRouteRegistrar<'a> {
         callback(&mut self);
     }
 
+    /// Check whether a middleware group is registered on the underlying router.
+    pub fn has_middleware_group(&self, name: &str) -> bool {
+        self.router.has_middleware_group(name)
+    }
+
+    /// Check whether a middleware alias is registered on the underlying router.
+    pub fn has_middleware_alias(&self, name: &str) -> bool {
+        self.router.has_middleware_alias(name)
+    }
+
     /// Commit the route into the router immediately.
     pub fn commit(&mut self) {
         if self.committed {

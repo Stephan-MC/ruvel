@@ -90,6 +90,16 @@ impl Router {
         *self.aliases.write().unwrap() = aliases;
     }
 
+    /// Check whether a middleware group is registered on the router.
+    pub fn has_middleware_group(&self, name: &str) -> bool {
+        self.middleware_groups.read().unwrap().contains_key(name)
+    }
+
+    /// Check whether a middleware alias is registered on the router.
+    pub fn has_middleware_alias(&self, name: &str) -> bool {
+        self.aliases.read().unwrap().contains_key(name)
+    }
+
     pub(crate) fn insert_route(&mut self, method: Method, path: &str, entry: RouteEntry) {
         let method_router = self.routes.entry(method).or_default();
         method_router.insert(path, entry).unwrap();

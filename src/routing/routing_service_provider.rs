@@ -1,4 +1,4 @@
-use crate::container::{self, Container};
+use crate::container::Container;
 use crate::routing::{Redirector, Router};
 use crate::support::ServiceProvider;
 
