@@ -1,12 +1,16 @@
 mod into_middleware;
-mod pending_route;
+pub mod pending_resource_registrar;
+mod pending_route_registrar;
 pub mod pipeline;
 mod redirector;
 pub mod route_registrar;
 mod router;
 
 pub use into_middleware::{IntoMiddleware, MiddlewareItem};
-pub use pending_route::PendingRouteRegistrar;
+pub use pending_resource_registrar::{
+    IntoResourceAction, PendingResourceRegistration, ResourceAction,
+};
+pub use pending_route_registrar::PendingRouteRegistrar;
 pub use pipeline::Pipeline;
 pub use route_registrar::RouteRegistrar;
 pub use router::{HandlerFn, Router};
