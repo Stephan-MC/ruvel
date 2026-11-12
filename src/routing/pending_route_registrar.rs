@@ -1,8 +1,9 @@
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
+use super::pending_resource_registrar::PendingResourceRegistration;
 use super::route_registrar::RouteRegistrar;
 use super::router::{HandlerFn, RouteEntry, Router};
 use crate::contracts::support::Responsable;
-use crate::http::{Method, Request};
+use crate::http::{Controller, Method, Request};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -248,6 +249,24 @@ impl<'a> PendingRouteRegistrar<'a> {
         self.r#where(param, r"^[a-zA-Z]+$")
     }
 
+    /// Register a resource controller responding to standard CRUD actions on this registrar.
+    pub fn resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        <Self as RouteRegistrar>::resource(self, name, controller)
+    }
+
+    /// Register an API resource controller on this registrar.
+    pub fn api_resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        <Self as RouteRegistrar>::api_resource(self, name, controller)
+    }
+
     /// Execute the callback registering all routes within a group sharing this registrar's attributes.
     ///
     /// Passes `&mut PendingRouteRegistrar` to `callback` so any routes or nested groups registered
@@ -415,6 +434,24 @@ impl<'a> RouteRegistrar for PendingRouteRegistrar<'a> {
 
     fn without_middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
         self.inherit_from().without_middleware(middleware)
+    }
+
+    fn resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        PendingResourceRegistration::new(
+            &mut *self.router,
+            name,
+            controller,
+            self.prefix.clone(),
+            self.name.clone(),
+            self.domain.clone(),
+            self.middleware.clone(),
+            self.excluded_middleware.clone(),
+            self.wheres.clone(),
+        )
     }
 }
 

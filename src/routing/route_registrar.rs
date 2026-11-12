@@ -1,7 +1,8 @@
 use super::into_middleware::IntoMiddleware;
-use super::pending_route::PendingRouteRegistrar;
+use super::pending_resource_registrar::PendingResourceRegistration;
+use super::pending_route_registrar::PendingRouteRegistrar;
 use crate::contracts::support::Responsable;
-use crate::http::{Method, Request};
+use crate::http::{Controller, Method, Request};
 use std::future::Future;
 
 /// Trait defining the fluent route registration and attribute configuration surface
@@ -75,4 +76,20 @@ pub trait RouteRegistrar {
 
     /// Begin configuring a route or group with excluded middleware aliases/groups.
     fn without_middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_>;
+
+    /// Register a resource controller responding to standard CRUD actions.
+    fn resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_>;
+
+    /// Register an API resource controller (omitting `create` and `edit` form actions).
+    fn api_resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        self.resource(name, controller).except(&["create", "edit"])
+    }
 }

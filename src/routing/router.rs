@@ -9,8 +9,10 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
-use super::pending_route::PendingRouteRegistrar;
+use super::pending_resource_registrar::PendingResourceRegistration;
+use super::pending_route_registrar::PendingRouteRegistrar;
 use super::route_registrar::RouteRegistrar;
+use crate::http::Controller;
 
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
 type MiddlewareList = Vec<Arc<dyn Middleware>>;
@@ -253,6 +255,22 @@ impl Router {
         <Self as RouteRegistrar>::without_middleware(self, middleware)
     }
 
+    pub fn resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        <Self as RouteRegistrar>::resource(self, name, controller)
+    }
+
+    pub fn api_resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        <Self as RouteRegistrar>::api_resource(self, name, controller)
+    }
+
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
         let lookup_path = {
             let trimmed = req.path.trim_end_matches('/');
@@ -395,5 +413,23 @@ impl RouteRegistrar for Router {
 
     fn without_middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
         PendingRouteRegistrar::new(self).without_middleware(middleware)
+    }
+
+    fn resource<C: Controller + 'static>(
+        &mut self,
+        name: &str,
+        controller: C,
+    ) -> PendingResourceRegistration<'_> {
+        PendingResourceRegistration::new(
+            self,
+            name,
+            controller,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+        )
     }
 }
