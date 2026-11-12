@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.6.0...ruvel-v0.7.0) (2026-11-12)
+
+
+### Features
+
+* **routing:** Added a resource Registrar for registring Resource routes ([c751b46](https://github.com/Stephan-MC/ruvel/commit/c751b46fbfaa45e7fa8a4b2e8256c08f45d369f5))
+
 ## [0.6.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.5.0...ruvel-v0.6.0) (2026-11-12)
 
 
