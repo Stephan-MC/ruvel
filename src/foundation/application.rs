@@ -86,7 +86,7 @@ impl Application {
 
     /// Register a service provider with the application.
     /// This immediately calls the provider's `register` method.
-    pub fn register_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
+    pub fn register_provider<P: ServiceProvider + 'static>(&mut self, provider: P) -> &mut Self {
         let provider = Box::new(provider);
 
         // 1. Run the register method immediately upon binding

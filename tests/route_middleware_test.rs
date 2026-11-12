@@ -53,10 +53,12 @@ async fn test_route_level_middleware_with_alias() {
                 },
             );
         })
-        .with_routing(|router| {
-            router
-                .get("/dashboard", |_req| async { "secret data" })
-                .middleware("auth");
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .get("/dashboard", |_req| async { "secret data" })
+                    .middleware("auth");
+            });
         })
         .create();
 
@@ -72,13 +74,15 @@ async fn test_route_level_middleware_with_alias() {
 #[tokio::test]
 async fn test_route_level_middleware_with_direct_instance() {
     let app = Application::configure("")
-        .with_routing(|router| {
-            router
-                .get("/profile", |_req| async { "profile data" })
-                .middleware(Arc::new(HeaderMiddleware {
-                    key: "X-Profile",
-                    val: "loaded",
-                }));
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .get("/profile", |_req| async { "profile data" })
+                    .middleware(Arc::new(HeaderMiddleware {
+                        key: "X-Profile",
+                        val: "loaded",
+                    }));
+            });
         })
         .create();
 
@@ -117,11 +121,13 @@ async fn test_route_level_middleware_slice_and_chaining() {
                 },
             );
         })
-        .with_routing(|router| {
-            router
-                .get("/chained", |_req| async { "chain" })
-                .middleware(["first", "second"])
-                .middleware("third");
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .get("/chained", |_req| async { "chain" })
+                    .middleware(["first", "second"])
+                    .middleware("third");
+            });
         })
         .create();
 
@@ -155,11 +161,13 @@ async fn test_without_middleware() {
                 },
             );
         })
-        .with_routing(|router| {
-            router
-                .get("/excluded", |_req| async { "excluded" })
-                .middleware(["auth", "log"])
-                .without_middleware("log");
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .get("/excluded", |_req| async { "excluded" })
+                    .middleware(["auth", "log"])
+                    .without_middleware("log");
+            });
         })
         .create();
 
@@ -180,13 +188,18 @@ async fn test_fluent_group_and_counter_middleware() {
     let app = Application::configure("")
         .with_routing({
             let counter = Arc::clone(&counter);
-            move |router| {
-                router.prefix("api").group(|router| {
-                    router
-                        .get("/counter", |_req| async { "ok" })
-                        .middleware(Arc::new(CounterMiddleware {
-                            count: Arc::clone(&counter),
-                        }));
+            move |routing| {
+                routing.web({
+                    let counter = Arc::clone(&counter);
+                    move |router| {
+                        router.prefix("api").group(|router| {
+                            router
+                                .get("/counter", |_req| async { "ok" })
+                                .middleware(Arc::new(CounterMiddleware {
+                                    count: Arc::clone(&counter),
+                                }));
+                        });
+                    }
                 });
             }
         })
@@ -204,9 +217,11 @@ async fn test_fluent_group_and_counter_middleware() {
 #[tokio::test]
 async fn test_route_prefix_and_group_prefix() {
     let app = Application::configure("")
-        .with_routing(|router| {
-            router.prefix("v1").group(|router| {
-                router.get("/users", |_req| async { "users list" });
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.prefix("v1").group(|router| {
+                    router.get("/users", |_req| async { "users list" });
+                });
             });
         })
         .create();
@@ -222,10 +237,12 @@ async fn test_route_prefix_and_group_prefix() {
 #[tokio::test]
 async fn test_route_naming() {
     let app = Application::configure("")
-        .with_routing(|router| {
-            router
-                .get("/named", |_req| async { "named route" })
-                .name("test.named");
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .get("/named", |_req| async { "named route" })
+                    .name("test.named");
+            });
         })
         .create();
 
@@ -240,8 +257,10 @@ async fn test_route_naming() {
 #[tokio::test]
 async fn test_any_method() {
     let app = Application::configure("")
-        .with_routing(|router| {
-            router.any("/any", |_req| async { "any response" });
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.any("/any", |_req| async { "any response" });
+            });
         })
         .create();
 
@@ -279,29 +298,29 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
                 },
             );
         })
-        .with_routing(|router| {
-            router
-                .middleware(["auth", "audit"])
-                .prefix("admin")
-                .domain("admin.example.com")
-                .name("admin.")
-                .where_number("id")
-                .group(|router| {
-                    router
-                        .without_middleware("audit")
-                        .get("/users/{id}", |req| async move {
-                            format!("user:{}", req.param("id").unwrap_or("0"))
-                        })
-                        .name("users.show");
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router
+                    .middleware(["auth", "audit"])
+                    .prefix("admin")
+                    .domain("admin.example.com")
+                    .name("admin.")
+                    .where_number("id")
+                    .group(|router| {
+                        router
+                            .without_middleware("audit")
+                            .get("/users/{id}", |req| async move {
+                                format!("user:{}", req.param("id").unwrap_or("0"))
+                            })
+                            .name("users.show");
 
-                    router
-                        .prefix("v1")
-                        .group(|router| {
+                        router.prefix("v1").group(|router| {
                             router
                                 .post("/posts/{slug}", |_req| async { "created" })
                                 .where_alpha("slug");
                         });
-                });
+                    });
+            });
         })
         .create();
 
@@ -325,13 +344,15 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
 #[tokio::test]
 async fn test_trailing_slash_normalization() {
     let app = Application::configure("")
-        .with_routing(|router| {
-            router.get("/", |_req| async { "root" });
-            router.get("/users", |_req| async { "users" });
-            router.get("/posts/", |_req| async { "posts" });
-            router.prefix("api/").group(|router| {
-                router.get("/items/{id}/", |req| async move {
-                    format!("item:{}", req.param("id").unwrap_or("0"))
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/", |_req| async { "root" });
+                router.get("/users", |_req| async { "users" });
+                router.get("/posts/", |_req| async { "posts" });
+                router.prefix("api/").group(|router| {
+                    router.get("/items/{id}/", |req| async move {
+                        format!("item:{}", req.param("id").unwrap_or("0"))
+                    });
                 });
             });
         })
