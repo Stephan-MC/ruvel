@@ -33,13 +33,17 @@ async fn test_http_kernel_handles_global_middleware() {
                 val: "true",
             });
         })
-        .with_routing(|router| {
-            router.get("/hello", |_req| async { "world" });
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/hello", |_req| async { "world" });
+            });
         })
         .create();
 
     // Verify Kernel is registered in the container
-    let kernel = app.make::<HttpKernel>().expect("Kernel must be in container");
+    let kernel = app
+        .make::<HttpKernel>()
+        .expect("Kernel must be in container");
 
     let req = Request::new(Method::GET, "/hello");
     let res = kernel.handle(req).await;
@@ -77,8 +81,10 @@ async fn test_http_kernel_trait_object_dispatches() {
                 val: "true",
             });
         })
-        .with_routing(|router| {
-            router.get("/hello", |_req| async { "world" });
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/hello", |_req| async { "world" });
+            });
         })
         .create();
 
@@ -95,9 +101,7 @@ async fn test_http_kernel_trait_object_dispatches() {
 
 #[tokio::test]
 async fn test_with_kernels_registers_both_kernels_in_container() {
-    let app = Application::configure("")
-        .with_kernels()
-        .create();
+    let app = Application::configure("").with_kernels().create();
 
     let console_kernel = app.make::<ConsoleKernel>();
     assert!(console_kernel.is_ok());

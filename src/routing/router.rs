@@ -38,14 +38,6 @@ pub struct Router {
     middleware_groups: Arc<RwLock<MiddlewareGroupMap>>,
     aliases: Arc<RwLock<MiddlewareAliasMap>>,
 
-    // Group properties applied to routes
-    pub(crate) group_prefix: Option<String>,
-    pub(crate) group_domain: Option<String>,
-    pub(crate) group_name: Option<String>,
-    pub(crate) group_wheres: HashMap<String, String>,
-    pub(crate) group_middleware: Vec<MiddlewareItem>,
-    pub(crate) group_excluded_middleware: Vec<String>,
-
     // Cached 404 Fallback
     fallback_handler: HandlerFn,
 }
@@ -63,12 +55,6 @@ impl Router {
             middlewares: Arc::new(RwLock::new(Vec::new())),
             middleware_groups: Arc::new(RwLock::new(HashMap::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
-            group_prefix: None,
-            group_domain: None,
-            group_name: None,
-            group_wheres: HashMap::new(),
-            group_middleware: Vec::new(),
-            group_excluded_middleware: Vec::new(),
 
             // Allocate the 404 handler ONCE at application boot
             fallback_handler: Arc::new(|_req| {
@@ -104,31 +90,14 @@ impl Router {
         *self.aliases.write().unwrap() = aliases;
     }
 
-    pub(crate) fn combine_prefix(&self, path: &str) -> String {
-        let clean_path = path.trim_matches('/');
-        match &self.group_prefix {
-            Some(prefix) => {
-                let trimmed = prefix.trim_matches('/');
-                if trimmed.is_empty() {
-                    if clean_path.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/{}", clean_path)
-                    }
-                } else if clean_path.is_empty() {
-                    format!("/{}", trimmed)
-                } else {
-                    format!("/{}/{}", trimmed, clean_path)
-                }
-            }
-            None => {
-                if clean_path.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/{}", clean_path)
-                }
-            }
-        }
+    /// Check whether a middleware group is registered on the router.
+    pub fn has_middleware_group(&self, name: &str) -> bool {
+        self.middleware_groups.read().unwrap().contains_key(name)
+    }
+
+    /// Check whether a middleware alias is registered on the router.
+    pub fn has_middleware_alias(&self, name: &str) -> bool {
+        self.aliases.read().unwrap().contains_key(name)
     }
 
     pub(crate) fn insert_route(&mut self, method: Method, path: &str, entry: RouteEntry) {
@@ -188,7 +157,7 @@ impl Router {
         pipeline
     }
 
-    /// Register routes defined within the closure.
+    /// Register routes defined within the closure, passing `&mut Router` directly.
     pub fn group(&mut self, configure: impl FnOnce(&mut Self)) {
         configure(self);
     }

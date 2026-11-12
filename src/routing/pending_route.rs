@@ -1,4 +1,5 @@
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
+use super::route_registrar::RouteRegistrar;
 use super::router::{HandlerFn, RouteEntry, Router};
 use crate::contracts::support::Responsable;
 use crate::http::{Method, Request};
@@ -9,10 +10,11 @@ use std::sync::Arc;
 /// A fluent builder for configuring a pending route or route group before it is
 /// committed to the [`Router`].
 ///
-/// Returned by [`RouteRegistrar`](super::RouteRegistrar) methods on [`Router`].
+/// Returned by [`RouteRegistrar`] methods on [`Router`] and [`PendingRouteRegistrar`].
 /// When configuring a single route (where a handler is attached via `.get(...)`, `.post(...)`, etc.),
 /// dropping `PendingRouteRegistrar` automatically commits the route into the underlying `Router`.
-/// When configuring a route group, call `.group(|router| { ... })`.
+/// When configuring a route group, call `.group(|router| { ... })`, which passes `&mut PendingRouteRegistrar`
+/// into the closure so child routes and nested groups inherit the group's attributes directly.
 pub struct PendingRouteRegistrar<'a> {
     router: &'a mut Router,
     methods: Vec<Method>,
@@ -41,6 +43,25 @@ impl<'a> PendingRouteRegistrar<'a> {
             handler: None,
             middleware: Vec::new(),
             excluded_middleware: Vec::new(),
+            committed: false,
+        }
+    }
+
+    /// Create a child `PendingRouteRegistrar` that inherits group attributes
+    /// (`prefix`, `name`, `domain`, `wheres`, `middleware`, `excluded_middleware`)
+    /// from the current `PendingRouteRegistrar`.
+    fn inherit_from<'b>(&'b mut self) -> PendingRouteRegistrar<'b> {
+        PendingRouteRegistrar {
+            router: &mut *self.router,
+            methods: Vec::new(),
+            path: None,
+            prefix: self.prefix.clone(),
+            name: self.name.clone(),
+            domain: self.domain.clone(),
+            wheres: self.wheres.clone(),
+            handler: None,
+            middleware: self.middleware.clone(),
+            excluded_middleware: self.excluded_middleware.clone(),
             committed: false,
         }
     }
@@ -228,79 +249,25 @@ impl<'a> PendingRouteRegistrar<'a> {
     }
 
     /// Execute the callback registering all routes within a group sharing this registrar's attributes.
+    ///
+    /// Passes `&mut PendingRouteRegistrar` to `callback` so any routes or nested groups registered
+    /// inside the closure inherit this group's attributes directly.
     pub fn group<F>(mut self, callback: F)
     where
-        F: FnOnce(&mut Router),
+        F: FnOnce(&mut Self),
     {
         self.committed = true;
+        callback(&mut self);
+    }
 
-        // Save current router group properties
-        let prev_prefix = self.router.group_prefix.clone();
-        let prev_domain = self.router.group_domain.clone();
-        let prev_name = self.router.group_name.clone();
-        let prev_wheres = self.router.group_wheres.clone();
-        let prev_middleware = self.router.group_middleware.clone();
-        let prev_excluded = self.router.group_excluded_middleware.clone();
+    /// Check whether a middleware group is registered on the underlying router.
+    pub fn has_middleware_group(&self, name: &str) -> bool {
+        self.router.has_middleware_group(name)
+    }
 
-        // Push new group prefix onto the router
-        if let Some(ref p) = self.prefix {
-            self.router.group_prefix = Some(match &self.router.group_prefix {
-                Some(parent) => {
-                    let parent_clean = parent.trim_matches('/');
-                    let p_clean = p.trim_matches('/');
-                    if parent_clean.is_empty() {
-                        format!("/{}", p_clean)
-                    } else if p_clean.is_empty() {
-                        format!("/{}", parent_clean)
-                    } else {
-                        format!("/{}/{}", parent_clean, p_clean)
-                    }
-                }
-                None => {
-                    let p_clean = p.trim_matches('/');
-                    format!("/{}", p_clean)
-                }
-            });
-        }
-
-        if let Some(ref domain) = self.domain {
-            self.router.group_domain = Some(domain.clone());
-        }
-
-        if let Some(ref name) = self.name {
-            self.router.group_name = Some(match &self.router.group_name {
-                Some(parent_name) => format!("{}{}", parent_name, name),
-                None => name.clone(),
-            });
-        }
-
-        if !self.wheres.is_empty() {
-            self.router
-                .group_wheres
-                .extend(self.wheres.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-
-        if !self.middleware.is_empty() {
-            self.router
-                .group_middleware
-                .extend(self.middleware.iter().cloned());
-        }
-
-        if !self.excluded_middleware.is_empty() {
-            self.router
-                .group_excluded_middleware
-                .extend(self.excluded_middleware.iter().cloned());
-        }
-
-        callback(self.router);
-
-        // Restore previous router group properties
-        self.router.group_prefix = prev_prefix;
-        self.router.group_domain = prev_domain;
-        self.router.group_name = prev_name;
-        self.router.group_wheres = prev_wheres;
-        self.router.group_middleware = prev_middleware;
-        self.router.group_excluded_middleware = prev_excluded;
+    /// Check whether a middleware alias is registered on the underlying router.
+    pub fn has_middleware_alias(&self, name: &str) -> bool {
+        self.router.has_middleware_alias(name)
     }
 
     /// Commit the route into the router immediately.
@@ -315,67 +282,139 @@ impl<'a> PendingRouteRegistrar<'a> {
         };
 
         let raw_path = self.path.as_deref().unwrap_or("/");
+        let trimmed_path = raw_path.trim_matches('/');
 
-        // Build final path: prepend any route-specific prefix
-        let mut final_path = raw_path.to_string();
-        if let Some(ref p) = self.prefix {
-            let trimmed_prefix = p.trim_matches('/');
-            let trimmed_path = final_path.trim_matches('/');
-            if trimmed_prefix.is_empty() {
-                final_path = if trimmed_path.is_empty() {
+        let final_path = match &self.prefix {
+            Some(p) => {
+                let trimmed_prefix = p.trim_matches('/');
+                if trimmed_prefix.is_empty() {
+                    if trimmed_path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/{}", trimmed_path)
+                    }
+                } else if trimmed_path.is_empty() {
+                    format!("/{}", trimmed_prefix)
+                } else {
+                    format!("/{}/{}", trimmed_prefix, trimmed_path)
+                }
+            }
+            None => {
+                if trimmed_path.is_empty() {
                     "/".to_string()
                 } else {
                     format!("/{}", trimmed_path)
-                };
-            } else if trimmed_path.is_empty() {
-                final_path = format!("/{}", trimmed_prefix);
-            } else {
-                final_path = format!("/{}/{}", trimmed_prefix, trimmed_path);
+                }
             }
-        }
-
-        // Apply router group prefix if any
-        final_path = self.router.combine_prefix(&final_path);
-
-        // Combine group middleware + route middleware, and group excluded + route excluded
-        let mut combined_middleware = self.router.group_middleware.clone();
-        combined_middleware.extend(self.middleware.iter().cloned());
-
-        let mut combined_excluded = self.router.group_excluded_middleware.clone();
-        combined_excluded.extend(self.excluded_middleware.iter().cloned());
-
-        // Build the route's middleware pipeline (global + group + route-specific, minus excluded)
-        let middleware = self
-            .router
-            .compile_route_middlewares(&combined_middleware, &combined_excluded);
-
-        let final_domain = self
-            .domain
-            .clone()
-            .or_else(|| self.router.group_domain.clone());
-
-        let final_name = match (&self.router.group_name, &self.name) {
-            (Some(group_name), Some(route_name)) => Some(format!("{}{}", group_name, route_name)),
-            (Some(group_name), None) => Some(group_name.clone()),
-            (None, Some(route_name)) => Some(route_name.clone()),
-            (None, None) => None,
         };
 
-        let mut final_wheres = self.router.group_wheres.clone();
-        final_wheres.extend(self.wheres.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Build the route's middleware pipeline (global + group/route-specific, minus excluded)
+        let middleware = self
+            .router
+            .compile_route_middlewares(&self.middleware, &self.excluded_middleware);
 
         let entry = RouteEntry {
             handler: Arc::clone(handler),
             middleware,
-            name: final_name,
-            domain: final_domain,
-            wheres: final_wheres,
+            name: self.name.clone(),
+            domain: self.domain.clone(),
+            wheres: self.wheres.clone(),
         };
 
         for method in &self.methods {
             self.router
                 .insert_route(method.clone(), &final_path, entry.clone());
         }
+    }
+}
+
+impl<'a> RouteRegistrar for PendingRouteRegistrar<'a> {
+    fn get<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().get(path, handler)
+    }
+
+    fn post<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().post(path, handler)
+    }
+
+    fn put<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().put(path, handler)
+    }
+
+    fn patch<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().patch(path, handler)
+    }
+
+    fn delete<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().delete(path, handler)
+    }
+
+    fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().any(path, handler)
+    }
+
+    fn r#match<F, Fut, R>(
+        &mut self,
+        methods: &[Method],
+        path: &str,
+        handler: F,
+    ) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().r#match(methods, path, handler)
+    }
+
+    fn domain(&mut self, domain: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        self.inherit_from().domain(domain)
+    }
+
+    fn prefix(&mut self, prefix: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        self.inherit_from().prefix(prefix)
+    }
+
+    fn name(&mut self, name: impl Into<String>) -> PendingRouteRegistrar<'_> {
+        self.inherit_from().name(name)
+    }
+
+    fn middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
+        self.inherit_from().middleware(middleware)
+    }
+
+    fn without_middleware(&mut self, middleware: impl IntoMiddleware) -> PendingRouteRegistrar<'_> {
+        self.inherit_from().without_middleware(middleware)
     }
 }
 

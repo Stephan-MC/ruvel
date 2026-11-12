@@ -1,19 +1,20 @@
 pub(crate) use crate::foundation::Application;
 use crate::{
-    configuration::Middleware,
-    console::Kernel as ConsoleKernel,
-    http::Kernel as HttpKernel,
+    configuration::{Middleware, Routing},
+    console, http,
     routing::Router,
     support::ServiceProvider,
 };
-use std::sync::Arc;
+use std::{any::type_name, sync::Arc};
 
 #[derive(Default)]
 pub struct Scheduler {}
 
+type RoutingCallback = Box<dyn FnOnce(&mut Router)>;
+
 pub struct ApplicationBuilder {
     app: Application,
-    routing_callbacks: Vec<Box<dyn FnOnce(&mut Router)>>,
+    routing_callbacks: Vec<RoutingCallback>,
 }
 
 impl ApplicationBuilder {
@@ -25,7 +26,7 @@ impl ApplicationBuilder {
     }
 
     pub fn with_provider<P: ServiceProvider + 'static>(mut self, provider: P) -> Self {
-        self.app = self.app.register_provider(provider);
+        self.app.register_provider(provider);
 
         self
     }
@@ -35,12 +36,17 @@ impl ApplicationBuilder {
         self
     }
 
-    /// Register routes on the router
+    /// Register routes on the router using the [`Routing`](crate::configuration::Routing) configuration builder.
     pub fn with_routing<F>(mut self, callback: F) -> Self
     where
-        F: FnOnce(&mut Router) + 'static,
+        F: FnOnce(&mut Routing) + 'static,
     {
-        self.routing_callbacks.push(Box::new(callback));
+        let mut routing = Routing::new();
+        callback(&mut routing);
+        self.routing_callbacks.push(Box::new(move |router| {
+            routing.register(router);
+        }));
+
         self
     }
 
@@ -54,10 +60,9 @@ impl ApplicationBuilder {
 
     /// Register HTTP and Console kernels in the container and application.
     pub fn with_kernels(self) -> Self {
-        self.app.container.singleton(|_| ConsoleKernel::default());
+        self.app.container.singleton(|_| console::Kernel::default());
         self.app.container.singleton(|c| {
-            let router = c.make::<Router>().unwrap_or_else(|_| Arc::new(Router::new()));
-            HttpKernel::new(router)
+            http::Kernel::new(c.make::<Router>().expect("Router Not found in Container"))
         });
         self
     }
@@ -68,11 +73,13 @@ impl ApplicationBuilder {
         F: FnOnce(&mut Middleware) + Send + Sync + 'static,
     {
         let callback_cell = std::sync::Mutex::new(Some(callback));
-        self.app.container.after_resolving::<HttpKernel, _>(move |kernel, _| {
-            if let Some(cb) = callback_cell.lock().unwrap().take() {
-                kernel.configure_middleware(cb);
-            }
-        });
+        self.app
+            .container
+            .after_resolving::<http::Kernel, _>(move |kernel, _| {
+                if let Some(cb) = callback_cell.lock().unwrap().take() {
+                    kernel.configure_middleware(cb);
+                }
+            });
         self
     }
 
@@ -86,7 +93,10 @@ impl ApplicationBuilder {
     pub fn create(mut self) -> Application {
         // 1. Resolve the HttpKernel from the container (which runs after_resolving to configure
         //    global middleware, groups, and aliases directly on the router)
-        let kernel = self.app.make::<HttpKernel>().expect("HttpKernel must be registered");
+        let kernel = self
+            .app
+            .make::<http::Kernel>()
+            .unwrap_or_else(|_| panic!("{:?} must be registered", type_name::<http::Kernel>()));
 
         // 2. Clone the router (preserving its global middleware, groups, and aliases) and run routing callbacks
         let mut router = (*kernel.get_router()).clone();
