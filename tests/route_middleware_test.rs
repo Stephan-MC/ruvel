@@ -268,14 +268,23 @@ async fn test_any_method() {
 
     for method in &[
         Method::GET,
+        Method::HEAD,
         Method::POST,
         Method::PUT,
-        Method::DELETE,
         Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
     ] {
         let req = Request::new(method.clone(), "/any");
         let res = kernel.handle(req).await;
+        assert_eq!(res.status.code(), 200);
         assert_eq!(res.body, b"any response");
+    }
+
+    for method in &[Method::TRACE, Method::CONNECT] {
+        let req = Request::new(method.clone(), "/any");
+        let res = kernel.handle(req).await;
+        assert_eq!(res.status.code(), 404);
     }
 }
 

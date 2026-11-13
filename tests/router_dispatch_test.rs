@@ -274,3 +274,41 @@ async fn test_api_resource_accepts_non_numeric_ids() {
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"post:550e8400-e29b-41d4-a716-446655440000");
 }
+
+#[tokio::test]
+async fn test_head_options_trace_and_connect_routes() {
+    let mut router = Router::new();
+    router.get("/only-get", |_req| async { "get" });
+    router.head("/status", |_req| async { "head:static" });
+    router.options("/cors/{resource}", |req| async move {
+        format!("options:{}", req.param("resource").unwrap_or(""))
+    });
+    router.trace("/echo", |_req| async { "trace:static" });
+    router.connect("example.com:443", |_req| async { "connect:tunnel" });
+
+    // HEAD does not implicitly fall back to GET
+    let head_miss = router
+        .dispatch(Request::new(Method::HEAD, "/only-get"))
+        .await;
+    assert_eq!(head_miss.status.code(), 404);
+
+    let head_hit = router.dispatch(Request::new(Method::HEAD, "/status")).await;
+    assert_eq!(head_hit.status.code(), 200);
+    assert_eq!(head_hit.body, b"head:static");
+
+    let options_hit = router
+        .dispatch(Request::new(Method::OPTIONS, "/cors/users"))
+        .await;
+    assert_eq!(options_hit.status.code(), 200);
+    assert_eq!(options_hit.body, b"options:users");
+
+    let trace_hit = router.dispatch(Request::new(Method::TRACE, "/echo")).await;
+    assert_eq!(trace_hit.status.code(), 200);
+    assert_eq!(trace_hit.body, b"trace:static");
+
+    let connect_hit = router
+        .dispatch(Request::new(Method::CONNECT, "example.com:443"))
+        .await;
+    assert_eq!(connect_hit.status.code(), 200);
+    assert_eq!(connect_hit.body, b"connect:tunnel");
+}
