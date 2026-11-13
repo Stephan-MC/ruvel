@@ -11,8 +11,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 arc-swap = "1.9.3"
-async-trait = "0.1.92"
-dashmap = "6.2.1"
 httparse = "1.10.1"
 tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -29,8 +27,14 @@ regex = "1"
 async_fn_in_trait = "allow"
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.5", default-features = false, features = [
+  "cargo_bench_support",
+] }
 
 [[bench]]
 name = "router"
+harness = false
+
+[[bench]]
+name = "http"
 harness = false

@@ -26,6 +26,17 @@ impl HeaderMap {
         }
     }
 
+    /// Create a `HeaderMap` with a single initial entry, avoiding over-allocation and
+    /// duplicate-key scanning when constructing standard responses.
+    pub(crate) fn with_single(
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            entries: vec![(key.into(), value.into())],
+        }
+    }
+
     /// Insert a header name-value pair.
     ///
     /// Accepts `&'static str` (0 heap allocations), `String`, or `Cow<'static, str>`.

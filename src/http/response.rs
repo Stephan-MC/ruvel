@@ -85,12 +85,19 @@ impl Response {
     /// Create a new Response initialized from an [`Status`].
     /// Defaults to `Content-Type: text/html; charset=utf-8`.
     pub fn new(status: Status) -> Self {
-        let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", "text/html; charset=utf-8");
         Self {
             status,
-            headers,
+            headers: HeaderMap::with_single("Content-Type", "text/html; charset=utf-8"),
             body: Vec::new(),
+        }
+    }
+
+    /// Internal fast-path constructor with an explicit `Content-Type` and pre-built body.
+    pub(crate) fn with_body(status: Status, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: HeaderMap::with_single("Content-Type", content_type),
+            body,
         }
     }
 
@@ -188,6 +195,9 @@ impl Response {
     /// Fast response serialization avoiding `std::fmt::write!` format string parsing
     /// and dynamic formatter dispatch.
     pub fn write_to(&self, buffer: &mut Vec<u8>) {
+        // Reserve enough space up front to avoid multiple growth reallocations on fresh buffers.
+        buffer.reserve(96 + self.body.len());
+
         // Fast static status line dispatch
         let status_line = match self.status {
             Status::Ok => b"HTTP/1.1 200 OK\r\n" as &[u8],

@@ -13,25 +13,37 @@ pub trait Responsable: Send + 'static {
 // 2. Implementations for String types (auto 200 OK with text/html)
 impl Responsable for &'static str {
     fn to_response(self) -> Response {
-        Response::ok().html(self)
+        Response::with_body(
+            Status::Ok,
+            "text/html; charset=utf-8",
+            self.as_bytes().to_vec(),
+        )
     }
 }
 
 impl Responsable for String {
     fn to_response(self) -> Response {
-        Response::ok().html(self)
+        Response::with_body(Status::Ok, "text/html; charset=utf-8", self.into_bytes())
     }
 }
 
 impl Responsable for Cow<'static, str> {
     fn to_response(self) -> Response {
-        Response::ok().html(self)
+        let bytes = match self {
+            Cow::Borrowed(s) => s.as_bytes().to_vec(),
+            Cow::Owned(s) => s.into_bytes(),
+        };
+        Response::with_body(Status::Ok, "text/html; charset=utf-8", bytes)
     }
 }
 
 impl Responsable for Box<str> {
     fn to_response(self) -> Response {
-        Response::ok().html(self.to_string())
+        Response::with_body(
+            Status::Ok,
+            "text/html; charset=utf-8",
+            String::from(self).into_bytes(),
+        )
     }
 }
 
