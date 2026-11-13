@@ -309,21 +309,12 @@ impl<'a> PendingResourceRegistration<'a> {
 
             let route_name = make_route_name(name_suffix);
 
-            let mut wheres = self.wheres.clone();
-            // In API resources (or when create is excluded), ensure default 'id' parameter doesn't capture 'create'
-            if !self.actions.contains(&ResourceAction::Create)
-                && self.parameter_name == "id"
-                && !wheres.contains_key("id")
-            {
-                wheres.insert("id".to_string(), r"^[0-9]+$".to_string());
-            }
-
             let route = Route {
                 handler,
                 middleware: compiled_middleware.clone(),
                 name: Some(route_name),
                 domain: self.domain.clone(),
-                wheres,
+                wheres: self.wheres.clone(),
             };
 
             for method in methods {
