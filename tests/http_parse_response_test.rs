@@ -143,3 +143,46 @@ fn test_response_defaults_and_responsable_serialization() {
     let from_box_res = from_box.to_response();
     assert_eq!(from_box_res.body, b"boxed");
 }
+
+#[test]
+fn test_request_parse_head_options_trace_and_connect_methods() {
+    let cases = [
+        (
+            "HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Method::HEAD,
+            "/health",
+            "HEAD",
+        ),
+        (
+            "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Method::OPTIONS,
+            "*",
+            "OPTIONS",
+        ),
+        (
+            "TRACE /debug HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Method::TRACE,
+            "/debug",
+            "TRACE",
+        ),
+        (
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            Method::CONNECT,
+            "example.com:443",
+            "CONNECT",
+        ),
+    ];
+
+    for (raw, expected_method, expected_path, expected_display) in cases {
+        let (req, consumed) = Request::parse(raw.as_bytes())
+            .expect("parse should succeed")
+            .expect("request should be complete");
+        assert_eq!(consumed, raw.len());
+        assert_eq!(req.method, expected_method);
+        assert_eq!(req.method.to_string(), expected_display);
+        assert_eq!(Method::from(expected_display), expected_method);
+        assert_eq!(req.path, expected_path);
+    }
+
+    assert_eq!(Method::from("PURGE"), Method::UNKNOWN("PURGE".to_string()));
+}
