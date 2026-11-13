@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.0...ruvel-v0.7.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **routing:** remove api_resource numeric-id constraint workaround ([77f1453](https://github.com/Stephan-MC/ruvel/commit/77f1453957fa0f3b4675769222a2c0fa8d66fd3f))
+
+
+### Performance Improvements
+
+* **routing,http,pipeline:** optimize router dispatch and middleware hot path ([558217d](https://github.com/Stephan-MC/ruvel/commit/558217de39f4197732d483106246780a5792387c))
+
 ## [0.7.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.6.0...ruvel-v0.7.0) (2026-11-12)
 
 
