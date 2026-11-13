@@ -277,6 +277,42 @@ impl Router {
         <Self as RouteRegistrar>::delete(self, path, handler)
     }
 
+    pub fn head<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        <Self as RouteRegistrar>::head(self, path, handler)
+    }
+
+    pub fn options<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        <Self as RouteRegistrar>::options(self, path, handler)
+    }
+
+    pub fn trace<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        <Self as RouteRegistrar>::trace(self, path, handler)
+    }
+
+    pub fn connect<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        <Self as RouteRegistrar>::connect(self, path, handler)
+    }
+
     pub fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -413,6 +449,42 @@ impl RouteRegistrar for Router {
         R: Responsable,
     {
         PendingRouteRegistrar::new(self).delete(path, handler)
+    }
+
+    fn head<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).head(path, handler)
+    }
+
+    fn options<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).options(path, handler)
+    }
+
+    fn trace<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).trace(path, handler)
+    }
+
+    fn connect<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        PendingRouteRegistrar::new(self).connect(path, handler)
     }
 
     fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>

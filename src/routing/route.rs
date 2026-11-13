@@ -223,7 +223,7 @@ type CustomMethodRoutes = Vec<(String, Arc<Route>)>;
 /// Compact inline storage for routes keyed by HTTP method at a terminal path or segment.
 #[derive(Clone, Default)]
 pub struct MethodSlots {
-    standard: [Option<Arc<Route>>; 5],
+    standard: [Option<Arc<Route>>; 9],
     other: Option<Box<CustomMethodRoutes>>,
 }
 
@@ -236,6 +236,10 @@ impl MethodSlots {
             Method::PUT => Some(2),
             Method::DELETE => Some(3),
             Method::PATCH => Some(4),
+            Method::HEAD => Some(5),
+            Method::OPTIONS => Some(6),
+            Method::TRACE => Some(7),
+            Method::CONNECT => Some(8),
             Method::UNKNOWN(_) => None,
         }
     }

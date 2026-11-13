@@ -136,6 +136,46 @@ impl<'a> PendingRouteRegistrar<'a> {
         self.add_route(Method::DELETE, path, handler)
     }
 
+    /// Register a HEAD route on this registrar.
+    pub fn head<F, Fut, R>(self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.add_route(Method::HEAD, path, handler)
+    }
+
+    /// Register an OPTIONS route on this registrar.
+    pub fn options<F, Fut, R>(self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.add_route(Method::OPTIONS, path, handler)
+    }
+
+    /// Register a TRACE route on this registrar.
+    pub fn trace<F, Fut, R>(self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.add_route(Method::TRACE, path, handler)
+    }
+
+    /// Register a CONNECT route on this registrar.
+    pub fn connect<F, Fut, R>(self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.add_route(Method::CONNECT, path, handler)
+    }
+
     /// Register a route that responds to all standard HTTP methods.
     pub fn any<F, Fut, R>(mut self, path: &str, handler: F) -> Self
     where
@@ -145,10 +185,12 @@ impl<'a> PendingRouteRegistrar<'a> {
     {
         let methods = vec![
             Method::GET,
+            Method::HEAD,
             Method::POST,
             Method::PUT,
-            Method::DELETE,
             Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
         ];
         let h: HandlerFn = Arc::new(move |req| {
             let fut = handler(req);
@@ -397,6 +439,42 @@ impl<'a> RouteRegistrar for PendingRouteRegistrar<'a> {
         R: Responsable,
     {
         self.inherit_from().delete(path, handler)
+    }
+
+    fn head<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().head(path, handler)
+    }
+
+    fn options<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().options(path, handler)
+    }
+
+    fn trace<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().trace(path, handler)
+    }
+
+    fn connect<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable,
+    {
+        self.inherit_from().connect(path, handler)
     }
 
     fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
