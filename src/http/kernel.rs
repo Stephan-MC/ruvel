@@ -3,28 +3,29 @@ use crate::contracts;
 use crate::http::middleware::{BoxFuture, Middleware};
 use crate::http::{Request, Response};
 use crate::routing::Router;
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub struct Kernel {
-    pub router: Arc<RwLock<Arc<Router>>>,
+    router: ArcSwap<Router>,
 }
 
 impl Kernel {
     pub fn new(router: Arc<Router>) -> Self {
         Self {
-            router: Arc::new(RwLock::new(router)),
+            router: ArcSwap::new(router),
         }
     }
 
     /// Set the router instance on the kernel.
     pub fn set_router(&self, router: Arc<Router>) {
-        *self.router.write().unwrap() = router;
+        self.router.store(router);
     }
 
     /// Get a clone of the inner router Arc.
     pub fn get_router(&self) -> Arc<Router> {
-        self.router.read().unwrap().clone()
+        self.router.load_full()
     }
 
     /// Set global middleware on the router.
@@ -33,18 +34,12 @@ impl Kernel {
     }
 
     /// Set route middleware groups on the router.
-    pub fn set_middleware_groups(
-        &self,
-        groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
-    ) {
+    pub fn set_middleware_groups(&self, groups: HashMap<String, Vec<Arc<dyn Middleware>>>) {
         self.get_router().set_middleware_groups(groups);
     }
 
     /// Set route middleware aliases on the router.
-    pub fn set_middleware_aliases(
-        &self,
-        aliases: HashMap<String, Arc<dyn Middleware>>,
-    ) {
+    pub fn set_middleware_aliases(&self, aliases: HashMap<String, Arc<dyn Middleware>>) {
         self.get_router().set_middleware_aliases(aliases);
     }
 
@@ -57,16 +52,12 @@ impl Kernel {
         callback(&mut config);
         let resolved = config.resolve();
 
-        self.get_router().install_middleware(
-            resolved.global,
-            resolved.groups,
-            resolved.aliases,
-        );
+        self.get_router()
+            .install_middleware(resolved.global, resolved.groups, resolved.aliases);
     }
 
     pub fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
-        let router = self.get_router();
-        Box::pin(async move { router.dispatch(req).await })
+        self.router.load().dispatch(req)
     }
 }
 

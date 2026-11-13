@@ -309,17 +309,15 @@ impl<'a> PendingResourceRegistration<'a> {
 
             let route_name = make_route_name(name_suffix);
 
-            let route = Route {
+            let route = Route::with_details(
                 handler,
-                middleware: compiled_middleware.clone(),
-                name: Some(route_name),
-                domain: self.domain.clone(),
-                wheres: self.wheres.clone(),
-            };
+                compiled_middleware.clone(),
+                Some(route_name),
+                self.domain.clone(),
+                self.wheres.clone(),
+            );
 
-            for method in methods {
-                self.router.insert_route(method, &path, route.clone());
-            }
+            self.router.insert_route_for_methods(&methods, &path, route);
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::contracts::pipeline::Pipeable;
 use crate::http::{Request, Response};
 use crate::pipeline;
+use crate::pipeline::pipe::StepFn;
 use std::future::Future;
 
 /// A specialized routing pipeline extending Ruvel's base pipeline for HTTP Request and Response.
@@ -24,6 +25,13 @@ impl Pipeline {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    pub(crate) fn compose(
+        &self,
+        destination: StepFn<Request, Response>,
+    ) -> StepFn<Request, Response> {
+        self.inner.compose(destination)
     }
 
     pub fn send(mut self, request: Request) -> Self {

@@ -340,18 +340,16 @@ impl<'a> PendingRouteRegistrar<'a> {
             .router
             .compile_route_middlewares(&self.middleware, &self.excluded_middleware);
 
-        let route = Route {
-            handler: Arc::clone(handler),
+        let route = Route::with_details(
+            Arc::clone(handler),
             middleware,
-            name: self.name.clone(),
-            domain: self.domain.clone(),
-            wheres: self.wheres.clone(),
-        };
+            self.name.clone(),
+            self.domain.clone(),
+            self.wheres.clone(),
+        );
 
-        for method in &self.methods {
-            self.router
-                .insert_route(method.clone(), &final_path, route.clone());
-        }
+        self.router
+            .insert_route_for_methods(&self.methods, &final_path, route);
     }
 }
 
