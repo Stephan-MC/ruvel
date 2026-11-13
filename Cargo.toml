@@ -1,6 +1,6 @@
 [package]
 name = "ruvel"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 description = "The laravel alternative framework with rust performance"
 homepage = "https://github.com/Stephan-MC/ruvel"

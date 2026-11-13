@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.1...ruvel-v0.7.2) (2026-11-13)
+
+
+### Performance Improvements
+
+* **http,foundation,routing:** optimize HTTP parsing, response construction, and read loop ([2c96d1b](https://github.com/Stephan-MC/ruvel/commit/2c96d1b5b10f9f02425cdeeb65721bac860b48d8))
+
 ## [0.7.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.0...ruvel-v0.7.1) (2026-11-13)
 
 
