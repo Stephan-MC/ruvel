@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 /// Pipeline builder that passes a payload through a sequence of pipes (middleware layers).
 pub struct Pipeline<T, R = T> {
-    passable: Option<T>,
+    passable: Option<Box<T>>,
     pipes: Vec<Arc<dyn Pipeable<T, R>>>,
 }
 
@@ -40,7 +40,7 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
 
     /// Set the object being sent through the pipeline.
     pub fn send(mut self, passable: T) -> Self {
-        self.passable = Some(passable);
+        self.passable = Some(Box::new(passable));
         self
     }
 
@@ -97,31 +97,34 @@ impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
         self
     }
 
+    /// Compose all pipes around `destination` into a single reusable step.
+    ///
+    /// Returns `destination` untouched when the pipeline contains no pipes.
+    pub(crate) fn compose(&self, destination: StepFn<T, R>) -> StepFn<T, R> {
+        self.pipes.iter().rev().fold(destination, |next, pipe| {
+            let pipe = Arc::clone(pipe);
+            Arc::new(move |passable| {
+                let p = Arc::clone(&pipe);
+                let n = Next::new(Arc::clone(&next));
+                Box::pin(async move { p.handle(passable, n).await })
+            })
+        })
+    }
+
     /// Run the pipeline with a final destination callback and get the result.
-    pub async fn then<F, Fut>(self, destination: F) -> R
+    pub async fn then<F, Fut>(mut self, destination: F) -> R
     where
         F: Fn(T) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R> + Send + 'static,
     {
-        let passable = self
+        let passable = *self
             .passable
+            .take()
             .expect("Cannot execute pipeline without setting a passable payload via send()");
 
-        let mut current_step: StepFn<T, R> =
-            Arc::new(move |passable| Box::pin(destination(passable)));
-
-        // Compose the onion layers in reverse order: innermost layer wraps destination,
-        // outermost layer is called first (identical to Laravel's array_reduce pipeline).
-        for pipe in self.pipes.into_iter().rev() {
-            let next_step = current_step;
-            current_step = Arc::new(move |passable| {
-                let p = Arc::clone(&pipe);
-                let n = Next::new(Arc::clone(&next_step));
-                Box::pin(async move { p.handle(passable, n).await })
-            });
-        }
-
-        current_step(passable).await
+        let dest: StepFn<T, R> = Arc::new(move |passable| Box::pin(destination(passable)));
+        let chain = self.compose(dest);
+        chain(passable).await
     }
 }
 

@@ -31,7 +31,7 @@ src/
 ├── foundation/      # Application bootstrap, core bindings/aliases, and TCP HTTP/1.1 listener
 ├── http/            # Request, Response, Status, HeaderMap, Controller trait, HTTP Kernel, and Middleware
 ├── pipeline/        # Generic onion Pipeline and Pipe implementations
-├── routing/         # Radix-tree Router (matchit), PendingRoute, and route middleware resolution
+├── routing/         # Segment-tree Router, PendingRoute, and route middleware resolution
 └── support/         # ServiceProvider trait and base providers (e.g., LogServiceProvider)
 tests/               # Integration tests verifying end-to-end subsystem behavior
 ```

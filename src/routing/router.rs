@@ -2,46 +2,37 @@ use crate::contracts::support::Responsable;
 use crate::http::BoxFuture;
 use crate::http::{Method, Middleware, Request, Response};
 use crate::routing::pipeline::Pipeline;
-use matchit::Router as MatchitRouter;
+use arc_swap::ArcSwap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
 use super::pending_resource_registrar::PendingResourceRegistration;
 use super::pending_route_registrar::PendingRouteRegistrar;
+pub use super::route::HandlerFn;
+use super::route::{FxHashMap, MethodSlots, ParamBuf, Route, Segment, parse_param_name};
 use super::route_registrar::RouteRegistrar;
 use crate::http::Controller;
 
-pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
 type MiddlewareList = Vec<Arc<dyn Middleware>>;
 type MiddlewareGroupMap = HashMap<String, MiddlewareList>;
 type MiddlewareAliasMap = HashMap<String, Arc<dyn Middleware>>;
 
 #[derive(Clone)]
-pub(crate) struct RouteEntry {
-    pub(crate) handler: HandlerFn,
-    /// Pre-built middleware pipeline (global + group + route middlewares) stored on the route.
-    pub(crate) middleware: Pipeline,
-    #[allow(dead_code)]
-    pub(crate) name: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) domain: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) wheres: HashMap<String, String>,
-}
-
-#[derive(Clone)]
 pub struct Router {
-    // Map each HTTP Method to its own Radix Tree of routes
-    routes: HashMap<Method, MatchitRouter<RouteEntry>>,
+    static_routes: FxHashMap<Box<str>, MethodSlots>,
+    routes: Segment,
     middlewares: Arc<RwLock<MiddlewareList>>,
     middleware_groups: Arc<RwLock<MiddlewareGroupMap>>,
     aliases: Arc<RwLock<MiddlewareAliasMap>>,
 
-    // Cached 404 Fallback
+    // Cached 404 Fallback and pre-composed global middleware + 404 chain
     fallback_handler: HandlerFn,
+    fallback_chain: Arc<ArcSwap<HandlerFn>>,
+    has_global_middlewares: Arc<AtomicBool>,
 }
 
 impl Default for Router {
@@ -52,22 +43,42 @@ impl Default for Router {
 
 impl Router {
     pub fn new() -> Self {
+        // Allocate the 404 handler ONCE at application boot
+        let fallback_handler: HandlerFn =
+            Arc::new(|_req| Box::pin(async { Response::not_found().text("404 Not Found") }));
+        let fallback_chain = Arc::new(ArcSwap::from_pointee(Arc::clone(&fallback_handler)));
+
         Self {
-            routes: HashMap::new(),
+            static_routes: FxHashMap::default(),
+            routes: Segment::new(),
             middlewares: Arc::new(RwLock::new(Vec::new())),
             middleware_groups: Arc::new(RwLock::new(HashMap::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
+            fallback_handler,
+            fallback_chain,
+            has_global_middlewares: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-            // Allocate the 404 handler ONCE at application boot
-            fallback_handler: Arc::new(|_req| {
-                Box::pin(async { Response::not_found().text("404 Not Found") })
-            }),
+    fn rebuild_fallback_chain(&self, global: &[Arc<dyn Middleware>]) {
+        if global.is_empty() {
+            self.fallback_chain
+                .store(Arc::new(Arc::clone(&self.fallback_handler)));
+            self.has_global_middlewares.store(false, Ordering::Release);
+        } else {
+            let chain = Pipeline::new()
+                .append(global.iter().cloned())
+                .compose(Arc::clone(&self.fallback_handler));
+            self.fallback_chain.store(Arc::new(chain));
+            self.has_global_middlewares.store(true, Ordering::Release);
         }
     }
 
     /// Set global middlewares on the router.
     pub fn set_middlewares(&self, global: Vec<Arc<dyn Middleware>>) {
-        *self.middlewares.write().unwrap() = global;
+        let mut guard = self.middlewares.write().unwrap();
+        *guard = global;
+        self.rebuild_fallback_chain(&guard);
     }
 
     /// Set route middleware groups on the router.
@@ -87,7 +98,11 @@ impl Router {
         groups: HashMap<String, Vec<Arc<dyn Middleware>>>,
         aliases: HashMap<String, Arc<dyn Middleware>>,
     ) {
-        *self.middlewares.write().unwrap() = global;
+        {
+            let mut guard = self.middlewares.write().unwrap();
+            *guard = global;
+            self.rebuild_fallback_chain(&guard);
+        }
         *self.middleware_groups.write().unwrap() = groups;
         *self.aliases.write().unwrap() = aliases;
     }
@@ -102,9 +117,55 @@ impl Router {
         self.aliases.read().unwrap().contains_key(name)
     }
 
-    pub(crate) fn insert_route(&mut self, method: Method, path: &str, entry: RouteEntry) {
-        let method_router = self.routes.entry(method).or_default();
-        method_router.insert(path, entry).unwrap();
+    #[allow(dead_code)]
+    pub(crate) fn insert_route(&mut self, method: Method, path: &str, route: Route) {
+        self.insert_route_arc(&[method], path, Arc::new(route));
+    }
+
+    pub(crate) fn insert_route_for_methods(
+        &mut self,
+        methods: &[Method],
+        path: &str,
+        route: Route,
+    ) {
+        if methods.is_empty() {
+            return;
+        }
+        self.insert_route_arc(methods, path, Arc::new(route));
+    }
+
+    fn insert_route_arc(&mut self, methods: &[Method], path: &str, route: Arc<Route>) {
+        let trimmed = path.trim_matches('/');
+
+        if trimmed.is_empty() {
+            let slots = self.static_routes.entry(Box::from("")).or_default();
+            for method in methods {
+                slots.insert(method.clone(), Arc::clone(&route));
+                self.routes
+                    .insert_arc(method.clone(), &[], Arc::clone(&route));
+            }
+            return;
+        }
+
+        let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        let is_static = segments.iter().all(|s| parse_param_name(s).is_none());
+
+        if is_static {
+            let key: Box<str> = if !trimmed.contains("//") {
+                Box::from(trimmed)
+            } else {
+                Box::from(segments.join("/"))
+            };
+            let slots = self.static_routes.entry(key).or_default();
+            for method in methods {
+                slots.insert(method.clone(), Arc::clone(&route));
+            }
+        }
+
+        for method in methods {
+            self.routes
+                .insert_arc(method.clone(), &segments, Arc::clone(&route));
+        }
     }
 
     /// Pre-compiles and resolves all middlewares (global + route-specific) into a [`Pipeline`] at registration time.
@@ -271,58 +332,33 @@ impl Router {
         <Self as RouteRegistrar>::api_resource(self, name, controller)
     }
 
-    pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
-        let lookup_path = {
-            let trimmed = req.path.trim_end_matches('/');
-            if trimmed.is_empty() { "/" } else { trimmed }
-        };
+    pub fn dispatch(&self, mut req: Request) -> BoxFuture<'static, Response> {
+        let trimmed = req.path.trim_matches('/');
 
-        if let Some(method_router) = self.routes.get(&req.method)
-            && let Ok(matched) = method_router.at(lookup_path)
+        // Tier 1: O(1) static fast-path. If the path exists in the static map for another method,
+        // fall through to the trie so dynamic parameter routes can still match.
+        if let Some(slots) = self.static_routes.get(trimmed)
+            && let Some(route) = slots.get(&req.method)
         {
-            // Populate inline RouteParams without allocating dynamic HashMap nodes
-            for (key, value) in matched.params.iter() {
-                req.params
-                    .insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
-            }
-
-            let handler = &matched.value.handler;
-            let pipeline = &matched.value.middleware;
-
-            // FAST-PATH: Bypass middleware machinery completely if there are no layers
-            if pipeline.is_empty() {
-                return (handler)(req);
-            }
-
-            let pipeline_cloned = pipeline.clone();
-            let handler_cloned = Arc::clone(handler);
-            return Box::pin(async move {
-                pipeline_cloned
-                    .send(req)
-                    .then(move |r| {
-                        let h = Arc::clone(&handler_cloned);
-                        async move { (h)(r).await }
-                    })
-                    .await
-            });
+            return (route.chain)(req);
         }
 
-        let global = self.middlewares.read().unwrap().clone();
-        if global.is_empty() {
+        // Tier 2: Segment trie lookup on `&str` slices with a stack-allocated parameter buffer.
+        let mut params = ParamBuf::new();
+        if let Some(route) = self.routes.lookup(&req.method, trimmed, &mut params) {
+            for &(key, value) in params.as_slice() {
+                req.params
+                    .insert(Cow::Borrowed(key), Cow::Owned(value.to_owned()));
+            }
+            return (route.chain)(req);
+        }
+
+        // 404 fallback: avoid ArcSwap load overhead when no global middleware is registered.
+        if !self.has_global_middlewares.load(Ordering::Acquire) {
             return (self.fallback_handler)(req);
         }
-
-        let fallback = Arc::clone(&self.fallback_handler);
-        Box::pin(async move {
-            Pipeline::new()
-                .send(req)
-                .append(global)
-                .then(move |r| {
-                    let h = Arc::clone(&fallback);
-                    async move { (h)(r).await }
-                })
-                .await
-        })
+        let guard = self.fallback_chain.load();
+        (***guard)(req)
     }
 }
 

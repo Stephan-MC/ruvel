@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
-use super::router::{HandlerFn, RouteEntry, Router};
+use super::route::{HandlerFn, Route};
+use super::router::Router;
 use crate::contracts::support::Responsable;
 use crate::http::{Controller, Method};
 
@@ -300,20 +301,23 @@ impl<'a> PendingResourceRegistration<'a> {
             };
 
             let path = build_path(self.base_prefix.as_deref(), &self.resource, suffix);
+            let path = if path != "/" {
+                path.trim_end_matches('/').to_string()
+            } else {
+                path
+            };
 
             let route_name = make_route_name(name_suffix);
 
-            let entry = RouteEntry {
+            let route = Route::with_details(
                 handler,
-                middleware: compiled_middleware.clone(),
-                name: Some(route_name),
-                domain: self.domain.clone(),
-                wheres: self.wheres.clone(),
-            };
+                compiled_middleware.clone(),
+                Some(route_name),
+                self.domain.clone(),
+                self.wheres.clone(),
+            );
 
-            for method in methods {
-                self.router.insert_route(method, &path, entry.clone());
-            }
+            self.router.insert_route_for_methods(&methods, &path, route);
         }
     }
 }

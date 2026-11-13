@@ -215,15 +215,14 @@ async fn test_api_resource_skips_create_and_edit() {
         200
     );
 
-    // Form routes are skipped in API resources
-    assert_eq!(
-        kernel
-            .handle(Request::new(Method::GET, "/posts/create"))
-            .await
-            .status
-            .code(),
-        404
-    );
+    // Form routes are skipped in API resources: `/posts/{id}/edit` has no route (404),
+    // while `/posts/create` falls through to `show` with id = "create" (Laravel behavior
+    // when `{id}` is unconstrained).
+    let res = kernel
+        .handle(Request::new(Method::GET, "/posts/create"))
+        .await;
+    assert_eq!(res.status.code(), 200);
+    assert_eq!(res.body, b"posts.show:create");
     assert_eq!(
         kernel
             .handle(Request::new(Method::GET, "/posts/99/edit"))
