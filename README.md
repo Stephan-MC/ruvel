@@ -15,7 +15,7 @@ Ruvel is an asynchronous web framework for Rust, shaped after Laravel. It runs o
 
 ### Routing
 
-`Router` implements the `RouteRegistrar` trait and uses a custom segment-based tree (`Segment`) supporting parameter constraints (`->where()`), optional parameters, and backtracking.
+`Router` implements the `RouteRegistrar` trait and uses a custom segment-based tree (`Segment`) with a static fast-path, supporting parameter constraints (`->where()`), pre-composed middleware chains, and backtracking.
 
 - Verbs & methods on `RouteRegistrar`: `get`, `post`, `put`, `delete`, `patch`, `any`, `r#match`, plus fluent route/group attributes (`domain`, `prefix`, `name`, `middleware`, `without_middleware`), each returning a `PendingRouteRegistrar` (which also provides parameter constraints like `r#where`, `where_number`, and `where_alpha`).
 - Path parameters use `{name}` segments. A match fills `Request::params`, and `Request::param("id")` reads one value.
