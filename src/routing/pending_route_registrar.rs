@@ -1,7 +1,8 @@
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
 use super::pending_resource_registrar::PendingResourceRegistration;
+use super::route::{HandlerFn, Route};
 use super::route_registrar::RouteRegistrar;
-use super::router::{HandlerFn, RouteEntry, Router};
+use super::router::Router;
 use crate::contracts::support::Responsable;
 use crate::http::{Controller, Method, Request};
 use std::collections::HashMap;
@@ -327,12 +328,19 @@ impl<'a> PendingRouteRegistrar<'a> {
             }
         };
 
+        // Remove trailing slashes from all routes during registration
+        let final_path = if final_path != "/" {
+            final_path.trim_end_matches('/').to_string()
+        } else {
+            final_path
+        };
+
         // Build the route's middleware pipeline (global + group/route-specific, minus excluded)
         let middleware = self
             .router
             .compile_route_middlewares(&self.middleware, &self.excluded_middleware);
 
-        let entry = RouteEntry {
+        let route = Route {
             handler: Arc::clone(handler),
             middleware,
             name: self.name.clone(),
@@ -342,7 +350,7 @@ impl<'a> PendingRouteRegistrar<'a> {
 
         for method in &self.methods {
             self.router
-                .insert_route(method.clone(), &final_path, entry.clone());
+                .insert_route(method.clone(), &final_path, route.clone());
         }
     }
 }

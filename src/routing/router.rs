@@ -2,7 +2,6 @@ use crate::contracts::support::Responsable;
 use crate::http::BoxFuture;
 use crate::http::{Method, Middleware, Request, Response};
 use crate::routing::pipeline::Pipeline;
-use matchit::Router as MatchitRouter;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,31 +10,18 @@ use std::sync::{Arc, RwLock};
 use super::into_middleware::{IntoMiddleware, MiddlewareItem};
 use super::pending_resource_registrar::PendingResourceRegistration;
 use super::pending_route_registrar::PendingRouteRegistrar;
+pub use super::route::HandlerFn;
+use super::route::{Route, Segment};
 use super::route_registrar::RouteRegistrar;
 use crate::http::Controller;
 
-pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
 type MiddlewareList = Vec<Arc<dyn Middleware>>;
 type MiddlewareGroupMap = HashMap<String, MiddlewareList>;
 type MiddlewareAliasMap = HashMap<String, Arc<dyn Middleware>>;
 
 #[derive(Clone)]
-pub(crate) struct RouteEntry {
-    pub(crate) handler: HandlerFn,
-    /// Pre-built middleware pipeline (global + group + route middlewares) stored on the route.
-    pub(crate) middleware: Pipeline,
-    #[allow(dead_code)]
-    pub(crate) name: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) domain: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) wheres: HashMap<String, String>,
-}
-
-#[derive(Clone)]
 pub struct Router {
-    // Map each HTTP Method to its own Radix Tree of routes
-    routes: HashMap<Method, MatchitRouter<RouteEntry>>,
+    routes: Segment,
     middlewares: Arc<RwLock<MiddlewareList>>,
     middleware_groups: Arc<RwLock<MiddlewareGroupMap>>,
     aliases: Arc<RwLock<MiddlewareAliasMap>>,
@@ -53,7 +39,7 @@ impl Default for Router {
 impl Router {
     pub fn new() -> Self {
         Self {
-            routes: HashMap::new(),
+            routes: Segment::new(),
             middlewares: Arc::new(RwLock::new(Vec::new())),
             middleware_groups: Arc::new(RwLock::new(HashMap::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
@@ -102,9 +88,18 @@ impl Router {
         self.aliases.read().unwrap().contains_key(name)
     }
 
-    pub(crate) fn insert_route(&mut self, method: Method, path: &str, entry: RouteEntry) {
-        let method_router = self.routes.entry(method).or_default();
-        method_router.insert(path, entry).unwrap();
+    pub(crate) fn insert_route(&mut self, method: Method, path: &str, route: Route) {
+        let clean_path = if path != "/" {
+            path.trim_end_matches('/')
+        } else {
+            path
+        };
+        let segments: Vec<&str> = if clean_path == "/" || clean_path.is_empty() {
+            Vec::new()
+        } else {
+            clean_path.trim_matches('/').split('/').collect()
+        };
+        self.routes.insert(method, &segments, route);
     }
 
     /// Pre-compiles and resolves all middlewares (global + route-specific) into a [`Pipeline`] at registration time.
@@ -272,35 +267,50 @@ impl Router {
     }
 
     pub fn dispatch(&self, mut req: Request) -> BoxFuture<'_, Response> {
-        let lookup_path = {
-            let trimmed = req.path.trim_end_matches('/');
-            if trimmed.is_empty() { "/" } else { trimmed }
+        let matched = {
+            let clean_path = if req.path != "/" {
+                req.path.trim_end_matches('/')
+            } else {
+                req.path.as_ref()
+            };
+            let segments: Vec<&str> = if clean_path == "/" || clean_path.is_empty() {
+                Vec::new()
+            } else {
+                clean_path.trim_matches('/').split('/').collect()
+            };
+
+            let mut params = Vec::new();
+            self.routes
+                .lookup(&req.method, &segments, &mut params)
+                .map(|route| {
+                    let extracted_params: Vec<(String, String)> = params
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    (
+                        route.handler.clone(),
+                        route.middleware.clone(),
+                        extracted_params,
+                    )
+                })
         };
 
-        if let Some(method_router) = self.routes.get(&req.method)
-            && let Ok(matched) = method_router.at(lookup_path)
-        {
+        if let Some((handler, pipeline, extracted_params)) = matched {
             // Populate inline RouteParams without allocating dynamic HashMap nodes
-            for (key, value) in matched.params.iter() {
-                req.params
-                    .insert(Cow::Owned(key.to_string()), Cow::Owned(value.to_string()));
+            for (key, value) in extracted_params {
+                req.params.insert(Cow::Owned(key), Cow::Owned(value));
             }
-
-            let handler = &matched.value.handler;
-            let pipeline = &matched.value.middleware;
 
             // FAST-PATH: Bypass middleware machinery completely if there are no layers
             if pipeline.is_empty() {
                 return (handler)(req);
             }
 
-            let pipeline_cloned = pipeline.clone();
-            let handler_cloned = Arc::clone(handler);
             return Box::pin(async move {
-                pipeline_cloned
+                pipeline
                     .send(req)
                     .then(move |r| {
-                        let h = Arc::clone(&handler_cloned);
+                        let h = Arc::clone(&handler);
                         async move { (h)(r).await }
                     })
                     .await
