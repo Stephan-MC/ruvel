@@ -43,6 +43,34 @@ pub trait RouteRegistrar {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable;
 
+    /// Register a new HEAD route with the router.
+    fn head<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable;
+
+    /// Register a new OPTIONS route with the router.
+    fn options<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable;
+
+    /// Register a new TRACE route with the router.
+    fn trace<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable;
+
+    /// Register a new CONNECT route with the router.
+    fn connect<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Responsable;
+
     /// Register a new route that responds to all standard HTTP methods.
     fn any<F, Fut, R>(&mut self, path: &str, handler: F) -> PendingRouteRegistrar<'_>
     where

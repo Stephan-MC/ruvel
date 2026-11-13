@@ -12,6 +12,10 @@ pub enum Method {
     PUT,
     DELETE,
     PATCH,
+    HEAD,
+    OPTIONS,
+    TRACE,
+    CONNECT,
     UNKNOWN(String),
 }
 
@@ -23,6 +27,10 @@ impl std::fmt::Display for Method {
             Method::PUT => f.write_str("PUT"),
             Method::DELETE => f.write_str("DELETE"),
             Method::PATCH => f.write_str("PATCH"),
+            Method::HEAD => f.write_str("HEAD"),
+            Method::OPTIONS => f.write_str("OPTIONS"),
+            Method::TRACE => f.write_str("TRACE"),
+            Method::CONNECT => f.write_str("CONNECT"),
             Method::UNKNOWN(other) => f.write_str(other),
         }
     }
@@ -36,6 +44,10 @@ impl From<&str> for Method {
             "PUT" => Method::PUT,
             "DELETE" => Method::DELETE,
             "PATCH" => Method::PATCH,
+            "HEAD" => Method::HEAD,
+            "OPTIONS" => Method::OPTIONS,
+            "TRACE" => Method::TRACE,
+            "CONNECT" => Method::CONNECT,
             other => Method::UNKNOWN(other.to_string()),
         }
     }
@@ -215,14 +227,7 @@ impl Request {
             buf[header_len..total].to_vec()
         };
 
-        let method = match parser.method.ok_or(())? {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "PATCH" => Method::PATCH,
-            other => Method::UNKNOWN(other.to_owned()),
-        };
+        let method = Method::from(parser.method.ok_or(())?);
 
         Ok(Some((
             Self {
