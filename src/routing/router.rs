@@ -1,6 +1,6 @@
 use crate::contracts::support::Responsable;
 use crate::http::BoxFuture;
-use crate::http::{Method, Middleware, Request, Response};
+use crate::http::{Method, Middleware, Request, Response, Status};
 use crate::routing::pipeline::Pipeline;
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
@@ -44,8 +44,15 @@ impl Default for Router {
 impl Router {
     pub fn new() -> Self {
         // Allocate the 404 handler ONCE at application boot
-        let fallback_handler: HandlerFn =
-            Arc::new(|_req| Box::pin(async { Response::not_found().text("404 Not Found") }));
+        let fallback_handler: HandlerFn = Arc::new(|_req| {
+            Box::pin(async {
+                Response::with_body(
+                    Status::NotFound,
+                    "text/plain; charset=utf-8",
+                    b"404 Not Found".to_vec(),
+                )
+            })
+        });
         let fallback_chain = Arc::new(ArcSwap::from_pointee(Arc::clone(&fallback_handler)));
 
         Self {

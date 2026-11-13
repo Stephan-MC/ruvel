@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
-use crate::contracts::http::Kernel as HttpKernelContract;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
 use crate::http::{Kernel, Request};
@@ -157,8 +156,8 @@ impl Application {
         println!("🚀 Ruvel native server running on http://{}", addr);
 
         // Resolve the HTTP Kernel directly from the container
-        let kernel: Arc<dyn HttpKernelContract> = match self.make::<Kernel>() {
-            Ok(k) => k as Arc<dyn HttpKernelContract>,
+        let kernel: Arc<Kernel> = match self.make::<Kernel>() {
+            Ok(k) => k,
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
@@ -168,46 +167,57 @@ impl Application {
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
-                let mut chunk = [0u8; READ_CHUNK_SIZE];
                 let mut read_buffer = Vec::with_capacity(READ_CHUNK_SIZE);
+                let mut read_pos = 0usize;
                 // Pre-allocated response buffer reused across pipelined requests
                 let mut response_buffer = Vec::with_capacity(4096);
 
                 'connection: loop {
-                    match socket.read(&mut chunk).await {
+                    if read_pos >= read_buffer.len() {
+                        read_buffer.clear();
+                        read_pos = 0;
+                    } else if read_pos > 0
+                        && (read_pos * 2 >= read_buffer.len()
+                            || read_buffer.len() >= MAX_REQUEST_BYTES)
+                    {
+                        let remaining = read_buffer.len() - read_pos;
+                        read_buffer.copy_within(read_pos.., 0);
+                        read_buffer.truncate(remaining);
+                        read_pos = 0;
+                    }
+
+                    let remaining_budget = MAX_REQUEST_BYTES.saturating_sub(read_buffer.len());
+                    if remaining_budget == 0 {
+                        break;
+                    }
+                    let want = READ_CHUNK_SIZE.min(remaining_budget);
+                    if read_buffer.capacity() - read_buffer.len() < want {
+                        read_buffer.reserve(want);
+                    }
+
+                    match socket.read_buf(&mut read_buffer).await {
                         Ok(0) => break, // Client gracefully closed connection
-                        Ok(n) => {
-                            if read_buffer.len().saturating_add(n) > MAX_REQUEST_BYTES {
+                        Ok(_) => {
+                            if read_buffer.len() > MAX_REQUEST_BYTES {
                                 break;
                             }
-                            read_buffer.extend_from_slice(&chunk[..n]);
 
-                            let mut offset = 0;
                             let mut responses_queued = 0;
 
-                            loop {
-                                if offset >= read_buffer.len() {
-                                    read_buffer.clear();
-                                    break;
-                                }
-
-                                let (req, consumed) = match Request::parse(&read_buffer[offset..]) {
+                            while read_pos < read_buffer.len() {
+                                let (req, consumed) = match Request::parse(&read_buffer[read_pos..])
+                                {
                                     Ok(Some(parsed)) => parsed,
-                                    Ok(None) => {
-                                        if offset > 0 {
-                                            read_buffer.drain(..offset);
-                                        }
-                                        break;
-                                    }
+                                    Ok(None) => break,
                                     Err(()) => break 'connection,
                                 };
 
-                                let Some(end) = offset.checked_add(consumed) else {
+                                let Some(end) = read_pos.checked_add(consumed) else {
                                     break 'connection;
                                 };
                                 if consumed == 0 || end > read_buffer.len() {
                                     break 'connection;
-                                }
+                                };
 
                                 // Dispatch request through HTTP Kernel
                                 let response = kernel_clone.handle(req).await;
@@ -216,7 +226,12 @@ impl Application {
                                 response.write_to(&mut response_buffer);
                                 responses_queued += 1;
 
-                                offset = end;
+                                read_pos = end;
+                            }
+
+                            if read_pos >= read_buffer.len() {
+                                read_buffer.clear();
+                                read_pos = 0;
                             }
 
                             // Batched flush: If any responses were queued from this read chunk (pipelining),
@@ -226,6 +241,9 @@ impl Application {
                                     break 'connection;
                                 }
                                 response_buffer.clear();
+                                if response_buffer.capacity() > 64 * 1024 {
+                                    response_buffer.shrink_to(4096);
+                                }
                             }
                         }
                         Err(_) => break, // Network error
