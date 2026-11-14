@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.2...ruvel-v0.8.0) (2026-11-14)
+
+
+### Features
+
+* **http,routing:** add HEAD, OPTIONS, TRACE, and CONNECT request methods ([c262cc3](https://github.com/Stephan-MC/ruvel/commit/c262cc30d5002c09bb1c7e2c26c5f46970ac5c39))
+* **http:** add Request::input and typed input accessors ([664d3c6](https://github.com/Stephan-MC/ruvel/commit/664d3c60a24c6ccb7aaa7718badbb4a75a7197a8))
+
 ## [0.7.2](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.1...ruvel-v0.7.2) (2026-11-13)
 
 
