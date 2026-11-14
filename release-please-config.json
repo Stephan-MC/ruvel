@@ -4,7 +4,7 @@
 		".": {
 			"package-name": "ruvel",
 			"release-type": "rust",
-			"extra-files": ["./src/foundation/application.rs"]
+			"extra-files": ["src/foundation/application.rs"]
 		}
 	},
 	"release-type": "rust",
