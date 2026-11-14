@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.8.0...ruvel-v0.9.0) (2026-11-14)
+
+
+### Features
+
+* **http,foundation:** support chunked transfer encoding and 400 response on parse errors ([9801af1](https://github.com/Stephan-MC/ruvel/commit/9801af10595d3a36a199d2ef4825f035c23c900c))
+
 ## [0.8.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.7.2...ruvel-v0.8.0) (2026-11-14)
 
 
