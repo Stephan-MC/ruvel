@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.9.0...ruvel-v0.9.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* Adjusted release-please typo ([981aa11](https://github.com/Stephan-MC/ruvel/commit/981aa1150e76dee70407100465c057ded9bfe942))
+* Release please now updates version in Application Struct ([2d38579](https://github.com/Stephan-MC/ruvel/commit/2d38579d6a90e24c7a15282a84a5aa419635f9e0))
+
 ## [0.9.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.8.0...ruvel-v0.9.0) (2026-11-14)
 
 
