@@ -175,12 +175,19 @@ impl Request {
         }
     }
 
-    /// Parse one HTTP/1.x request from `buf` with `httparse`.
+    /// Parse one complete HTTP/1.x request from the leading bytes of `buf`.
     ///
-    /// `Ok(None)` means the headers or `Content-Length` body are not in `buf` yet.
-    /// Nothing is allocated in that case. `Ok(Some((request, consumed)))` is one
-    /// full request and how many bytes of `buf` it used. `Err(())` means these
-    /// bytes cannot be a request this server accepts.
+    /// Designed for streaming TCP reads and HTTP/1.1 pipelining:
+    /// - `Ok(None)`: headers or body (`Content-Length` or `Transfer-Encoding: chunked`)
+    ///   are still fragmented / incomplete in `buf`. Performs **zero heap allocations**
+    ///   so the caller can keep appending TCP bytes and retry safely across arbitrary
+    ///   split boundaries (including 1-byte reads).
+    /// - `Ok(Some((request, consumed)))`: one complete request and the exact wire byte
+    ///   count consumed (`header_len + framed_body_len`). Any bytes in `&buf[consumed..]`
+    ///   belong to subsequent pipelined requests on the same connection.
+    /// - `Err(())`: syntactically malformed request line, headers, conflicting/unsupported
+    ///   framing (`Transfer-Encoding` + `Content-Length`, conflicting `Content-Length`,
+    ///   unknown transfer-coding), or malformed chunked body syntax.
     pub fn parse(buf: &[u8]) -> Result<Option<(Self, usize)>, ()> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut parser = httparse::Request::new(&mut headers);
@@ -191,12 +198,11 @@ impl Request {
             Err(_) => return Err(()),
         };
 
-        // Frame the body before allocating. A short read must be able to retry
-        // this parse without having built a Request.
-        let total = framed_len(header_len, parser.headers)?;
-        if buf.len() < total {
+        // Frame and validate the body before allocating any `Request` fields.
+        // A fragmented read returns `Ok(None)` here with zero allocations.
+        let Some(framing) = frame_body(header_len, parser.headers, buf)? else {
             return Ok(None);
-        }
+        };
 
         let target = parser.path.ok_or(())?;
         let (path_str, query_str) = split_target(target);
@@ -221,10 +227,22 @@ impl Request {
             header_map.insert(name, val);
         }
 
-        let body = if total == header_len {
-            Vec::new()
-        } else {
-            buf[header_len..total].to_vec()
+        let (body, consumed) = match framing {
+            BodyFraming::ContentLength { total_len } => {
+                let body = if total_len == header_len {
+                    Vec::new()
+                } else {
+                    buf[header_len..total_len].to_vec()
+                };
+                (body, total_len)
+            }
+            BodyFraming::Chunked {
+                total_len,
+                decoded_len,
+            } => (
+                extract_chunked_body(&buf[header_len..total_len], decoded_len),
+                total_len,
+            ),
         };
 
         let method = Method::from(parser.method.ok_or(())?);
@@ -238,7 +256,7 @@ impl Request {
                 body,
                 params: RouteParams::new(),
             },
-            total,
+            consumed,
         )))
     }
 
@@ -413,12 +431,34 @@ impl Request {
     }
 }
 
-/// Byte length of one request: header block plus `Content-Length` body.
+/// Determined message framing for a parsed HTTP/1.x request header block.
+enum BodyFraming {
+    /// Fixed-length body framed by `Content-Length` (or zero-length when absent).
+    ContentLength { total_len: usize },
+    /// `Transfer-Encoding: chunked` body with total wire byte span
+    /// (`total_len = header_len + chunked_wire_len`) and decoded payload length (`decoded_len`).
+    Chunked {
+        total_len: usize,
+        decoded_len: usize,
+    },
+}
+
+/// Determine how the request body is framed from its parsed headers (RFC 9112 Sections 6.1, 6.3, 7.1).
 ///
-/// `httparse` does not decode bodies. A non-identity `Transfer-Encoding` is rejected
-/// so a chunked body is not mistaken for the next request.
-fn framed_len(header_len: usize, headers: &[httparse::Header<'_>]) -> Result<usize, ()> {
+/// Validates framing headers against request-smuggling hazards before checking payload completeness:
+/// - Rejects duplicate `Content-Length` headers whose numeric values disagree.
+/// - Rejects multiple `Transfer-Encoding` headers or any coding other than `chunked` or `identity`.
+/// - Rejects requests specifying both `Transfer-Encoding: chunked` and `Content-Length` (RFC 9112 §6.3).
+///
+/// Returns `Ok(None)` without heap allocation if the body bytes in `buf` are still incomplete.
+fn frame_body(
+    header_len: usize,
+    headers: &[httparse::Header<'_>],
+    buf: &[u8],
+) -> Result<Option<BodyFraming>, ()> {
     let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut has_transfer_encoding = false;
 
     for header in headers {
         if header.name.eq_ignore_ascii_case("content-length") {
@@ -430,16 +470,206 @@ fn framed_len(header_len: usize, headers: &[httparse::Header<'_>]) -> Result<usi
             } else {
                 content_length = Some(parsed);
             }
-        } else if header.name.eq_ignore_ascii_case("transfer-encoding")
-            && !header.value.trim_ascii().eq_ignore_ascii_case(b"identity")
-        {
-            return Err(());
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            if has_transfer_encoding {
+                return Err(());
+            }
+            has_transfer_encoding = true;
+
+            let coding = header.value.trim_ascii();
+            if coding.eq_ignore_ascii_case(b"chunked") {
+                is_chunked = true;
+            } else if !coding.eq_ignore_ascii_case(b"identity") {
+                return Err(());
+            }
         }
     }
 
-    header_len
+    if is_chunked {
+        // RFC 9112 §6.3: A message containing both Transfer-Encoding: chunked and Content-Length is invalid.
+        if content_length.is_some() {
+            return Err(());
+        }
+        return match frame_chunked_body(&buf[header_len..])? {
+            Some((chunked_wire_len, decoded_len)) => {
+                let total_len = header_len.checked_add(chunked_wire_len).ok_or(())?;
+                Ok(Some(BodyFraming::Chunked {
+                    total_len,
+                    decoded_len,
+                }))
+            }
+            None => Ok(None),
+        };
+    }
+
+    let total_len = header_len
         .checked_add(content_length.unwrap_or(0))
-        .ok_or(())
+        .ok_or(())?;
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+
+    Ok(Some(BodyFraming::ContentLength { total_len }))
+}
+
+/// First zero-allocation pass over a `Transfer-Encoding: chunked` body stream (RFC 9112 Section 7.1).
+///
+/// Walks every chunk (`<hex-size>[;ext]\r\n<data>\r\n ... 0[;ext]\r\n[trailers]\r\n`) to:
+/// - Return `Ok(None)` when `src` ends mid-chunk-size, mid-extension, mid-CRLF, mid-data, or mid-trailer.
+/// - Return `Err(())` immediately on invalid hex sizes, bare LF, missing data CRLF, overflow, or malformed trailers.
+/// - Return `Ok(Some((wire_consumed, decoded_len)))` once the terminating empty line completes.
+fn frame_chunked_body(src: &[u8]) -> Result<Option<(usize, usize)>, ()> {
+    let mut pos = 0usize;
+    let mut decoded_len = 0usize;
+
+    loop {
+        let Some((chunk_size, data_start)) = parse_chunk_size_line(src, pos)? else {
+            return Ok(None);
+        };
+
+        if chunk_size == 0 {
+            let Some(wire_end) = consume_chunked_trailers(src, data_start)? else {
+                return Ok(None);
+            };
+            return Ok(Some((wire_end, decoded_len)));
+        }
+
+        let data_end = data_start.checked_add(chunk_size).ok_or(())?;
+        let chunk_end = data_end.checked_add(2).ok_or(())?;
+        if src.len() < chunk_end {
+            // Fail fast if a non-CR byte immediately follows the chunk payload before EOF.
+            if src.len() > data_end && src[data_end] != b'\r' {
+                return Err(());
+            }
+            return Ok(None);
+        }
+        if src[data_end] != b'\r' || src[data_end + 1] != b'\n' {
+            return Err(());
+        }
+
+        decoded_len = decoded_len.checked_add(chunk_size).ok_or(())?;
+        pos = chunk_end;
+    }
+}
+
+/// Parse one `<hex-size>[;chunk-ext]\r\n` line starting at `pos`.
+///
+/// Returns `Ok(Some((chunk_size, pos_after_crlf)))`, `Ok(None)` if truncated mid-line,
+/// or `Err(())` on non-hex/empty size or bare LF.
+fn parse_chunk_size_line(src: &[u8], mut pos: usize) -> Result<Option<(usize, usize)>, ()> {
+    let mut chunk_size = 0usize;
+    let mut has_digits = false;
+
+    while pos < src.len() {
+        let Some(nibble) = hex_nibble(src[pos]) else {
+            break;
+        };
+        has_digits = true;
+        chunk_size = chunk_size
+            .checked_mul(16)
+            .ok_or(())?
+            .checked_add(usize::from(nibble))
+            .ok_or(())?;
+        pos += 1;
+    }
+
+    if !has_digits {
+        return if pos == src.len() { Ok(None) } else { Err(()) };
+    }
+    if pos == src.len() {
+        return Ok(None);
+    }
+
+    // Optional chunk extension / BWS (`;` or linear whitespace) up to `\r\n`.
+    if matches!(src[pos], b';' | b' ' | b'\t') {
+        while pos < src.len() && src[pos] != b'\r' {
+            if src[pos] == b'\n' {
+                return Err(());
+            }
+            pos += 1;
+        }
+        if pos == src.len() {
+            return Ok(None);
+        }
+    }
+
+    if src[pos] != b'\r' {
+        return Err(());
+    }
+    pos += 1;
+    if pos == src.len() {
+        return Ok(None);
+    }
+    if src[pos] != b'\n' {
+        return Err(());
+    }
+
+    Ok(Some((chunk_size, pos + 1)))
+}
+
+/// Consume zero or more optional HTTP/1.1 trailer field lines following a `0`-size
+/// chunk and the final empty `\r\n` terminator (RFC 9112 Section 7.1.2).
+fn consume_chunked_trailers(src: &[u8], mut pos: usize) -> Result<Option<usize>, ()> {
+    loop {
+        if pos == src.len() {
+            return Ok(None);
+        }
+        if src[pos] == b'\r' {
+            if pos + 1 == src.len() {
+                return Ok(None);
+            }
+            if src[pos + 1] != b'\n' {
+                return Err(());
+            }
+            return Ok(Some(pos + 2));
+        }
+
+        let mut has_colon = false;
+        while pos < src.len() && src[pos] != b'\r' {
+            if src[pos] == b'\n' {
+                return Err(());
+            }
+            if src[pos] == b':' {
+                has_colon = true;
+            }
+            pos += 1;
+        }
+        if pos == src.len() {
+            return Ok(None);
+        }
+        if !has_colon {
+            return Err(());
+        }
+        if pos + 1 == src.len() {
+            return Ok(None);
+        }
+        if src[pos + 1] != b'\n' {
+            return Err(());
+        }
+        pos += 2;
+    }
+}
+
+/// Second pass over an already-validated chunked wire slice, assembling all chunk data slices
+/// into a single `Vec<u8>` pre-sized to `decoded_len`.
+fn extract_chunked_body(src: &[u8], decoded_len: usize) -> Vec<u8> {
+    if decoded_len == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(decoded_len);
+    let mut pos = 0usize;
+
+    while let Ok(Some((chunk_size, data_start))) = parse_chunk_size_line(src, pos) {
+        if chunk_size == 0 {
+            break;
+        }
+        let data_end = data_start + chunk_size;
+        out.extend_from_slice(&src[data_start..data_end]);
+        pos = data_end + 2;
+    }
+
+    out
 }
 
 fn parse_content_length(value: &[u8]) -> Result<usize, ()> {

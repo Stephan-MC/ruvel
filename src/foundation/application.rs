@@ -146,7 +146,17 @@ impl Application {
         .await
     }
 
-    /// Start the TCP Listener (analogous to public/index.php `$kernel->handle()`)
+    /// Start the TCP listener (analogous to `public/index.php` `$kernel->handle()`).
+    ///
+    /// Each accepted connection maintains a streaming read buffer (`read_buffer`) and cursor
+    /// (`read_pos`) to handle keep-alive, HTTP/1.1 pipelining, and arbitrary TCP fragmentation:
+    /// - When [`Request::parse`] returns `Ok(None)`, unread bytes at `&read_buffer[read_pos..]`
+    ///   remain buffered so the next `read_buf` call can append trailing TCP fragments.
+    /// - When [`Request::parse`] returns `Ok(Some((req, consumed)))`, `read_pos` advances by
+    ///   `consumed` and any remaining bytes in `read_buffer` are immediately parsed as pipelined
+    ///   requests before flushing `response_buffer` in a single `write_all` call.
+    /// - When [`Request::parse`] returns `Err(())`, any already-queued pipelined responses plus an
+    ///   `HTTP/1.1 400 Bad Request` (`Connection: close`) response are flushed and the socket closes.
     async fn listen(mut self, host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure all providers are booted before accepting traffic
         self.boot();
@@ -173,6 +183,8 @@ impl Application {
                 let mut response_buffer = Vec::with_capacity(4096);
 
                 'connection: loop {
+                    // Compact consumed prefix bytes so unread partial fragments stay contiguous
+                    // without letting `read_buffer` grow unbounded across keep-alive requests.
                     if read_pos >= read_buffer.len() {
                         read_buffer.clear();
                         read_pos = 0;
@@ -208,8 +220,16 @@ impl Application {
                                 let (req, consumed) = match Request::parse(&read_buffer[read_pos..])
                                 {
                                     Ok(Some(parsed)) => parsed,
+                                    // Partial frame (split headers, Content-Length body, or chunked
+                                    // payload): preserve `&read_buffer[read_pos..]` for the next read.
                                     Ok(None) => break,
-                                    Err(()) => break 'connection,
+                                    Err(()) => {
+                                        response_buffer.extend_from_slice(
+                                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                        );
+                                        let _ = socket.write_all(&response_buffer).await;
+                                        break 'connection;
+                                    }
                                 };
 
                                 let Some(end) = read_pos.checked_add(consumed) else {
