@@ -251,6 +251,166 @@ impl Request {
     pub fn param(&self, key: &str) -> Option<&str> {
         self.params.get(key)
     }
+
+    /// Retrieve an input value by key from the request body or query string.
+    ///
+    /// Checks parsed `application/json` objects or `application/x-www-form-urlencoded`
+    /// form payloads first, then falls back to URL query parameters (`self.query`).
+    /// Route parameters remain separate via [`Self::param`].
+    pub fn input(&self, key: &str) -> Option<serde_json::Value> {
+        if !self.body.is_empty()
+            && let Some(content_type) = self.header("Content-Type")
+        {
+            let media_type = content_type_media_type(content_type);
+            if is_json_media_type(media_type) {
+                if let Ok(serde_json::Value::Object(mut map)) =
+                    serde_json::from_slice::<serde_json::Value>(&self.body)
+                    && let Some(val) = map.remove(key)
+                {
+                    return Some(val);
+                }
+            } else if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                && let Ok(form) = std::str::from_utf8(&self.body)
+                && let Some(val) = lookup_form_urlencoded(form, key)
+            {
+                return Some(serde_json::Value::String(val));
+            }
+        }
+
+        if !self.query.is_empty()
+            && let Some(val) = lookup_form_urlencoded(&self.query, key)
+        {
+            return Some(serde_json::Value::String(val));
+        }
+
+        None
+    }
+
+    fn parse_unsigned<T>(&self, key: &str) -> Option<T>
+    where
+        T: TryFrom<u64> + std::str::FromStr,
+    {
+        match self.input(key)? {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|v| T::try_from(v).ok()),
+            serde_json::Value::String(s) => s.trim().parse::<T>().ok(),
+            _ => None,
+        }
+    }
+
+    fn parse_signed<T>(&self, key: &str) -> Option<T>
+    where
+        T: TryFrom<i64> + std::str::FromStr,
+    {
+        match self.input(key)? {
+            serde_json::Value::Number(n) => n.as_i64().and_then(|v| T::try_from(v).ok()),
+            serde_json::Value::String(s) => s.trim().parse::<T>().ok(),
+            _ => None,
+        }
+    }
+
+    /// Retrieve an input value parsed as `u8`, or `None` if missing or invalid.
+    pub fn u8(&self, key: &str) -> Option<u8> {
+        self.parse_unsigned(key)
+    }
+
+    /// Retrieve an input value parsed as `u16`, or `None` if missing or invalid.
+    pub fn u16(&self, key: &str) -> Option<u16> {
+        self.parse_unsigned(key)
+    }
+
+    /// Retrieve an input value parsed as `u32`, or `None` if missing or invalid.
+    pub fn u32(&self, key: &str) -> Option<u32> {
+        self.parse_unsigned(key)
+    }
+
+    /// Retrieve an input value parsed as `u64`, or `None` if missing or invalid.
+    pub fn u64(&self, key: &str) -> Option<u64> {
+        self.parse_unsigned(key)
+    }
+
+    /// Retrieve an input value parsed as `usize`, or `None` if missing or invalid.
+    pub fn usize(&self, key: &str) -> Option<usize> {
+        self.parse_unsigned(key)
+    }
+
+    /// Retrieve an input value parsed as `i8`, or `None` if missing or invalid.
+    pub fn i8(&self, key: &str) -> Option<i8> {
+        self.parse_signed(key)
+    }
+
+    /// Retrieve an input value parsed as `i16`, or `None` if missing or invalid.
+    pub fn i16(&self, key: &str) -> Option<i16> {
+        self.parse_signed(key)
+    }
+
+    /// Retrieve an input value parsed as `i32`, or `None` if missing or invalid.
+    pub fn i32(&self, key: &str) -> Option<i32> {
+        self.parse_signed(key)
+    }
+
+    /// Retrieve an input value parsed as `i64`, or `None` if missing or invalid.
+    pub fn i64(&self, key: &str) -> Option<i64> {
+        self.parse_signed(key)
+    }
+
+    /// Retrieve an input value parsed as `isize`, or `None` if missing or invalid.
+    pub fn isize(&self, key: &str) -> Option<isize> {
+        self.parse_signed(key)
+    }
+
+    /// Retrieve an input value parsed as finite `f32`, or `None` if missing or invalid.
+    pub fn f32(&self, key: &str) -> Option<f32> {
+        let val = match self.input(key)? {
+            serde_json::Value::Number(n) => n.as_f64()? as f32,
+            serde_json::Value::String(s) => s.trim().parse::<f32>().ok()?,
+            _ => return None,
+        };
+        val.is_finite().then_some(val)
+    }
+
+    /// Retrieve an input value parsed as finite `f64`, or `None` if missing or invalid.
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        let val = match self.input(key)? {
+            serde_json::Value::Number(n) => n.as_f64()?,
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+            _ => return None,
+        };
+        val.is_finite().then_some(val)
+    }
+
+    /// Retrieve an input value as `bool`, or `None` if missing or not a boolean representation.
+    pub fn bool(&self, key: &str) -> Option<bool> {
+        match self.input(key)? {
+            serde_json::Value::Bool(b) => Some(b),
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.eq_ignore_ascii_case("true")
+                    || trimmed == "1"
+                    || trimmed.eq_ignore_ascii_case("yes")
+                    || trimmed.eq_ignore_ascii_case("on")
+                {
+                    Some(true)
+                } else if trimmed.eq_ignore_ascii_case("false")
+                    || trimmed == "0"
+                    || trimmed.eq_ignore_ascii_case("no")
+                    || trimmed.eq_ignore_ascii_case("off")
+                {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Retrieve an input value as `String`, or `None` if missing or not a string value.
+    pub fn string(&self, key: &str) -> Option<String> {
+        match self.input(key)? {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 /// Byte length of one request: header block plus `Content-Length` body.
@@ -479,4 +639,87 @@ fn intern_common_header_value(value: &str) -> Cow<'static, str> {
         "0" => Cow::Borrowed("0"),
         _ => Cow::Owned(value.to_owned()),
     }
+}
+
+#[inline]
+fn content_type_media_type(header: &str) -> &str {
+    header.split(';').next().unwrap_or(header).trim()
+}
+
+#[inline]
+fn is_json_media_type(media_type: &str) -> bool {
+    let bytes = media_type.as_bytes();
+    media_type.eq_ignore_ascii_case("application/json")
+        || (bytes.len() > b"application/+json".len()
+            && bytes[..12].eq_ignore_ascii_case(b"application/")
+            && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b"+json"))
+}
+
+fn lookup_form_urlencoded(raw: &str, key: &str) -> Option<String> {
+    let mut matched: Option<&str> = None;
+
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_val) = pair.split_once('=').unwrap_or((pair, ""));
+        if raw_key.is_empty() {
+            continue;
+        }
+
+        let is_match = if !raw_key.as_bytes().iter().any(|&b| b == b'%' || b == b'+') {
+            raw_key == key
+        } else {
+            percent_decode(raw_key) == key
+        };
+
+        if is_match {
+            matched = Some(raw_val);
+        }
+    }
+
+    matched.map(percent_decode)
+}
+
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    if !bytes.iter().any(|&b| b == b'%' || b == b'+') {
+        return input.to_owned();
+    }
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }

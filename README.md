@@ -20,6 +20,7 @@ Ruvel is an asynchronous web framework for Rust, shaped after Laravel. It runs o
 - Verbs & methods on `RouteRegistrar`: `get`, `post`, `put`, `delete`, `patch`, `head`, `options`, `trace`, `connect`, `any`, `r#match`, plus fluent route/group attributes (`domain`, `prefix`, `name`, `middleware`, `without_middleware`), each returning a `PendingRouteRegistrar` (which also provides parameter constraints like `r#where`, `where_number`, and `where_alpha`).
 - Path parameters use `{name}` segments. A match fills `Request::params`, and `Request::param("id")` reads one value.
 - The query string is split off the path and kept raw on `Request::query`. The router matches the path only.
+- `Request::input("key")` looks up request input as `Option<serde_json::Value>` from `application/json` or `application/x-www-form-urlencoded` bodies first, falling back to `Request::query`. Typed helpers (`u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, `f32`, `f64`, `bool`, `string`) convert matching values or return `None`.
 - `router.middleware("auth").group(...)` or `router.prefix("/api").group(...)` attaches middleware or prefixes to the routes registered inside the closure. Names are resolved when the route is registered. An unknown name panics at startup.
 - A missing route returns `404 Not Found`. Global middleware still runs for that response.
 - A route with an empty pipeline skips the middleware machinery and calls the handler directly.
