@@ -1,11 +1,12 @@
 {
-  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/refs/heads/main/schemas/config.json",
-  "packages": {
-    ".": {
-      "package-name": "ruvel",
-      "release-type": "rust"
-    }
-  },
-  "release-type": "rust",
-  "plugins": []
+	"$schema": "https://raw.githubusercontent.com/googleapis/release-please/refs/heads/main/schemas/config.json",
+	"packages": {
+		".": {
+			"package-name": "ruvel",
+			"release-type": "rust",
+			"extra-files": ["./src/foundation/application.rs"]
+		}
+	},
+	"release-type": "rust",
+	"plugins": []
 }
