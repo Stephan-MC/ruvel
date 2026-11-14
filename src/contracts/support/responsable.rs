@@ -71,4 +71,3 @@ impl<T: Responsable> Responsable for (u16, T) {
         res
     }
 }
-
