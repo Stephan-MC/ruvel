@@ -180,7 +180,7 @@ You register each action on the router yourself. There is no `resource()` helper
 ### Also in place
 
 - **Application lifecycle.** `Application::configure(base_path)` returns a builder. `with_provider`, `with_routing`, and `with_middleware` shape it. `create()` returns the `Application`. `listen(host, port)` boots every provider, then accepts TCP connections.
-- **HTTP/1.1 server.** Requests are parsed with `httparse`. One connection can serve keep-alive and pipelined requests. The body is framed with `Content-Length`. A request larger than 64 KiB is dropped. A non-identity `Transfer-Encoding` closes the connection.
+- **HTTP/1.1 server.** Requests are parsed with `httparse`. One connection can serve keep-alive and pipelined requests across arbitrary TCP fragmentation. Request bodies are framed with either `Content-Length` or `Transfer-Encoding: chunked` (supporting chunk extensions and trailers). A request larger than 64 KiB is dropped, and malformed framing or unsupported transfer-codings receive `400 Bad Request` before closing the connection.
 - **`Responsable`.** Route handlers can return `&'static str`, `String`, `Cow<str>`, `Box<str>`, `Response`, `()`, `(Status, T)`, or `(u16, T)`. Strings become `200 OK` with `Content-Type: text/html; charset=utf-8`.
 - **Responses.** `Response::ok`, `created`, `no_content`, `bad_request`, `not_found`, and `not_implemented`, plus `.text()`, `.json()`, `.html()`, and `.header()`. Numeric constants such as `Response::HTTP_OK` are available. `Status` covers the usual RFC codes, with `code()` and `message()`.
 - **Headers.** `HeaderMap` looks up names without regard to case and writes the casing of the last insert.
@@ -234,7 +234,7 @@ Not started:
 - Injecting container services into closures or controller methods, and a request-scoped container
 - A parsed query map, multipart bodies, and file uploads
 - Redirect and cookie helpers
-- Chunked request bodies, TLS, and HTTP/2
+- TLS and HTTP/2
 - An Artisan-style CLI, queues, mail, cache, and notifications
 
 ---
