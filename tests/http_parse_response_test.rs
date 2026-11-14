@@ -64,16 +64,28 @@ Content-Length: 15\r\n\
 }
 
 #[test]
-fn test_request_parse_rejects_chunked_and_mismatched_content_length() {
-    let chunked =
-        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-    assert!(Request::parse(chunked).is_err());
+fn test_request_parse_rejects_invalid_framing_and_accepts_chunked_and_identity() {
+    let unsupported_te =
+        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n";
+    assert!(Request::parse(unsupported_te).is_err());
+
+    let duplicate_te = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n";
+    assert!(Request::parse(duplicate_te).is_err());
+
+    let chunked_with_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    assert!(Request::parse(chunked_with_cl).is_err());
 
     let conflicting_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
     assert!(Request::parse(conflicting_cl).is_err());
 
     let identity = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\n";
     assert!(Request::parse(identity).unwrap().is_some());
+
+    let empty_chunked =
+        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    let (req, consumed) = Request::parse(empty_chunked).unwrap().unwrap();
+    assert_eq!(consumed, empty_chunked.len());
+    assert!(req.body.is_empty());
 }
 
 #[test]
@@ -312,4 +324,112 @@ fn test_request_typed_input_helpers_json_and_query() {
     assert_eq!(form_req.bool("d"), Some(false));
     assert_eq!(form_req.bool("e"), Some(true));
     assert_eq!(form_req.bool("f"), None);
+}
+
+#[test]
+fn test_request_parse_chunked_body_extensions_trailers_and_pipelining() {
+    let first = b"\
+POST /items HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Type: application/json\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+a;ext=1\r\n\
+{\"id\":42,\"\r\n\
+B;foo=bar\r\n\
+name\":\"ok\"}\r\n\
+0;last=yes\r\n\
+X-Trailer: ok\r\n\
+\r\n";
+    let second = b"GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    let mut pipelined = Vec::with_capacity(first.len() + second.len());
+    pipelined.extend_from_slice(first);
+    pipelined.extend_from_slice(second);
+
+    let (req1, consumed1) = Request::parse(&pipelined)
+        .expect("chunked request should succeed")
+        .expect("chunked request should be complete");
+    assert_eq!(consumed1, first.len());
+    assert_eq!(req1.method, Method::POST);
+    assert_eq!(req1.path, "/items");
+    assert_eq!(req1.body, br#"{"id":42,"name":"ok"}"#);
+    assert_eq!(req1.u64("id"), Some(42));
+    assert_eq!(req1.string("name"), Some("ok".to_string()));
+
+    let (req2, consumed2) = Request::parse(&pipelined[consumed1..])
+        .expect("pipelined request should succeed")
+        .expect("pipelined request should be complete");
+    assert_eq!(consumed2, second.len());
+    assert_eq!(req2.method, Method::GET);
+    assert_eq!(req2.path, "/health");
+
+    // Malformed chunked payloads must fail with Err(())
+    let invalid_hex =
+        b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nGG\r\n";
+    assert!(Request::parse(invalid_hex).is_err());
+
+    let missing_data_crlf = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX\r\n0\r\n\r\n";
+    assert!(Request::parse(missing_data_crlf).is_err());
+
+    let bare_lf_chunk_size = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n";
+    assert!(Request::parse(bare_lf_chunk_size).is_err());
+
+    let malformed_trailer = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBadTrailer\r\n\r\n";
+    assert!(Request::parse(malformed_trailer).is_err());
+}
+
+#[test]
+fn test_request_parse_exhaustive_tcp_fragmentation() {
+    let cl_request: &[u8] = b"\
+POST /submit?source=frag HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 13\r\n\
+\r\n\
+hello, world!";
+
+    for split in 0..cl_request.len() {
+        assert!(
+            matches!(Request::parse(&cl_request[..split]), Ok(None)),
+            "Content-Length prefix of {split} bytes must return Ok(None)"
+        );
+    }
+
+    let (req, consumed) = Request::parse(cl_request)
+        .expect("complete Content-Length request should succeed")
+        .expect("complete Content-Length request should be complete");
+    assert_eq!(consumed, cl_request.len());
+    assert_eq!(req.body, b"hello, world!");
+    assert_eq!(req.input("source"), Some(serde_json::json!("frag")));
+
+    let chunked_request: &[u8] = b"\
+POST /submit?source=chunked HTTP/1.1\r\n\
+Host: localhost\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5;ext=a\r\n\
+hello\r\n\
+8\r\n\
+, world!\r\n\
+0\r\n\
+X-Checksum: 1\r\n\
+\r\n";
+
+    for split in 0..chunked_request.len() {
+        assert!(
+            matches!(Request::parse(&chunked_request[..split]), Ok(None)),
+            "chunked prefix of {split} bytes must return Ok(None)"
+        );
+    }
+
+    let (chunked_req, chunked_consumed) = Request::parse(chunked_request)
+        .expect("complete chunked request should succeed")
+        .expect("complete chunked request should be complete");
+    assert_eq!(chunked_consumed, chunked_request.len());
+    assert_eq!(chunked_req.body, b"hello, world!");
+    assert_eq!(
+        chunked_req.input("source"),
+        Some(serde_json::json!("chunked"))
+    );
 }
