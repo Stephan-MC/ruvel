@@ -20,6 +20,7 @@ const READ_CHUNK_SIZE: usize = 8 * 1024; // 8 KiB read buffer to match standard 
 pub struct Scheduler {}
 
 pub struct Application {
+    pub version: &'static str,
     pub container: Container,
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
@@ -35,6 +36,7 @@ impl Default for Application {
 impl Application {
     pub fn new(_base_path: &str) -> Self {
         let mut app = Self {
+            version: "0.9.0", // x-release-please-version
             container: Container::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
