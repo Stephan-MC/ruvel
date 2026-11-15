@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.10.0...ruvel-v0.10.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* Fixed issue with TCP fragmentation errors ([43383ca](https://github.com/Stephan-MC/ruvel/commit/43383ca828a7c1740323d9f6e67839332c8ccfd0))
+
 ## [0.10.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.9.1...ruvel-v0.10.0) (2026-11-15)
 
 
