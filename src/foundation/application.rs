@@ -207,6 +207,7 @@ impl Application {
                         Ok(_) => {
                             let mut read_pos = 0usize;
                             let mut responses_queued = 0;
+                            let mut close_connection = false;
 
                             while read_pos < read_buffer.len() {
                                 let (req, consumed) = match Request::parse(&read_buffer[read_pos..])
@@ -220,6 +221,7 @@ impl Application {
                                             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                                         );
                                         let _ = socket.write_all(&response_buffer).await;
+                                        let _ = socket.shutdown().await;
                                         break 'connection;
                                     }
                                 };
@@ -231,14 +233,23 @@ impl Application {
                                     break 'connection;
                                 };
 
+                                let req_wants_close =
+                                    should_close_connection(req.header("Connection"));
+
                                 // Dispatch request through HTTP Kernel
                                 let response = kernel_clone.handle(req).await;
+                                let res_wants_close =
+                                    should_close_connection(response.headers.get("Connection"));
 
                                 // Serialize response into the write buffer
                                 response.write_to(&mut response_buffer);
                                 responses_queued += 1;
-
                                 read_pos = end;
+
+                                if req_wants_close || res_wants_close {
+                                    close_connection = true;
+                                    break;
+                                }
                             }
 
                             // Compact any consumed prefix so `read_buffer` starts the next read
@@ -257,6 +268,10 @@ impl Application {
                                 if socket.write_all(&response_buffer).await.is_err() {
                                     break 'connection;
                                 }
+                                if close_connection {
+                                    let _ = socket.shutdown().await;
+                                    break 'connection;
+                                }
                                 response_buffer.clear();
                                 if response_buffer.capacity() > 64 * 1024 {
                                     response_buffer.shrink_to(4096);
@@ -269,4 +284,15 @@ impl Application {
             });
         }
     }
+}
+
+/// Returns `true` when a `Connection` header value contains the `"close"` token
+/// (case-insensitive, comma-separated per RFC 9110 §7.6.1).
+fn should_close_connection(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("close"))
 }

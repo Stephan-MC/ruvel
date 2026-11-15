@@ -536,14 +536,57 @@ Transfer-Encoding: chunked\r\n\
 X-Trail: ok\r\n\
 \r\n";
 
-    // 1. Exhaustive 2-segment TCP split sweep across GET, Content-Length POST, and chunked POST.
-    let cases: [(&str, &[u8], &[u8]); 3] = [
-        ("GET", get_req, b"42"),
-        ("Content-Length POST", cl_post_req, b"42"),
-        ("Chunked POST", chunked_post_req, b"45"),
+    let get_close_req: &[u8] =
+        b"GET /baseline11?a=17&b=25 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let get_lower_close_req: &[u8] = b"\
+GET /baseline11?a=13&b=42 HTTP/1.1\r\n\
+host: localhost\r\n\
+user-agent: arena-frag/1.0\r\n\
+connection: close\r\n\
+\r\n";
+    let cl_post_close_req: &[u8] = b"\
+POST /baseline11?a=13&b=42 HTTP/1.1\r\n\
+host: localhost\r\n\
+content-type: text/plain\r\n\
+content-length: 2\r\n\
+connection: close\r\n\
+\r\n\
+20";
+    let chunked_post_close_req: &[u8] = b"\
+POST /baseline11?a=13&b=42 HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Type: text/plain\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\
+\r\n\
+1\r\n\
+2\r\n\
+1\r\n\
+0\r\n\
+0\r\n\
+\r\n";
+
+    // 1. Exhaustive 2-segment TCP split sweep with `Connection: close`, reading until server EOF.
+    let close_cases: [(&str, &[u8], &[u8]); 4] = [
+        ("GET Connection: close", get_close_req, b"42"),
+        (
+            "GET lower-cased connection: close",
+            get_lower_close_req,
+            b"55",
+        ),
+        (
+            "Content-Length POST connection: close",
+            cl_post_close_req,
+            b"75",
+        ),
+        (
+            "Chunked POST Connection: close",
+            chunked_post_close_req,
+            b"75",
+        ),
     ];
 
-    for (label, raw, expected_body) in cases {
+    for (label, raw, expected_body) in close_cases {
         for split in 1..raw.len() {
             let mut stream = TcpStream::connect(addr)
                 .await
@@ -561,8 +604,19 @@ X-Trail: ok\r\n\
                 .await
                 .expect("write second fragment");
 
-            let mut resp_buf = Vec::new();
-            let (headers, body) = read_http_response(&mut stream, &mut resp_buf).await;
+            let mut raw_resp = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw_resp))
+                .await
+                .expect("server must close TCP connection after Connection: close response")
+                .expect("read_to_end failed");
+
+            let sep = raw_resp
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response must contain header/body separator");
+            let headers = std::str::from_utf8(&raw_resp[..sep + 4]).expect("valid UTF-8 headers");
+            let body = &raw_resp[sep + 4..];
+
             assert!(
                 headers.starts_with("HTTP/1.1 200 OK\r\n"),
                 "{label} split={split}: expected 200 OK, got {headers:?}"
