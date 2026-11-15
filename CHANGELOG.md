@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.9.1...ruvel-v0.10.0) (2026-11-15)
+
+
+### Features
+
+* Added support for Exhaustive TCP fragmentation ([e34070e](https://github.com/Stephan-MC/ruvel/commit/e34070e38192fe2d8d60c9d222cff811181a837d))
+
 ## [0.9.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.9.0...ruvel-v0.9.1) (2026-11-14)
 
 
