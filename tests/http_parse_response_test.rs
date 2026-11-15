@@ -1,6 +1,10 @@
 use ruvel::contracts::support::Responsable;
+use ruvel::foundation::Application;
 use ruvel::http::{Method, Request, Response};
 use std::borrow::Cow;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 #[test]
 fn test_request_parse_get_root_and_headers_case_insensitive() {
@@ -432,4 +436,222 @@ X-Checksum: 1\r\n\
         chunked_req.input("source"),
         Some(serde_json::json!("chunked"))
     );
+}
+
+async fn baseline_handler(req: Request) -> Response {
+    let a = req.i64("a").unwrap_or(0);
+    let b = req.i64("b").unwrap_or(0);
+    let body_num = std::str::from_utf8(&req.body)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    Response::ok().text((a + b + body_num).to_string())
+}
+
+/// Read one complete HTTP/1.1 response frame (headers + `Content-Length` body) from `stream`,
+/// retaining any pipelined trailing bytes in `buf`.
+async fn read_http_response(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (String, Vec<u8>) {
+    let mut tmp = [0u8; 1024];
+
+    let (header_end, content_length) = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let header_str = std::str::from_utf8(&buf[..header_end])
+                .expect("response headers must be valid UTF-8");
+            let cl = header_str
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().expect("valid Content-Length"))
+                })
+                .expect("response must include Content-Length");
+            break (header_end, cl);
+        }
+
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut tmp))
+            .await
+            .expect("timed out waiting for HTTP response headers")
+            .expect("socket read failed");
+        assert!(n > 0, "server closed connection before sending headers");
+        buf.extend_from_slice(&tmp[..n]);
+    };
+
+    let total_len = header_end + content_length;
+    while buf.len() < total_len {
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut tmp))
+            .await
+            .expect("timed out waiting for HTTP response body")
+            .expect("socket read failed");
+        assert!(n > 0, "server closed connection before sending body");
+        buf.extend_from_slice(&tmp[..n]);
+    }
+
+    let headers = String::from_utf8(buf[..header_end].to_vec()).expect("valid UTF-8 headers");
+    let body = buf[header_end..total_len].to_vec();
+    buf.drain(..total_len);
+    (headers, body)
+}
+
+#[tokio::test]
+async fn test_tcp_listener_exhaustive_fragmentation_and_byte_by_byte() {
+    let app = Application::configure("")
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/baseline11", baseline_handler);
+                router.post("/baseline11", baseline_handler);
+            });
+        })
+        .create();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("read bound local addr");
+
+    let server = tokio::spawn(async move {
+        let _ = app.serve(listener).await;
+    });
+
+    let get_req: &[u8] = b"GET /baseline11?a=17&b=25 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let cl_post_req: &[u8] = b"\
+POST /baseline11?a=10&b=20 HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 2\r\n\
+\r\n\
+12";
+    let chunked_post_req: &[u8] = b"\
+POST /baseline11?a=5&b=6 HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Type: text/plain\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+1;ext=x\r\n\
+3\r\n\
+1\r\n\
+4\r\n\
+0\r\n\
+X-Trail: ok\r\n\
+\r\n";
+
+    // 1. Exhaustive 2-segment TCP split sweep across GET, Content-Length POST, and chunked POST.
+    let cases: [(&str, &[u8], &[u8]); 3] = [
+        ("GET", get_req, b"42"),
+        ("Content-Length POST", cl_post_req, b"42"),
+        ("Chunked POST", chunked_post_req, b"45"),
+    ];
+
+    for (label, raw, expected_body) in cases {
+        for split in 1..raw.len() {
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect to loopback server");
+            stream.set_nodelay(true).expect("enable TCP_NODELAY");
+
+            stream
+                .write_all(&raw[..split])
+                .await
+                .expect("write first fragment");
+            // Yield across a millisecond tick so the server reads the partial frame first.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            stream
+                .write_all(&raw[split..])
+                .await
+                .expect("write second fragment");
+
+            let mut resp_buf = Vec::new();
+            let (headers, body) = read_http_response(&mut stream, &mut resp_buf).await;
+            assert!(
+                headers.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{label} split={split}: expected 200 OK, got {headers:?}"
+            );
+            assert_eq!(
+                body, expected_body,
+                "{label} split={split}: unexpected body"
+            );
+        }
+    }
+
+    // 2. Per-byte (1-byte-at-a-time) TCP streaming on a persistent keep-alive connection.
+    {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect for byte-by-byte test");
+        stream.set_nodelay(true).expect("enable TCP_NODELAY");
+        let mut resp_buf = Vec::new();
+
+        for (label, raw, expected_body) in [
+            ("byte-by-byte Content-Length", cl_post_req, b"42" as &[u8]),
+            ("byte-by-byte Chunked", chunked_post_req, b"45" as &[u8]),
+        ] {
+            for &byte in raw {
+                stream
+                    .write_all(&[byte])
+                    .await
+                    .expect("write single byte fragment");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            let (headers, body) = read_http_response(&mut stream, &mut resp_buf).await;
+            assert!(
+                headers.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{label}: expected 200 OK, got {headers:?}"
+            );
+            assert_eq!(body, expected_body, "{label}: unexpected body");
+        }
+    }
+
+    // 3. Pipelined + mid-frame split across reads to verify immediate batch flush and tail compaction.
+    {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect for pipelined fragmentation test");
+        stream.set_nodelay(true).expect("enable TCP_NODELAY");
+        let mut resp_buf = Vec::new();
+
+        // First write contains full Request 1 (56 bytes) + large partial prefix of Request 2 (> 100 bytes),
+        // ensuring `read_pos < remaining` exercises tail compaction before reading the final 5 bytes.
+        let split = chunked_post_req.len() - 5;
+        let mut batch1 = Vec::with_capacity(get_req.len() + split);
+        batch1.extend_from_slice(get_req);
+        batch1.extend_from_slice(&chunked_post_req[..split]);
+
+        stream.write_all(&batch1).await.expect("write batch 1");
+
+        // Response 1 must flush immediately before Request 2 completes.
+        let (headers1, body1) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(headers1.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(body1, b"42");
+
+        stream
+            .write_all(&chunked_post_req[split..])
+            .await
+            .expect("write remainder of request 2");
+        let (headers2, body2) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(headers2.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(body2, b"45");
+
+        // Follow up on the same keep-alive connection with another pipelined + header-split batch.
+        let split2 = 15;
+        let mut batch2 = Vec::with_capacity(cl_post_req.len() + split2);
+        batch2.extend_from_slice(cl_post_req);
+        batch2.extend_from_slice(&get_req[..split2]);
+        stream.write_all(&batch2).await.expect("write batch 2");
+
+        let (headers3, body3) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(headers3.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(body3, b"42");
+
+        stream
+            .write_all(&get_req[split2..])
+            .await
+            .expect("write remainder of request 4");
+        let (headers4, body4) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(headers4.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(body4, b"42");
+    }
+
+    server.abort();
 }

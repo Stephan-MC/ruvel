@@ -149,23 +149,28 @@ impl Application {
     }
 
     /// Start the TCP listener (analogous to `public/index.php` `$kernel->handle()`).
+    async fn listen(self, host: String, port: u16) -> Result<(), Box<dyn Error>> {
+        let addr = format!("{}:{}", host, port);
+        let listener = TcpListener::bind(&addr).await?;
+        println!("🚀 Ruvel native server running on http://{}", addr);
+
+        self.serve(listener).await
+    }
+
+    /// Serve HTTP/1.1 connections on an already-bound [`TcpListener`].
     ///
-    /// Each accepted connection maintains a streaming read buffer (`read_buffer`) and cursor
+    /// Each accepted connection maintains a streaming read buffer (`read_buffer`) and batch cursor
     /// (`read_pos`) to handle keep-alive, HTTP/1.1 pipelining, and arbitrary TCP fragmentation:
-    /// - When [`Request::parse`] returns `Ok(None)`, unread bytes at `&read_buffer[read_pos..]`
-    ///   remain buffered so the next `read_buf` call can append trailing TCP fragments.
+    /// - When [`Request::parse`] returns `Ok(None)`, any unparsed tail bytes are compacted to the
+    ///   front of `read_buffer` so the next bounded `read_buf` call can append trailing TCP fragments.
     /// - When [`Request::parse`] returns `Ok(Some((req, consumed)))`, `read_pos` advances by
     ///   `consumed` and any remaining bytes in `read_buffer` are immediately parsed as pipelined
     ///   requests before flushing `response_buffer` in a single `write_all` call.
     /// - When [`Request::parse`] returns `Err(())`, any already-queued pipelined responses plus an
     ///   `HTTP/1.1 400 Bad Request` (`Connection: close`) response are flushed and the socket closes.
-    async fn listen(mut self, host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn serve(mut self, listener: TcpListener) -> Result<(), Box<dyn Error>> {
         // 1. Ensure all providers are booted before accepting traffic
         self.boot();
-
-        let addr = format!("{}:{}", host, port);
-        let listener = TcpListener::bind(&addr).await?;
-        println!("🚀 Ruvel native server running on http://{}", addr);
 
         // Resolve the HTTP Kernel directly from the container
         let kernel: Arc<Kernel> = match self.make::<Kernel>() {
@@ -180,26 +185,10 @@ impl Application {
 
             tokio::spawn(async move {
                 let mut read_buffer = Vec::with_capacity(READ_CHUNK_SIZE);
-                let mut read_pos = 0usize;
                 // Pre-allocated response buffer reused across pipelined requests
                 let mut response_buffer = Vec::with_capacity(4096);
 
                 'connection: loop {
-                    // Compact consumed prefix bytes so unread partial fragments stay contiguous
-                    // without letting `read_buffer` grow unbounded across keep-alive requests.
-                    if read_pos >= read_buffer.len() {
-                        read_buffer.clear();
-                        read_pos = 0;
-                    } else if read_pos > 0
-                        && (read_pos * 2 >= read_buffer.len()
-                            || read_buffer.len() >= MAX_REQUEST_BYTES)
-                    {
-                        let remaining = read_buffer.len() - read_pos;
-                        read_buffer.copy_within(read_pos.., 0);
-                        read_buffer.truncate(remaining);
-                        read_pos = 0;
-                    }
-
                     let remaining_budget = MAX_REQUEST_BYTES.saturating_sub(read_buffer.len());
                     if remaining_budget == 0 {
                         break;
@@ -209,13 +198,14 @@ impl Application {
                         read_buffer.reserve(want);
                     }
 
-                    match socket.read_buf(&mut read_buffer).await {
+                    match (&mut socket)
+                        .take(remaining_budget as u64)
+                        .read_buf(&mut read_buffer)
+                        .await
+                    {
                         Ok(0) => break, // Client gracefully closed connection
                         Ok(_) => {
-                            if read_buffer.len() > MAX_REQUEST_BYTES {
-                                break;
-                            }
-
+                            let mut read_pos = 0usize;
                             let mut responses_queued = 0;
 
                             while read_pos < read_buffer.len() {
@@ -251,9 +241,14 @@ impl Application {
                                 read_pos = end;
                             }
 
+                            // Compact any consumed prefix so `read_buffer` starts the next read
+                            // iteration with only the unparsed in-flight request fragment.
                             if read_pos >= read_buffer.len() {
                                 read_buffer.clear();
-                                read_pos = 0;
+                            } else if read_pos > 0 {
+                                let remaining = read_buffer.len() - read_pos;
+                                read_buffer.copy_within(read_pos.., 0);
+                                read_buffer.truncate(remaining);
                             }
 
                             // Batched flush: If any responses were queued from this read chunk (pipelining),
