@@ -58,21 +58,21 @@ async fn test_static_beats_param_and_method_miss_falls_through() {
 
     // Exact static route beats `{id}` on GET
     let res = router
-        .dispatch(Request::new(Method::GET, "/posts/create"))
+        .dispatch(Request::new(Method::Get, "/posts/create"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"static:create");
 
     // Static path exists for GET only; POST must fall through to the trie and match `POST /posts/{id}`
     let res = router
-        .dispatch(Request::new(Method::POST, "/posts/create"))
+        .dispatch(Request::new(Method::Post, "/posts/create"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"post:create");
 
     // Numeric parameter hits dynamic GET
     let res = router
-        .dispatch(Request::new(Method::GET, "/posts/42"))
+        .dispatch(Request::new(Method::Get, "/posts/42"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"get:42");
@@ -109,29 +109,29 @@ async fn test_regex_constraints_and_backtracking() {
     });
 
     let res = router
-        .dispatch(Request::new(Method::GET, "/users/123"))
+        .dispatch(Request::new(Method::Get, "/users/123"))
         .await;
     assert_eq!(res.body, b"num:123");
 
     // Unanchored `[0-9]+` must not match mixed alphanumeric segments
     let res = router
-        .dispatch(Request::new(Method::GET, "/users/123abc"))
+        .dispatch(Request::new(Method::Get, "/users/123abc"))
         .await;
     assert_eq!(res.body, b"slug:123abc");
 
     let res = router
-        .dispatch(Request::new(Method::GET, "/items/deadbeef"))
+        .dispatch(Request::new(Method::Get, "/items/deadbeef"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"hex:deadbeef");
 
     let res = router
-        .dispatch(Request::new(Method::GET, "/items/deadbeef1"))
+        .dispatch(Request::new(Method::Get, "/items/deadbeef1"))
         .await;
     assert_eq!(res.status.code(), 404);
 
     let res = router
-        .dispatch(Request::new(Method::GET, "/teams/alpha/comments"))
+        .dispatch(Request::new(Method::Get, "/teams/alpha/comments"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"team_comments:alpha");
@@ -168,7 +168,7 @@ async fn test_precomposed_middleware_order() {
     }
 
     let res = router
-        .dispatch(Request::new(Method::GET, "/orders/99"))
+        .dispatch(Request::new(Method::Get, "/orders/99"))
         .await;
     assert_eq!(res.body, b"ok");
 
@@ -193,7 +193,7 @@ async fn test_404_runs_global_middleware_installed_after_routes() {
     // Install global middleware after routes are registered
     router.set_middlewares(vec![Arc::new(GlobalTagMiddleware { val: "late" })]);
 
-    let res = router.dispatch(Request::new(Method::GET, "/missing")).await;
+    let res = router.dispatch(Request::new(Method::Get, "/missing")).await;
     assert_eq!(res.status.code(), 404);
     assert_eq!(res.headers.get("X-Global-Tag"), Some("late"));
 }
@@ -205,23 +205,23 @@ async fn test_root_and_trailing_slash_variants() {
     router.get("/ping/", |_req| async { "pong" });
 
     assert_eq!(
-        router.dispatch(Request::new(Method::GET, "/")).await.body,
+        router.dispatch(Request::new(Method::Get, "/")).await.body,
         b"root"
     );
     assert_eq!(
-        router.dispatch(Request::new(Method::GET, "")).await.body,
+        router.dispatch(Request::new(Method::Get, "")).await.body,
         b"root"
     );
     assert_eq!(
         router
-            .dispatch(Request::new(Method::GET, "/ping"))
+            .dispatch(Request::new(Method::Get, "/ping"))
             .await
             .body,
         b"pong"
     );
     assert_eq!(
         router
-            .dispatch(Request::new(Method::GET, "/ping/"))
+            .dispatch(Request::new(Method::Get, "/ping/"))
             .await
             .body,
         b"pong"
@@ -229,7 +229,7 @@ async fn test_root_and_trailing_slash_variants() {
     // Double internal slash must not match
     assert_eq!(
         router
-            .dispatch(Request::new(Method::GET, "/ping//extra"))
+            .dispatch(Request::new(Method::Get, "/ping//extra"))
             .await
             .status
             .code(),
@@ -267,7 +267,7 @@ async fn test_api_resource_accepts_non_numeric_ids() {
     let kernel = app.make::<Kernel>().unwrap();
     let res = kernel
         .handle(Request::new(
-            Method::GET,
+            Method::Get,
             "/posts/550e8400-e29b-41d4-a716-446655440000",
         ))
         .await;

@@ -64,7 +64,7 @@ async fn test_route_level_middleware_with_alias() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/dashboard");
+    let req = Request::new(Method::Get, "/dashboard");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"secret data");
@@ -88,7 +88,7 @@ async fn test_route_level_middleware_with_direct_instance() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/profile");
+    let req = Request::new(Method::Get, "/profile");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"profile data");
@@ -133,7 +133,7 @@ async fn test_route_level_middleware_slice_and_chaining() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/chained");
+    let req = Request::new(Method::Get, "/chained");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"chain");
@@ -173,7 +173,7 @@ async fn test_without_middleware() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/excluded");
+    let req = Request::new(Method::Get, "/excluded");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"excluded");
@@ -207,7 +207,7 @@ async fn test_fluent_group_and_counter_middleware() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/api/counter");
+    let req = Request::new(Method::Get, "/api/counter");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"ok");
@@ -228,7 +228,7 @@ async fn test_route_prefix_and_group_prefix() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/v1/users");
+    let req = Request::new(Method::Get, "/v1/users");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"users list");
@@ -248,7 +248,7 @@ async fn test_route_naming() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/named");
+    let req = Request::new(Method::Get, "/named");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"named route");
@@ -267,12 +267,12 @@ async fn test_any_method() {
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
     for method in &[
-        Method::GET,
+        Method::Get,
         Method::HEAD,
-        Method::POST,
-        Method::PUT,
-        Method::PATCH,
-        Method::DELETE,
+        Method::Post,
+        Method::Put,
+        Method::Patch,
+        Method::Delete,
         Method::OPTIONS,
     ] {
         let req = Request::new(method.clone(), "/any");
@@ -336,14 +336,14 @@ async fn test_route_registrar_attribute_first_and_group_middleware() {
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
     let res = kernel
-        .handle(Request::new(Method::GET, "/admin/users/42"))
+        .handle(Request::new(Method::Get, "/admin/users/42"))
         .await;
     assert_eq!(res.body, b"user:42");
     assert_eq!(res.headers.get("X-Auth"), Some("ok"));
     assert_eq!(res.headers.get("X-Audit"), None);
 
     let res_post = kernel
-        .handle(Request::new(Method::POST, "/admin/v1/posts/hello"))
+        .handle(Request::new(Method::Post, "/admin/v1/posts/hello"))
         .await;
     assert_eq!(res_post.body, b"created");
     assert_eq!(res_post.headers.get("X-Auth"), Some("ok"));
@@ -370,22 +370,22 @@ async fn test_trailing_slash_normalization() {
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
     // Root route
-    let res_root = kernel.handle(Request::new(Method::GET, "/")).await;
+    let res_root = kernel.handle(Request::new(Method::Get, "/")).await;
     assert_eq!(res_root.body, b"root");
 
     // Registered without trailing slash, requested with trailing slash
-    let res_users_slash = kernel.handle(Request::new(Method::GET, "/users/")).await;
+    let res_users_slash = kernel.handle(Request::new(Method::Get, "/users/")).await;
     assert_eq!(res_users_slash.body, b"users");
 
     // Registered with trailing slash, requested both ways
-    let res_posts = kernel.handle(Request::new(Method::GET, "/posts")).await;
+    let res_posts = kernel.handle(Request::new(Method::Get, "/posts")).await;
     assert_eq!(res_posts.body, b"posts");
-    let res_posts_slash = kernel.handle(Request::new(Method::GET, "/posts/")).await;
+    let res_posts_slash = kernel.handle(Request::new(Method::Get, "/posts/")).await;
     assert_eq!(res_posts_slash.body, b"posts");
 
     // Parameterized route inside a group requested with trailing slash
     let res_item = kernel
-        .handle(Request::new(Method::GET, "/api/items/99/"))
+        .handle(Request::new(Method::Get, "/api/items/99/"))
         .await;
     assert_eq!(res_item.body, b"item:99");
 }

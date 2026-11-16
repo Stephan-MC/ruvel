@@ -22,7 +22,7 @@ X-Custom-Trace: abc-123\r\n\
         .expect("request should be complete");
 
     assert_eq!(consumed, raw.len());
-    assert_eq!(req.method, Method::GET);
+    assert_eq!(req.method, Method::Get);
     assert_eq!(req.path, "/");
     assert_eq!(req.query, "");
     assert_eq!(req.header("Host"), Some("localhost:7883"));
@@ -54,7 +54,7 @@ Content-Length: 15\r\n\
 
     let (req1, consumed1) = Request::parse(&pipelined).unwrap().unwrap();
     assert_eq!(consumed1, first.len());
-    assert_eq!(req1.method, Method::POST);
+    assert_eq!(req1.method, Method::Post);
     assert_eq!(req1.path, "/api/v1/items");
     assert_eq!(req1.query, "dry_run=true");
     assert_eq!(req1.header("Content-Type"), Some("application/json"));
@@ -62,7 +62,7 @@ Content-Length: 15\r\n\
 
     let (req2, consumed2) = Request::parse(&pipelined[consumed1..]).unwrap().unwrap();
     assert_eq!(consumed2, second.len());
-    assert_eq!(req2.method, Method::GET);
+    assert_eq!(req2.method, Method::Get);
     assert_eq!(req2.path, "/health");
     assert_eq!(req2.query, "");
 }
@@ -94,7 +94,7 @@ fn test_request_parse_rejects_invalid_framing_and_accepts_chunked_and_identity()
 
 #[test]
 fn test_route_params_insert_overwrite_clone_and_capacity() {
-    let mut req = Request::new(Method::GET, "/users");
+    let mut req = Request::new(Method::Get, "/users");
     assert!(req.params.is_empty());
     assert_eq!(req.params.len(), 0);
 
@@ -165,25 +165,25 @@ fn test_request_parse_head_options_trace_and_connect_methods() {
     let cases = [
         (
             "HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::HEAD,
+            Method::Head,
             "/health",
             "HEAD",
         ),
         (
             "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::OPTIONS,
+            Method::Options,
             "*",
             "OPTIONS",
         ),
         (
             "TRACE /debug HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::TRACE,
+            Method::Trace,
             "/debug",
             "TRACE",
         ),
         (
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-            Method::CONNECT,
+            Method::Connect,
             "example.com:443",
             "CONNECT",
         ),
@@ -200,7 +200,7 @@ fn test_request_parse_head_options_trace_and_connect_methods() {
         assert_eq!(req.path, expected_path);
     }
 
-    assert_eq!(Method::from("PURGE"), Method::UNKNOWN("PURGE".to_string()));
+    assert_eq!(Method::from("PURGE"), Method::Unknown("PURGE".to_string()));
 }
 
 #[test]
@@ -252,12 +252,12 @@ role=admin&bio=hello+rust%25&empty=";
     assert_eq!(req.input("user key"), Some(serde_json::json!("ok")));
 
     // Non-object JSON or missing Content-Type should ignore body safely and still check query
-    let mut no_ct = Request::new(Method::POST, "/items");
+    let mut no_ct = Request::new(Method::Post, "/items");
     no_ct.query = Cow::Borrowed("source=query");
     no_ct.body = br#"{"source":"body"}"#.to_vec();
     assert_eq!(no_ct.input("source"), Some(serde_json::json!("query")));
 
-    let mut invalid_json = Request::new(Method::POST, "/items");
+    let mut invalid_json = Request::new(Method::Post, "/items");
     invalid_json
         .headers
         .insert("Content-Type", "application/problem+json");
@@ -268,7 +268,7 @@ role=admin&bio=hello+rust%25&empty=";
 
 #[test]
 fn test_request_typed_input_helpers_json_and_query() {
-    let mut json_req = Request::new(Method::POST, "/metrics");
+    let mut json_req = Request::new(Method::Post, "/metrics");
     json_req.headers.insert("Content-Type", "application/json");
     json_req.query = Cow::Borrowed("q_num=42&q_bool=ON&q_neg=-12&bad_float=NaN");
     json_req.body = br#"{
@@ -320,7 +320,7 @@ fn test_request_typed_input_helpers_json_and_query() {
     assert_eq!(json_req.u32("missing"), None);
 
     // Extra boolean string variants
-    let mut form_req = Request::new(Method::GET, "/opts");
+    let mut form_req = Request::new(Method::Get, "/opts");
     form_req.query = Cow::Borrowed("a=0&b=no&c=Off&d=false&e=yes&f=maybe");
     assert_eq!(form_req.bool("a"), Some(false));
     assert_eq!(form_req.bool("b"), Some(false));
@@ -355,7 +355,7 @@ X-Trailer: ok\r\n\
         .expect("chunked request should succeed")
         .expect("chunked request should be complete");
     assert_eq!(consumed1, first.len());
-    assert_eq!(req1.method, Method::POST);
+    assert_eq!(req1.method, Method::Post);
     assert_eq!(req1.path, "/items");
     assert_eq!(req1.body, br#"{"id":42,"name":"ok"}"#);
     assert_eq!(req1.u64("id"), Some(42));
@@ -365,7 +365,7 @@ X-Trailer: ok\r\n\
         .expect("pipelined request should succeed")
         .expect("pipelined request should be complete");
     assert_eq!(consumed2, second.len());
-    assert_eq!(req2.method, Method::GET);
+    assert_eq!(req2.method, Method::Get);
     assert_eq!(req2.path, "/health");
 
     // Malformed chunked payloads must fail with Err(())

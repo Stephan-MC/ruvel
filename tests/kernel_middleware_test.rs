@@ -45,7 +45,7 @@ async fn test_http_kernel_handles_global_middleware() {
         .make::<HttpKernel>()
         .expect("Kernel must be in container");
 
-    let req = Request::new(Method::GET, "/hello");
+    let req = Request::new(Method::Get, "/hello");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.body, b"world");
@@ -65,7 +65,7 @@ async fn test_http_kernel_handles_404_through_global_middleware() {
 
     let kernel = app.make::<HttpKernel>().unwrap();
 
-    let req = Request::new(Method::GET, "/non-existent");
+    let req = Request::new(Method::Get, "/non-existent");
     let res = kernel.handle(req).await;
 
     assert_eq!(res.status.code(), 404);
@@ -93,7 +93,7 @@ async fn test_http_kernel_trait_object_dispatches() {
         .make::<HttpKernel>()
         .expect("Kernel must be in container");
 
-    let res = kernel.handle(Request::new(Method::GET, "/hello")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/hello")).await;
 
     assert_eq!(res.body, b"world");
     assert_eq!(res.headers.get("X-Global"), Some("true"));
