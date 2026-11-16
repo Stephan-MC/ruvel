@@ -13,8 +13,21 @@ use crate::support::{LogServiceProvider, ServiceProvider};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const READ_CHUNK_SIZE: usize = 8 * 1024; // 8 KiB read buffer to match standard MTU/TCP windows
+const REQUEST_BUFFER_SIZE: usize = match option_env!("RV_REQUEST_BUFFER_SIZE") {
+    Some(s) => match usize::from_str_radix(s, 10) {
+        Ok(v) if v > 0 => v,
+        _ => 8 * 1024,
+    },
+    None => 8 * 1024,
+};
+
+const RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
+    Some(s) => match usize::from_str_radix(s, 10) {
+        Ok(v) if v > 0 => v,
+        _ => 4096,
+    },
+    None => 4096,
+};
 
 #[derive(Default)]
 pub struct Scheduler {}
@@ -184,43 +197,44 @@ impl Application {
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
-                let mut read_buffer = Vec::with_capacity(READ_CHUNK_SIZE);
-                // Pre-allocated response buffer reused across pipelined requests
-                let mut response_buffer = Vec::with_capacity(4096);
+                let mut read_buffer = [0u8; REQUEST_BUFFER_SIZE];
+                let mut read_len = 0usize;
+                let mut response_buffer = [0u8; RESPONSE_BUFFER_SIZE];
+                let mut resp_len = 0usize;
 
                 'connection: loop {
-                    let remaining_budget = MAX_REQUEST_BYTES.saturating_sub(read_buffer.len());
-                    if remaining_budget == 0 {
+                    if read_len >= REQUEST_BUFFER_SIZE {
+                        // TODO: Throw an error warning the about request size to large
                         break;
                     }
-                    let want = READ_CHUNK_SIZE.min(remaining_budget);
-                    if read_buffer.capacity() - read_buffer.len() < want {
-                        read_buffer.reserve(want);
-                    }
 
-                    match (&mut socket)
-                        .take(remaining_budget as u64)
-                        .read_buf(&mut read_buffer)
-                        .await
-                    {
+                    match socket.read(&mut read_buffer[read_len..]).await {
                         Ok(0) => break, // Client gracefully closed connection
-                        Ok(_) => {
+                        Ok(n) => {
+                            read_len += n;
                             let mut read_pos = 0usize;
-                            let mut responses_queued = 0;
                             let mut close_connection = false;
 
-                            while read_pos < read_buffer.len() {
-                                let (req, consumed) = match Request::parse(&read_buffer[read_pos..])
-                                {
+                            while read_pos < read_len {
+                                let (req, consumed) = match Request::parse(
+                                    &read_buffer[read_pos..read_len],
+                                ) {
                                     Ok(Some(parsed)) => parsed,
                                     // Partial frame (split headers, Content-Length body, or chunked
-                                    // payload): preserve `&read_buffer[read_pos..]` for the next read.
+                                    // payload): preserve `&read_buffer[read_pos..read_len]` for the next read.
                                     Ok(None) => break,
                                     Err(()) => {
-                                        response_buffer.extend_from_slice(
-                                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                                        );
-                                        let _ = socket.write_all(&response_buffer).await;
+                                        if resp_len > 0
+                                            && socket
+                                                .write_all(&response_buffer[..resp_len])
+                                                .await
+                                                .is_err()
+                                        {
+                                            break 'connection;
+                                        }
+                                        let _ = socket
+                                                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                                .await;
                                         let _ = socket.shutdown().await;
                                         break 'connection;
                                     }
@@ -229,7 +243,7 @@ impl Application {
                                 let Some(end) = read_pos.checked_add(consumed) else {
                                     break 'connection;
                                 };
-                                if consumed == 0 || end > read_buffer.len() {
+                                if consumed == 0 || end > read_len {
                                     break 'connection;
                                 };
 
@@ -241,9 +255,32 @@ impl Application {
                                 let res_wants_close =
                                     should_close_connection(response.headers.get("Connection"));
 
-                                // Serialize response into the write buffer
-                                response.write_to(&mut response_buffer);
-                                responses_queued += 1;
+                                // Serialize response into the fixed write buffer, flushing early if needed.
+                                if let Some(written) =
+                                    response.write_to_slice(&mut response_buffer[resp_len..])
+                                {
+                                    resp_len += written;
+                                } else {
+                                    if resp_len > 0 {
+                                        if socket
+                                            .write_all(&response_buffer[..resp_len])
+                                            .await
+                                            .is_err()
+                                        {
+                                            break 'connection;
+                                        }
+                                        resp_len = 0;
+                                    }
+                                    if let Some(written) =
+                                        response.write_to_slice(&mut response_buffer)
+                                    {
+                                        resp_len = written;
+                                    } else if socket.write_all(&response.to_bytes()).await.is_err()
+                                    {
+                                        break 'connection;
+                                    }
+                                }
+
                                 read_pos = end;
 
                                 if req_wants_close || res_wants_close {
@@ -252,30 +289,31 @@ impl Application {
                                 }
                             }
 
-                            // Compact any consumed prefix so `read_buffer` starts the next read
-                            // iteration with only the unparsed in-flight request fragment.
-                            if read_pos >= read_buffer.len() {
-                                read_buffer.clear();
+                            // Compact any consumed prefix so `read_buffer[..read_len]` starts the
+                            // next read iteration with only the unparsed in-flight request fragment.
+                            if read_pos >= read_len {
+                                read_len = 0;
                             } else if read_pos > 0 {
-                                let remaining = read_buffer.len() - read_pos;
-                                read_buffer.copy_within(read_pos.., 0);
-                                read_buffer.truncate(remaining);
+                                let remaining = read_len - read_pos;
+                                read_buffer.copy_within(read_pos..read_len, 0);
+                                read_len = remaining;
                             }
 
-                            // Batched flush: If any responses were queued from this read chunk (pipelining),
+                            // Batched flush: If any responses are queued in `response_buffer`,
                             // flush them all in one single write_all syscall to the OS socket.
-                            if responses_queued > 0 {
-                                if socket.write_all(&response_buffer).await.is_err() {
+                            if resp_len > 0 {
+                                if socket
+                                    .write_all(&response_buffer[..resp_len])
+                                    .await
+                                    .is_err()
+                                {
                                     break 'connection;
                                 }
-                                if close_connection {
-                                    let _ = socket.shutdown().await;
-                                    break 'connection;
-                                }
-                                response_buffer.clear();
-                                if response_buffer.capacity() > 64 * 1024 {
-                                    response_buffer.shrink_to(4096);
-                                }
+                                resp_len = 0;
+                            }
+                            if close_connection {
+                                let _ = socket.shutdown().await;
+                                break 'connection;
                             }
                         }
                         Err(_) => break, // Network error
