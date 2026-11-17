@@ -50,48 +50,48 @@ async fn test_resource_controller_all_7_actions() {
     let kernel = app.make::<Kernel>().unwrap();
 
     // 1. index: GET /posts
-    let res = kernel.handle(Request::new(Method::GET, "/posts")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.index");
 
     // 2. create: GET /posts/create
     let res = kernel
-        .handle(Request::new(Method::GET, "/posts/create"))
+        .handle(Request::new(Method::Get, "/posts/create"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.create");
 
     // 3. store: POST /posts
-    let res = kernel.handle(Request::new(Method::POST, "/posts")).await;
+    let res = kernel.handle(Request::new(Method::Post, "/posts")).await;
     assert_eq!(res.status.code(), 201);
     assert_eq!(res.body, b"posts.store");
 
     // 4. show: GET /posts/123
-    let res = kernel.handle(Request::new(Method::GET, "/posts/123")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts/123")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:123");
 
     // 5. edit: GET /posts/123/edit
     let res = kernel
-        .handle(Request::new(Method::GET, "/posts/123/edit"))
+        .handle(Request::new(Method::Get, "/posts/123/edit"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.edit:123");
 
     // 6. update: PUT and PATCH /posts/123
-    let res = kernel.handle(Request::new(Method::PUT, "/posts/123")).await;
+    let res = kernel.handle(Request::new(Method::Put, "/posts/123")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.update:123");
 
     let res = kernel
-        .handle(Request::new(Method::PATCH, "/posts/123"))
+        .handle(Request::new(Method::Patch, "/posts/123"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.update:123");
 
     // 7. destroy: DELETE /posts/123
     let res = kernel
-        .handle(Request::new(Method::DELETE, "/posts/123"))
+        .handle(Request::new(Method::Delete, "/posts/123"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.destroy:123");
@@ -112,20 +112,20 @@ async fn test_resource_controller_only_filtering() {
     let kernel = app.make::<Kernel>().unwrap();
 
     // Allowed actions
-    let res = kernel.handle(Request::new(Method::GET, "/posts")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.index");
 
-    let res = kernel.handle(Request::new(Method::GET, "/posts/42")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts/42")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:42");
 
     // Filtered out actions
-    let res = kernel.handle(Request::new(Method::POST, "/posts")).await;
+    let res = kernel.handle(Request::new(Method::Post, "/posts")).await;
     assert_eq!(res.status.code(), 404);
 
     let res = kernel
-        .handle(Request::new(Method::DELETE, "/posts/42"))
+        .handle(Request::new(Method::Delete, "/posts/42"))
         .await;
     assert_eq!(res.status.code(), 404);
 }
@@ -146,17 +146,17 @@ async fn test_resource_controller_except_filtering() {
 
     // Excluded actions
     let res = kernel
-        .handle(Request::new(Method::DELETE, "/posts/42"))
+        .handle(Request::new(Method::Delete, "/posts/42"))
         .await;
     assert_eq!(res.status.code(), 404);
 
     let res = kernel
-        .handle(Request::new(Method::GET, "/posts/42/edit"))
+        .handle(Request::new(Method::Get, "/posts/42/edit"))
         .await;
     assert_eq!(res.status.code(), 404);
 
     // Remaining actions still work
-    let res = kernel.handle(Request::new(Method::GET, "/posts/42")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts/42")).await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:42");
 }
@@ -176,7 +176,7 @@ async fn test_api_resource_skips_create_and_edit() {
     // API actions work
     assert_eq!(
         kernel
-            .handle(Request::new(Method::GET, "/posts"))
+            .handle(Request::new(Method::Get, "/posts"))
             .await
             .status
             .code(),
@@ -184,7 +184,7 @@ async fn test_api_resource_skips_create_and_edit() {
     );
     assert_eq!(
         kernel
-            .handle(Request::new(Method::POST, "/posts"))
+            .handle(Request::new(Method::Post, "/posts"))
             .await
             .status
             .code(),
@@ -192,7 +192,7 @@ async fn test_api_resource_skips_create_and_edit() {
     );
     assert_eq!(
         kernel
-            .handle(Request::new(Method::GET, "/posts/99"))
+            .handle(Request::new(Method::Get, "/posts/99"))
             .await
             .status
             .code(),
@@ -200,7 +200,7 @@ async fn test_api_resource_skips_create_and_edit() {
     );
     assert_eq!(
         kernel
-            .handle(Request::new(Method::PUT, "/posts/99"))
+            .handle(Request::new(Method::Put, "/posts/99"))
             .await
             .status
             .code(),
@@ -208,7 +208,7 @@ async fn test_api_resource_skips_create_and_edit() {
     );
     assert_eq!(
         kernel
-            .handle(Request::new(Method::DELETE, "/posts/99"))
+            .handle(Request::new(Method::Delete, "/posts/99"))
             .await
             .status
             .code(),
@@ -219,13 +219,13 @@ async fn test_api_resource_skips_create_and_edit() {
     // while `/posts/create` falls through to `show` with id = "create" (Laravel behavior
     // when `{id}` is unconstrained).
     let res = kernel
-        .handle(Request::new(Method::GET, "/posts/create"))
+        .handle(Request::new(Method::Get, "/posts/create"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:create");
     assert_eq!(
         kernel
-            .handle(Request::new(Method::GET, "/posts/99/edit"))
+            .handle(Request::new(Method::Get, "/posts/99/edit"))
             .await
             .status
             .code(),
@@ -256,7 +256,7 @@ async fn test_resource_controller_custom_parameter() {
     let kernel = app.make::<Kernel>().unwrap();
 
     let res = kernel
-        .handle(Request::new(Method::GET, "/articles/rust-edition-2024"))
+        .handle(Request::new(Method::Get, "/articles/rust-edition-2024"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"slug:rust-edition-2024");
@@ -294,10 +294,10 @@ async fn test_resource_controller_with_middleware() {
 
     let kernel = app.make::<Kernel>().unwrap();
 
-    let res = kernel.handle(Request::new(Method::GET, "/posts")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts")).await;
     assert_eq!(res.headers.get("X-Resource-Auth"), Some("verified"));
 
-    let res = kernel.handle(Request::new(Method::GET, "/posts/10")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/posts/10")).await;
     assert_eq!(res.headers.get("X-Resource-Auth"), Some("verified"));
 }
 
@@ -316,13 +316,13 @@ async fn test_resource_controller_in_group_with_prefix() {
     let kernel = app.make::<Kernel>().unwrap();
 
     let res = kernel
-        .handle(Request::new(Method::GET, "/api/v1/posts"))
+        .handle(Request::new(Method::Get, "/api/v1/posts"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.index");
 
     let res = kernel
-        .handle(Request::new(Method::GET, "/api/v1/posts/77"))
+        .handle(Request::new(Method::Get, "/api/v1/posts/77"))
         .await;
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:77");
@@ -343,11 +343,11 @@ async fn test_default_controller_methods_return_501() {
 
     let kernel = app.make::<Kernel>().unwrap();
 
-    let res = kernel.handle(Request::new(Method::GET, "/items")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/items")).await;
     assert_eq!(res.status.code(), 501);
     assert_eq!(res.body, b"501 Not Implemented: index");
 
-    let res = kernel.handle(Request::new(Method::GET, "/items/1")).await;
+    let res = kernel.handle(Request::new(Method::Get, "/items/1")).await;
     assert_eq!(res.status.code(), 501);
     assert_eq!(res.body, b"501 Not Implemented: show");
 }

@@ -231,16 +231,16 @@ impl MethodSlots {
     #[inline]
     fn slot_index(method: &Method) -> Option<usize> {
         match method {
-            Method::GET => Some(0),
-            Method::POST => Some(1),
-            Method::PUT => Some(2),
-            Method::DELETE => Some(3),
-            Method::PATCH => Some(4),
-            Method::HEAD => Some(5),
-            Method::OPTIONS => Some(6),
-            Method::TRACE => Some(7),
-            Method::CONNECT => Some(8),
-            Method::UNKNOWN(_) => None,
+            Method::Get => Some(0),
+            Method::Post => Some(1),
+            Method::Put => Some(2),
+            Method::Delete => Some(3),
+            Method::Patch => Some(4),
+            Method::Head => Some(5),
+            Method::Options => Some(6),
+            Method::Trace => Some(7),
+            Method::Connect => Some(8),
+            Method::Unknown(_) => None,
         }
     }
 
@@ -248,7 +248,7 @@ impl MethodSlots {
         match Self::slot_index(&method) {
             Some(idx) => self.standard[idx] = Some(route),
             None => {
-                if let Method::UNKNOWN(name) = method {
+                if let Method::Unknown(name) = method {
                     let list = self.other.get_or_insert_with(|| Box::new(Vec::new()));
                     if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == name) {
                         *existing = route;
@@ -265,7 +265,7 @@ impl MethodSlots {
         match Self::slot_index(method) {
             Some(idx) => self.standard[idx].as_deref(),
             None => {
-                if let Method::UNKNOWN(name) = method
+                if let Method::Unknown(name) = method
                     && let Some(ref list) = self.other
                 {
                     return list

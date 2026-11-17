@@ -65,28 +65,28 @@ fn bench_router(c: &mut Criterion) {
     let mut group = c.benchmark_group("router_dispatch");
     group.bench_function("static_hit", |b| {
         b.iter(|| {
-            poll_ready(router.dispatch(Request::new(Method::GET, black_box("/api/v1/health"))))
+            poll_ready(router.dispatch(Request::new(Method::Get, black_box("/api/v1/health"))))
         })
     });
     group.bench_function("param_hit", |b| {
         b.iter(|| {
-            poll_ready(router.dispatch(Request::new(Method::GET, black_box("/api/v1/teams/42"))))
+            poll_ready(router.dispatch(Request::new(Method::Get, black_box("/api/v1/teams/42"))))
         })
     });
     group.bench_function("nested_param_hit", |b| {
         b.iter(|| {
             poll_ready(router.dispatch(Request::new(
-                Method::GET,
+                Method::Get,
                 black_box("/api/v1/teams/42/children/7"),
             )))
         })
     });
     group.bench_function("param_hit_2_middleware", |b| {
-        b.iter(|| poll_ready(router.dispatch(Request::new(Method::GET, black_box("/mw/users/42")))))
+        b.iter(|| poll_ready(router.dispatch(Request::new(Method::Get, black_box("/mw/users/42")))))
     });
     group.bench_function("not_found", |b| {
         b.iter(|| {
-            poll_ready(router.dispatch(Request::new(Method::GET, black_box("/nope/nothing"))))
+            poll_ready(router.dispatch(Request::new(Method::Get, black_box("/nope/nothing"))))
         })
     });
     group.finish();
@@ -94,7 +94,7 @@ fn bench_router(c: &mut Criterion) {
     let kernel = Kernel::new(Arc::new(build_router()));
     c.bench_function("kernel_handle/param_hit", |b| {
         b.iter(|| {
-            poll_ready(kernel.handle(Request::new(Method::GET, black_box("/api/v1/teams/42"))))
+            poll_ready(kernel.handle(Request::new(Method::Get, black_box("/api/v1/teams/42"))))
         })
     });
 }

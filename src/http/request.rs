@@ -7,23 +7,6 @@ use std::mem::MaybeUninit;
 const MAX_HEADERS: usize = 64;
 const MAX_INLINE_PARAMS: usize = 8;
 
-impl From<&str> for Method {
-    fn from(s: &str) -> Self {
-        match s {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "PATCH" => Method::PATCH,
-            "HEAD" => Method::HEAD,
-            "OPTIONS" => Method::OPTIONS,
-            "TRACE" => Method::TRACE,
-            "CONNECT" => Method::CONNECT,
-            other => Method::UNKNOWN(other.to_string()),
-        }
-    }
-}
-
 /// Fixed-capacity, inline route parameter storage to avoid heap HashMap allocations per match.
 pub struct RouteParams {
     len: usize,

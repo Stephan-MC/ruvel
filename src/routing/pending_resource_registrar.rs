@@ -251,35 +251,35 @@ impl<'a> PendingResourceRegistration<'a> {
         };
 
         let route_specs = [
-            (ResourceAction::Index, vec![Method::GET], None, "index"),
+            (ResourceAction::Index, vec![Method::Get], None, "index"),
             (
                 ResourceAction::Create,
-                vec![Method::GET],
+                vec![Method::Get],
                 Some("create"),
                 "create",
             ),
-            (ResourceAction::Store, vec![Method::POST], None, "store"),
+            (ResourceAction::Store, vec![Method::Post], None, "store"),
             (
                 ResourceAction::Show,
-                vec![Method::GET],
+                vec![Method::Get],
                 Some(param_suffix.as_str()),
                 "show",
             ),
             (
                 ResourceAction::Edit,
-                vec![Method::GET],
+                vec![Method::Get],
                 Some(edit_suffix.as_str()),
                 "edit",
             ),
             (
                 ResourceAction::Update,
-                vec![Method::PUT, Method::PATCH],
+                vec![Method::Put, Method::Patch],
                 Some(param_suffix.as_str()),
                 "update",
             ),
             (
                 ResourceAction::Destroy,
-                vec![Method::DELETE],
+                vec![Method::Delete],
                 Some(param_suffix.as_str()),
                 "destroy",
             ),
