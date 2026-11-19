@@ -37,11 +37,11 @@ impl HeaderMap {
         }
     }
 
-    /// Insert a header name-value pair.
+    /// Insert a header name-value pair while preserving the original header name casing.
     ///
-    /// Accepts `&'static str` (0 heap allocations), `String`, or `Cow<'static, str>`.
-    /// If a header with the same name (case-insensitive) already exists,
-    /// its value and casing are updated.
+    /// Singleton headers (`Host`, `Content-Type`, `Content-Length`, `Authorization`, etc.) overwrite
+    /// any existing case-insensitive match; multi-value headers (`Set-Cookie`, `Cookie`,
+    /// `Connection`, `X-*`, etc.) append additional entries.
     pub fn insert(
         &mut self,
         key: impl Into<Cow<'static, str>>,
@@ -50,19 +50,60 @@ impl HeaderMap {
         let key = key.into();
         let value = value.into();
 
-        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&key)) {
+        if is_single_value_header(&key)
+            && let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+        {
             entry.0 = key;
             entry.1 = value;
-        } else {
+            return;
+        }
+
+        self.entries.push((key, value));
+    }
+
+    /// Replace all existing entries for `key` (case-insensitive) with a single `(key, value)` entry
+    /// while preserving `key`'s exact casing.
+    pub fn set(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) {
+        let key = key.into();
+        let value = value.into();
+
+        let mut replaced = false;
+        let mut idx = 0;
+        while idx < self.entries.len() {
+            if self.entries[idx].0.eq_ignore_ascii_case(&key) {
+                if !replaced {
+                    self.entries[idx] = (key.clone(), value.clone());
+                    replaced = true;
+                    idx += 1;
+                } else {
+                    self.entries.remove(idx);
+                }
+            } else {
+                idx += 1;
+            }
+        }
+
+        if !replaced {
             self.entries.push((key, value));
         }
     }
 
-    /// Get a header value by name (case-insensitive).
+    /// Get the first header value matching `key` (case-insensitive).
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_ref())
+    }
+
+    /// Iterate over all header values matching `key` (case-insensitive) in insertion order.
+    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> {
+        self.entries
+            .iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.as_ref())
     }
 
@@ -73,20 +114,24 @@ impl HeaderMap {
             .any(|(k, _)| k.eq_ignore_ascii_case(key))
     }
 
-    /// Remove a header by name (case-insensitive) and return its value if present.
+    /// Remove all entries matching `key` (case-insensitive) and return the first removed value.
     pub fn remove(&mut self, key: &str) -> Option<String> {
-        if let Some(idx) = self
-            .entries
-            .iter()
-            .position(|(k, _)| k.eq_ignore_ascii_case(key))
-        {
-            Some(self.entries.remove(idx).1.into_owned())
-        } else {
-            None
+        let mut removed: Option<String> = None;
+        let mut idx = 0;
+        while idx < self.entries.len() {
+            if self.entries[idx].0.eq_ignore_ascii_case(key) {
+                let (_, val) = self.entries.remove(idx);
+                if removed.is_none() {
+                    removed = Some(val.into_owned());
+                }
+            } else {
+                idx += 1;
+            }
         }
+        removed
     }
 
-    /// Return the number of unique headers.
+    /// Return the number of header entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -98,9 +143,7 @@ impl HeaderMap {
 
     /// Iterator over `(&original_key, &value)`.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries
-            .iter()
-            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        self.entries.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
     }
 }
 
@@ -134,6 +177,41 @@ impl<K: Into<Cow<'static, str>>, V: Into<Cow<'static, str>>> FromIterator<(K, V)
             map.insert(k, v);
         }
         map
+    }
+}
+
+#[inline]
+fn is_single_value_header(name: &str) -> bool {
+    match name.len() {
+        3 => name.eq_ignore_ascii_case("age"),
+        4 => {
+            name.eq_ignore_ascii_case("host")
+                || name.eq_ignore_ascii_case("date")
+                || name.eq_ignore_ascii_case("etag")
+                || name.eq_ignore_ascii_case("from")
+        }
+        5 => name.eq_ignore_ascii_case("range"),
+        6 => name.eq_ignore_ascii_case("origin") || name.eq_ignore_ascii_case("server"),
+        7 => name.eq_ignore_ascii_case("expires") || name.eq_ignore_ascii_case("referer"),
+        8 => name.eq_ignore_ascii_case("if-range") || name.eq_ignore_ascii_case("location"),
+        10 => name.eq_ignore_ascii_case("user-agent"),
+        11 => name.eq_ignore_ascii_case("retry-after"),
+        12 => {
+            name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("max-forwards")
+        }
+        13 => {
+            name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("content-range")
+                || name.eq_ignore_ascii_case("last-modified")
+        }
+        14 => name.eq_ignore_ascii_case("content-length"),
+        17 => name.eq_ignore_ascii_case("if-modified-since"),
+        19 => {
+            name.eq_ignore_ascii_case("if-unmodified-since")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+                || name.eq_ignore_ascii_case("content-disposition")
+        }
+        _ => false,
     }
 }
 

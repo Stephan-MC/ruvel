@@ -1,10 +1,19 @@
 use ruvel::contracts::support::Responsable;
 use ruvel::foundation::Application;
-use ruvel::http::{Method, Request, Response};
+use ruvel::http::parser::Status as ParseStatus;
+use ruvel::http::{HeaderMap, Method, Request, Response};
+use ruvel::routing::route::MAX_ROUTE_PARAMS;
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn capture_complete(buf: &[u8]) -> (Request, usize) {
+    match Request::capture(buf).expect("capture should succeed") {
+        ParseStatus::Complete(req, consumed) => (req, consumed),
+        ParseStatus::Incomplete => panic!("request should be complete"),
+    }
+}
 
 #[test]
 fn test_request_parse_get_root_and_headers_case_insensitive() {
@@ -17,12 +26,10 @@ Connection: keep-alive\r\n\
 X-Custom-Trace: abc-123\r\n\
 \r\n";
 
-    let (req, consumed) = Request::parse(raw)
-        .expect("parse should succeed")
-        .expect("request should be complete");
+    let (req, consumed) = capture_complete(raw);
 
     assert_eq!(consumed, raw.len());
-    assert_eq!(req.method, Method::GET);
+    assert_eq!(req.method, Method::Get);
     assert_eq!(req.path, "/");
     assert_eq!(req.query, "");
     assert_eq!(req.header("Host"), Some("localhost:7883"));
@@ -49,20 +56,23 @@ Content-Length: 15\r\n\
     pipelined.extend_from_slice(first);
     pipelined.extend_from_slice(second);
 
-    // Partial body should return Ok(None)
-    assert!(Request::parse(&first[..first.len() - 3]).unwrap().is_none());
+    // Partial body should return ParseStatus::Incomplete
+    assert!(matches!(
+        Request::capture(&first[..first.len() - 3]).unwrap(),
+        ParseStatus::Incomplete
+    ));
 
-    let (req1, consumed1) = Request::parse(&pipelined).unwrap().unwrap();
+    let (req1, consumed1) = capture_complete(&pipelined);
     assert_eq!(consumed1, first.len());
-    assert_eq!(req1.method, Method::POST);
+    assert_eq!(req1.method, Method::Post);
     assert_eq!(req1.path, "/api/v1/items");
     assert_eq!(req1.query, "dry_run=true");
     assert_eq!(req1.header("Content-Type"), Some("application/json"));
     assert_eq!(req1.body, br#"{"name":"book"}"#);
 
-    let (req2, consumed2) = Request::parse(&pipelined[consumed1..]).unwrap().unwrap();
+    let (req2, consumed2) = capture_complete(&pipelined[consumed1..]);
     assert_eq!(consumed2, second.len());
-    assert_eq!(req2.method, Method::GET);
+    assert_eq!(req2.method, Method::Get);
     assert_eq!(req2.path, "/health");
     assert_eq!(req2.query, "");
 }
@@ -71,30 +81,33 @@ Content-Length: 15\r\n\
 fn test_request_parse_rejects_invalid_framing_and_accepts_chunked_and_identity() {
     let unsupported_te =
         b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n";
-    assert!(Request::parse(unsupported_te).is_err());
+    assert!(Request::capture(unsupported_te).is_err());
 
     let duplicate_te = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n";
-    assert!(Request::parse(duplicate_te).is_err());
+    assert!(Request::capture(duplicate_te).is_err());
 
     let chunked_with_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    assert!(Request::parse(chunked_with_cl).is_err());
+    assert!(Request::capture(chunked_with_cl).is_err());
 
     let conflicting_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
-    assert!(Request::parse(conflicting_cl).is_err());
+    assert!(Request::capture(conflicting_cl).is_err());
 
     let identity = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\n";
-    assert!(Request::parse(identity).unwrap().is_some());
+    assert!(matches!(
+        Request::capture(identity).unwrap(),
+        ParseStatus::Complete(_, _)
+    ));
 
     let empty_chunked =
         b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-    let (req, consumed) = Request::parse(empty_chunked).unwrap().unwrap();
+    let (req, consumed) = capture_complete(empty_chunked);
     assert_eq!(consumed, empty_chunked.len());
     assert!(req.body.is_empty());
 }
 
 #[test]
 fn test_route_params_insert_overwrite_clone_and_capacity() {
-    let mut req = Request::new(Method::GET, "/users");
+    let mut req = Request::new(Method::Get, "/users");
     assert!(req.params.is_empty());
     assert_eq!(req.params.len(), 0);
 
@@ -121,12 +134,51 @@ fn test_route_params_insert_overwrite_clone_and_capacity() {
     assert!(debug.contains("99"));
     assert!(debug.contains("hello-world"));
 
-    // Fill up to max inline capacity (8) and verify extra insert does not panic or overflow
-    for i in 2..10 {
+    // Fill up to max inline capacity and verify extra insert does not panic or overflow
+    for i in 2..(MAX_ROUTE_PARAMS + 2) {
         req.params.insert(format!("k{i}"), format!("v{i}"));
     }
-    assert_eq!(req.params.len(), 8);
-    assert_eq!(req.params.get("k9"), None);
+    assert_eq!(req.params.len(), MAX_ROUTE_PARAMS);
+    assert_eq!(req.params.get(&format!("k{}", MAX_ROUTE_PARAMS + 1)), None);
+}
+
+#[test]
+fn test_header_map_multi_value_singleton_overwrite_and_case_preservation() {
+    let mut headers = HeaderMap::new();
+    headers.insert("Set-Cookie", "a=1");
+    headers.insert("set-cookie", "b=2");
+    headers.insert("X-Custom", "one");
+    headers.insert("x-custom", "two");
+    headers.insert("Content-Type", "text/plain");
+    headers.insert("content-type", "application/json");
+
+    let pairs: Vec<(&str, &str)> = headers.iter().collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Set-Cookie", "a=1"),
+            ("set-cookie", "b=2"),
+            ("X-Custom", "one"),
+            ("x-custom", "two"),
+            ("content-type", "application/json"),
+        ]
+    );
+
+    assert_eq!(headers.get("SET-COOKIE"), Some("a=1"));
+    assert_eq!(
+        headers.get_all("set-cookie").collect::<Vec<_>>(),
+        vec!["a=1", "b=2"]
+    );
+    assert_eq!(headers.get("Content-Type"), Some("application/json"));
+
+    headers.set("X-Custom", "only");
+    assert_eq!(
+        headers.get_all("x-custom").collect::<Vec<_>>(),
+        vec!["only"]
+    );
+
+    assert_eq!(headers.remove("set-cookie"), Some("a=1".to_string()));
+    assert!(!headers.contains_key("Set-Cookie"));
 }
 
 #[test]
@@ -165,34 +217,32 @@ fn test_request_parse_head_options_trace_and_connect_methods() {
     let cases = [
         (
             "HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::HEAD,
+            Method::Head,
             "/health",
             "HEAD",
         ),
         (
             "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::OPTIONS,
+            Method::Options,
             "*",
             "OPTIONS",
         ),
         (
             "TRACE /debug HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            Method::TRACE,
+            Method::Trace,
             "/debug",
             "TRACE",
         ),
         (
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-            Method::CONNECT,
+            Method::Connect,
             "example.com:443",
             "CONNECT",
         ),
     ];
 
     for (raw, expected_method, expected_path, expected_display) in cases {
-        let (req, consumed) = Request::parse(raw.as_bytes())
-            .expect("parse should succeed")
-            .expect("request should be complete");
+        let (req, consumed) = capture_complete(raw.as_bytes());
         assert_eq!(consumed, raw.len());
         assert_eq!(req.method, expected_method);
         assert_eq!(req.method.to_string(), expected_display);
@@ -200,7 +250,7 @@ fn test_request_parse_head_options_trace_and_connect_methods() {
         assert_eq!(req.path, expected_path);
     }
 
-    assert_eq!(Method::from("PURGE"), Method::UNKNOWN("PURGE".to_string()));
+    assert_eq!(Method::from("PURGE"), Method::Unknown("PURGE".to_string()));
 }
 
 #[test]
@@ -213,7 +263,7 @@ Content-Length: 66\r\n\
 \r\n\
 {\"name\":\"Alice\",\"age\":30,\"active\":true,\"tags\":[\"rust\"],\"nil\":null}";
 
-    let (mut req, _) = Request::parse(raw).unwrap().unwrap();
+    let (mut req, _) = capture_complete(raw);
     req.params.insert("id", "99");
 
     // Body overrides overlapping query parameter while preserving JSON types
@@ -244,7 +294,7 @@ Content-Length: 35\r\n\
 \r\n\
 role=admin&bio=hello+rust%25&empty=";
 
-    let (req, _) = Request::parse(raw).unwrap().unwrap();
+    let (req, _) = capture_complete(raw);
     assert_eq!(req.input("role"), Some(serde_json::json!("admin")));
     assert_eq!(req.input("bio"), Some(serde_json::json!("hello rust%")));
     assert_eq!(req.input("empty"), Some(serde_json::json!("")));
@@ -252,12 +302,12 @@ role=admin&bio=hello+rust%25&empty=";
     assert_eq!(req.input("user key"), Some(serde_json::json!("ok")));
 
     // Non-object JSON or missing Content-Type should ignore body safely and still check query
-    let mut no_ct = Request::new(Method::POST, "/items");
+    let mut no_ct = Request::new(Method::Post, "/items");
     no_ct.query = Cow::Borrowed("source=query");
     no_ct.body = br#"{"source":"body"}"#.to_vec();
     assert_eq!(no_ct.input("source"), Some(serde_json::json!("query")));
 
-    let mut invalid_json = Request::new(Method::POST, "/items");
+    let mut invalid_json = Request::new(Method::Post, "/items");
     invalid_json
         .headers
         .insert("Content-Type", "application/problem+json");
@@ -268,7 +318,7 @@ role=admin&bio=hello+rust%25&empty=";
 
 #[test]
 fn test_request_typed_input_helpers_json_and_query() {
-    let mut json_req = Request::new(Method::POST, "/metrics");
+    let mut json_req = Request::new(Method::Post, "/metrics");
     json_req.headers.insert("Content-Type", "application/json");
     json_req.query = Cow::Borrowed("q_num=42&q_bool=ON&q_neg=-12&bad_float=NaN");
     json_req.body = br#"{
@@ -320,7 +370,7 @@ fn test_request_typed_input_helpers_json_and_query() {
     assert_eq!(json_req.u32("missing"), None);
 
     // Extra boolean string variants
-    let mut form_req = Request::new(Method::GET, "/opts");
+    let mut form_req = Request::new(Method::Get, "/opts");
     form_req.query = Cow::Borrowed("a=0&b=no&c=Off&d=false&e=yes&f=maybe");
     assert_eq!(form_req.bool("a"), Some(false));
     assert_eq!(form_req.bool("b"), Some(false));
@@ -351,36 +401,32 @@ X-Trailer: ok\r\n\
     pipelined.extend_from_slice(first);
     pipelined.extend_from_slice(second);
 
-    let (req1, consumed1) = Request::parse(&pipelined)
-        .expect("chunked request should succeed")
-        .expect("chunked request should be complete");
+    let (req1, consumed1) = capture_complete(&pipelined);
     assert_eq!(consumed1, first.len());
-    assert_eq!(req1.method, Method::POST);
+    assert_eq!(req1.method, Method::Post);
     assert_eq!(req1.path, "/items");
     assert_eq!(req1.body, br#"{"id":42,"name":"ok"}"#);
     assert_eq!(req1.u64("id"), Some(42));
     assert_eq!(req1.string("name"), Some("ok".to_string()));
 
-    let (req2, consumed2) = Request::parse(&pipelined[consumed1..])
-        .expect("pipelined request should succeed")
-        .expect("pipelined request should be complete");
+    let (req2, consumed2) = capture_complete(&pipelined[consumed1..]);
     assert_eq!(consumed2, second.len());
-    assert_eq!(req2.method, Method::GET);
+    assert_eq!(req2.method, Method::Get);
     assert_eq!(req2.path, "/health");
 
-    // Malformed chunked payloads must fail with Err(())
+    // Malformed chunked payloads must fail with Err(...)
     let invalid_hex =
         b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nGG\r\n";
-    assert!(Request::parse(invalid_hex).is_err());
+    assert!(Request::capture(invalid_hex).is_err());
 
     let missing_data_crlf = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX\r\n0\r\n\r\n";
-    assert!(Request::parse(missing_data_crlf).is_err());
+    assert!(Request::capture(missing_data_crlf).is_err());
 
     let bare_lf_chunk_size = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n";
-    assert!(Request::parse(bare_lf_chunk_size).is_err());
+    assert!(Request::capture(bare_lf_chunk_size).is_err());
 
     let malformed_trailer = b"POST /items HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBadTrailer\r\n\r\n";
-    assert!(Request::parse(malformed_trailer).is_err());
+    assert!(Request::capture(malformed_trailer).is_err());
 }
 
 #[test]
@@ -395,14 +441,15 @@ hello, world!";
 
     for split in 0..cl_request.len() {
         assert!(
-            matches!(Request::parse(&cl_request[..split]), Ok(None)),
-            "Content-Length prefix of {split} bytes must return Ok(None)"
+            matches!(
+                Request::capture(&cl_request[..split]),
+                Ok(ParseStatus::Incomplete)
+            ),
+            "Content-Length prefix of {split} bytes must return ParseStatus::Incomplete"
         );
     }
 
-    let (req, consumed) = Request::parse(cl_request)
-        .expect("complete Content-Length request should succeed")
-        .expect("complete Content-Length request should be complete");
+    let (req, consumed) = capture_complete(cl_request);
     assert_eq!(consumed, cl_request.len());
     assert_eq!(req.body, b"hello, world!");
     assert_eq!(req.input("source"), Some(serde_json::json!("frag")));
@@ -422,14 +469,15 @@ X-Checksum: 1\r\n\
 
     for split in 0..chunked_request.len() {
         assert!(
-            matches!(Request::parse(&chunked_request[..split]), Ok(None)),
-            "chunked prefix of {split} bytes must return Ok(None)"
+            matches!(
+                Request::capture(&chunked_request[..split]),
+                Ok(ParseStatus::Incomplete)
+            ),
+            "chunked prefix of {split} bytes must return ParseStatus::Incomplete"
         );
     }
 
-    let (chunked_req, chunked_consumed) = Request::parse(chunked_request)
-        .expect("complete chunked request should succeed")
-        .expect("complete chunked request should be complete");
+    let (chunked_req, chunked_consumed) = capture_complete(chunked_request);
     assert_eq!(chunked_consumed, chunked_request.len());
     assert_eq!(chunked_req.body, b"hello, world!");
     assert_eq!(

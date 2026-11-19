@@ -197,64 +197,114 @@ impl Response {
     pub fn write_to(&self, buffer: &mut Vec<u8>) {
         // Reserve enough space up front to avoid multiple growth reallocations on fresh buffers.
         buffer.reserve(96 + self.body.len());
+        let _ = self.write_to_sink(buffer);
+    }
 
-        // Fast static status line dispatch
-        let status_line = match self.status {
-            Status::Ok => b"HTTP/1.1 200 OK\r\n" as &[u8],
-            Status::Created => b"HTTP/1.1 201 Created\r\n",
-            Status::Accepted => b"HTTP/1.1 202 Accepted\r\n",
-            Status::NoContent => b"HTTP/1.1 204 No Content\r\n",
-            Status::BadRequest => b"HTTP/1.1 400 Bad Request\r\n",
-            Status::Unauthorized => b"HTTP/1.1 401 Unauthorized\r\n",
-            Status::Forbidden => b"HTTP/1.1 403 Forbidden\r\n",
-            Status::NotFound => b"HTTP/1.1 404 Not Found\r\n",
-            Status::MethodNotAllowed => b"HTTP/1.1 405 Method Not Allowed\r\n",
-            Status::InternalServerError => b"HTTP/1.1 500 Internal Server Error\r\n",
-            Status::NotImplemented => b"HTTP/1.1 501 Not Implemented\r\n",
-            Status::BadGateway => b"HTTP/1.1 502 Bad Gateway\r\n",
-            Status::ServiceUnavailable => b"HTTP/1.1 503 Service Unavailable\r\n",
-            _ => {
-                buffer.extend_from_slice(b"HTTP/1.1 ");
-                append_usize_fast(buffer, self.status_code() as usize);
-                buffer.extend_from_slice(b" ");
-                buffer.extend_from_slice(self.status_message().as_bytes());
-                b"\r\n"
-            }
+    /// Serialize this response directly into a fixed byte slice without heap allocation.
+    /// Returns `Some(bytes_written)` if the serialized response fits in `dst`, or `None` otherwise.
+    pub(crate) fn write_to_slice(&self, dst: &mut [u8]) -> Option<usize> {
+        let mut sink = SliceSink { dst, pos: 0 };
+        self.write_to_sink(&mut sink).then_some(sink.pos)
+    }
+
+    #[inline]
+    fn write_to_sink<S: ByteSink>(&self, sink: &mut S) -> bool {
+        let static_status: Option<&[u8]> = match self.status {
+            Status::Ok => Some(b"HTTP/1.1 200 OK\r\n"),
+            Status::Created => Some(b"HTTP/1.1 201 Created\r\n"),
+            Status::Accepted => Some(b"HTTP/1.1 202 Accepted\r\n"),
+            Status::NoContent => Some(b"HTTP/1.1 204 No Content\r\n"),
+            Status::BadRequest => Some(b"HTTP/1.1 400 Bad Request\r\n"),
+            Status::Unauthorized => Some(b"HTTP/1.1 401 Unauthorized\r\n"),
+            Status::Forbidden => Some(b"HTTP/1.1 403 Forbidden\r\n"),
+            Status::NotFound => Some(b"HTTP/1.1 404 Not Found\r\n"),
+            Status::MethodNotAllowed => Some(b"HTTP/1.1 405 Method Not Allowed\r\n"),
+            Status::InternalServerError => Some(b"HTTP/1.1 500 Internal Server Error\r\n"),
+            Status::NotImplemented => Some(b"HTTP/1.1 501 Not Implemented\r\n"),
+            Status::BadGateway => Some(b"HTTP/1.1 502 Bad Gateway\r\n"),
+            Status::ServiceUnavailable => Some(b"HTTP/1.1 503 Service Unavailable\r\n"),
+            _ => None,
         };
-        buffer.extend_from_slice(status_line);
 
-        // Fast Content-Length line
-        buffer.extend_from_slice(b"Content-Length: ");
-        append_usize_fast(buffer, self.body.len());
-        buffer.extend_from_slice(b"\r\n");
-
-        // Headers
-        for (k, v) in self.headers.iter() {
-            buffer.extend_from_slice(k.as_bytes());
-            buffer.extend_from_slice(b": ");
-            buffer.extend_from_slice(v.as_bytes());
-            buffer.extend_from_slice(b"\r\n");
+        let mut num_buf = [0u8; 20];
+        if let Some(status_line) = static_status {
+            if !sink.write_bytes(status_line) {
+                return false;
+            }
+        } else if !sink.write_bytes(b"HTTP/1.1 ")
+            || !sink.write_bytes(format_usize_ascii(self.status_code() as usize, &mut num_buf))
+            || !sink.write_bytes(b" ")
+            || !sink.write_bytes(self.status_message().as_bytes())
+            || !sink.write_bytes(b"\r\n")
+        {
+            return false;
         }
 
-        // End of headers and body payload
-        buffer.extend_from_slice(b"\r\n");
-        buffer.extend_from_slice(&self.body);
+        if !sink.write_bytes(b"Content-Length: ")
+            || !sink.write_bytes(format_usize_ascii(self.body.len(), &mut num_buf))
+            || !sink.write_bytes(b"\r\n")
+        {
+            return false;
+        }
+
+        for (k, v) in self.headers.iter() {
+            if !sink.write_bytes(k.as_bytes())
+                || !sink.write_bytes(b": ")
+                || !sink.write_bytes(v.as_bytes())
+                || !sink.write_bytes(b"\r\n")
+            {
+                return false;
+            }
+        }
+
+        sink.write_bytes(b"\r\n") && sink.write_bytes(&self.body)
     }
 }
 
-/// Zero-allocation, fast usize to ASCII serialization directly appending to buffer
-#[inline]
-fn append_usize_fast(buffer: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buffer.push(b'0');
-        return;
+trait ByteSink {
+    fn write_bytes(&mut self, bytes: &[u8]) -> bool;
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
     }
-    let mut temp = [0u8; 20];
+}
+
+struct SliceSink<'a> {
+    dst: &'a mut [u8],
+    pos: usize,
+}
+
+impl ByteSink for SliceSink<'_> {
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) -> bool {
+        let Some(end) = self.pos.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > self.dst.len() {
+            return false;
+        }
+        self.dst[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        true
+    }
+}
+
+/// Zero-allocation, fast usize to ASCII formatting into a fixed stack buffer.
+#[inline]
+fn format_usize_ascii(mut n: usize, temp: &mut [u8; 20]) -> &[u8] {
+    if n == 0 {
+        temp[19] = b'0';
+        return &temp[19..];
+    }
     let mut i = 20;
     while n > 0 {
         i -= 1;
         temp[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    buffer.extend_from_slice(&temp[i..]);
+    &temp[i..]
 }

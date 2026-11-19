@@ -93,7 +93,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::GET, path, handler)
+        self.add_route(Method::Get, path, handler)
     }
 
     /// Register a POST route on this registrar.
@@ -103,7 +103,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::POST, path, handler)
+        self.add_route(Method::Post, path, handler)
     }
 
     /// Register a PUT route on this registrar.
@@ -113,7 +113,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::PUT, path, handler)
+        self.add_route(Method::Put, path, handler)
     }
 
     /// Register a PATCH route on this registrar.
@@ -123,7 +123,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::PATCH, path, handler)
+        self.add_route(Method::Patch, path, handler)
     }
 
     /// Register a DELETE route on this registrar.
@@ -133,7 +133,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::DELETE, path, handler)
+        self.add_route(Method::Delete, path, handler)
     }
 
     /// Register a HEAD route on this registrar.
@@ -143,7 +143,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::HEAD, path, handler)
+        self.add_route(Method::Head, path, handler)
     }
 
     /// Register an OPTIONS route on this registrar.
@@ -153,7 +153,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::OPTIONS, path, handler)
+        self.add_route(Method::Options, path, handler)
     }
 
     /// Register a TRACE route on this registrar.
@@ -163,7 +163,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::TRACE, path, handler)
+        self.add_route(Method::Trace, path, handler)
     }
 
     /// Register a CONNECT route on this registrar.
@@ -173,7 +173,7 @@ impl<'a> PendingRouteRegistrar<'a> {
         Fut: Future<Output = R> + Send + 'static,
         R: Responsable,
     {
-        self.add_route(Method::CONNECT, path, handler)
+        self.add_route(Method::Connect, path, handler)
     }
 
     /// Register a route that responds to all standard HTTP methods.
@@ -184,13 +184,13 @@ impl<'a> PendingRouteRegistrar<'a> {
         R: Responsable,
     {
         let methods = vec![
-            Method::GET,
-            Method::HEAD,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
+            Method::Get,
+            Method::Head,
+            Method::Post,
+            Method::Put,
+            Method::Patch,
+            Method::Delete,
+            Method::Options,
         ];
         let h: HandlerFn = Arc::new(move |req| {
             let fut = handler(req);

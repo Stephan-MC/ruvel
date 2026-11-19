@@ -1,5 +1,6 @@
 use crate::http::{BoxFuture, Method, Request, Response};
 use crate::routing::pipeline::Pipeline;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::mem::MaybeUninit;
@@ -7,8 +8,116 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
 
-/// Maximum number of route parameters supported per route (matches `RouteParams`).
-pub const MAX_ROUTE_PARAMS: usize = 8;
+/// Maximum number of route parameters supported per route (matches `route::Params`).
+/// Defaults to `4`; override at compile time with `RV_MAX_ROUTE_PARAMS`.
+pub const MAX_ROUTE_PARAMS: usize = match option_env!("RV_MAX_ROUTE_PARAMS") {
+    Some(val) => match usize::from_str_radix(val, 10) {
+        Ok(v) if v > 0 => v,
+        _ => 4,
+    },
+    None => 4,
+};
+
+// TODO: Optimize route params storage method
+/// Fixed-capacity, inline route parameter storage to avoid heap HashMap allocations per match.
+pub struct Params {
+    len: usize,
+    entries: [MaybeUninit<(Cow<'static, str>, Cow<'static, str>)>; MAX_ROUTE_PARAMS],
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Params {
+    fn drop(&mut self) {
+        for i in 0..self.len {
+            // SAFETY: `entries[..self.len]` are always initialized before `len` is incremented.
+            unsafe { self.entries[i].assume_init_drop() };
+        }
+    }
+}
+
+impl Clone for Params {
+    fn clone(&self) -> Self {
+        let mut out = Self::new();
+        for i in 0..self.len {
+            // SAFETY: `entries[i]` is initialized for all `i < self.len`.
+            let cloned = unsafe { self.entries[i].assume_init_ref() }.clone();
+            out.entries[i].write(cloned);
+            out.len += 1;
+        }
+        out
+    }
+}
+
+impl std::fmt::Debug for Params {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Params")
+            .field("len", &self.len)
+            .field("entries", &self.as_slice())
+            .finish()
+    }
+}
+
+impl Params {
+    pub const fn new() -> Self {
+        Self {
+            len: 0,
+            entries: [const { MaybeUninit::uninit() }; MAX_ROUTE_PARAMS],
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[(Cow<'static, str>, Cow<'static, str>)] {
+        // SAFETY: `entries[..self.len]` are always initialized via `insert` or `clone`.
+        unsafe { std::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len) }
+    }
+
+    pub fn insert(
+        &mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) {
+        let key_cow = key.into();
+        let val_cow = value.into();
+
+        for i in 0..self.len {
+            // SAFETY: `entries[i]` is initialized for all `i < self.len`.
+            let entry = unsafe { self.entries[i].assume_init_mut() };
+            if entry.0 == key_cow {
+                entry.1 = val_cow;
+                return;
+            }
+        }
+
+        if self.len < MAX_ROUTE_PARAMS {
+            self.entries[self.len].write((key_cow, val_cow));
+            self.len += 1;
+        } else {
+            // TODO: add an appropriate error when maximum route params exceeded
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        for (k, v) in self.as_slice() {
+            if k == key {
+                return Some(v.as_ref());
+            }
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 static INTERNED_PARAM_NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
@@ -231,16 +340,16 @@ impl MethodSlots {
     #[inline]
     fn slot_index(method: &Method) -> Option<usize> {
         match method {
-            Method::GET => Some(0),
-            Method::POST => Some(1),
-            Method::PUT => Some(2),
-            Method::DELETE => Some(3),
-            Method::PATCH => Some(4),
-            Method::HEAD => Some(5),
-            Method::OPTIONS => Some(6),
-            Method::TRACE => Some(7),
-            Method::CONNECT => Some(8),
-            Method::UNKNOWN(_) => None,
+            Method::Get => Some(0),
+            Method::Post => Some(1),
+            Method::Put => Some(2),
+            Method::Delete => Some(3),
+            Method::Patch => Some(4),
+            Method::Head => Some(5),
+            Method::Options => Some(6),
+            Method::Trace => Some(7),
+            Method::Connect => Some(8),
+            Method::Unknown(_) => None,
         }
     }
 
@@ -248,7 +357,7 @@ impl MethodSlots {
         match Self::slot_index(&method) {
             Some(idx) => self.standard[idx] = Some(route),
             None => {
-                if let Method::UNKNOWN(name) = method {
+                if let Method::Unknown(name) = method {
                     let list = self.other.get_or_insert_with(|| Box::new(Vec::new()));
                     if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == name) {
                         *existing = route;
@@ -265,7 +374,7 @@ impl MethodSlots {
         match Self::slot_index(method) {
             Some(idx) => self.standard[idx].as_deref(),
             None => {
-                if let Method::UNKNOWN(name) = method
+                if let Method::Unknown(name) = method
                     && let Some(ref list) = self.other
                 {
                     return list
@@ -388,6 +497,7 @@ impl Segment {
             .iter()
             .filter(|s| parse_param_name(s).is_some())
             .count();
+        // TODO: add an appropriate error when maximum route params exceeded
         assert!(
             param_count <= MAX_ROUTE_PARAMS,
             "Route defines {param_count} parameters, which exceeds the maximum of {MAX_ROUTE_PARAMS}"
