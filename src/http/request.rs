@@ -100,6 +100,12 @@ impl Request {
         self.headers.get(key)
     }
 
+    /// Retrieve all headers as a slice of `(original_key, value)` pairs in insertion order.
+    #[inline]
+    pub fn headers(&self) -> &[(Cow<'static, str>, Cow<'static, str>)] {
+        self.headers.all()
+    }
+
     /// Retrieve a URL parameter by key (e.g., req.param("id")).
     pub fn param(&self, key: &str) -> Option<&str> {
         self.params.get(key)

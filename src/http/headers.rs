@@ -141,6 +141,12 @@ impl HeaderMap {
         self.entries.is_empty()
     }
 
+    /// Return all stored `(original_key, value)` header entries in insertion order.
+    #[inline]
+    pub fn all(&self) -> &[(Cow<'static, str>, Cow<'static, str>)] {
+        &self.entries
+    }
+
     /// Iterator over `(&original_key, &value)`.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
