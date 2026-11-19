@@ -38,6 +38,26 @@ X-Custom-Trace: abc-123\r\n\
     assert_eq!(req.header("Accept"), Some("*/*"));
     assert_eq!(req.header("Connection"), Some("keep-alive"));
     assert_eq!(req.header("x-custom-trace"), Some("abc-123"));
+    assert_eq!(req.headers(), req.headers.all());
+    assert_eq!(
+        req.headers(),
+        &[
+            (
+                Cow::Borrowed("host"),
+                Cow::Owned("localhost:7883".to_string())
+            ),
+            (
+                Cow::Borrowed("USER-AGENT"),
+                Cow::Owned("wrk/4.2".to_string())
+            ),
+            (Cow::Borrowed("Accept"), Cow::Borrowed("*/*")),
+            (Cow::Borrowed("Connection"), Cow::Borrowed("keep-alive")),
+            (
+                Cow::Borrowed("X-Custom-Trace"),
+                Cow::Owned("abc-123".to_string())
+            ),
+        ]
+    );
     assert!(req.body.is_empty());
 }
 
@@ -161,6 +181,19 @@ fn test_header_map_multi_value_singleton_overwrite_and_case_preservation() {
             ("X-Custom", "one"),
             ("x-custom", "two"),
             ("content-type", "application/json"),
+        ]
+    );
+    assert_eq!(
+        headers.all(),
+        &[
+            (Cow::Borrowed("Set-Cookie"), Cow::Borrowed("a=1")),
+            (Cow::Borrowed("set-cookie"), Cow::Borrowed("b=2")),
+            (Cow::Borrowed("X-Custom"), Cow::Borrowed("one")),
+            (Cow::Borrowed("x-custom"), Cow::Borrowed("two")),
+            (
+                Cow::Borrowed("content-type"),
+                Cow::Borrowed("application/json")
+            ),
         ]
     );
 
