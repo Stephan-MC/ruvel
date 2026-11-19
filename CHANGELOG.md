@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.11.0...ruvel-v0.11.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **request:** added function to retrieve all headers on the request ([26f07c1](https://github.com/Stephan-MC/ruvel/commit/26f07c15de619d4696578a9047ca2a69430927f6))
+
 ## [0.11.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.10.1...ruvel-v0.11.0) (2026-11-19)
 
 
