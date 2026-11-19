@@ -4,7 +4,7 @@ pub use framing::H1Cursor;
 
 use crate::http::{
     Method,
-    parser::{Error, Header, Headers, HttpVersion, Parser, Request, Status, semantics},
+    parser::{Error, Header, Headers, HttpVersion, ParsedRequest, Parser, Status, semantics},
 };
 use framing::{BodyFraming, FramingMeta};
 
@@ -14,22 +14,22 @@ const LEADING_CRLF_LIMIT: Option<usize> = None;
 
 pub struct H1;
 
-impl<const H: usize> Parser<H> for H1 {
-    type Request<'a> = Request<'a, H>;
+impl Parser for H1 {
+    type Output<'a> = ParsedRequest<'a>;
 
-    fn parse<'a>(buf: &'a [u8]) -> Result<Status<Self::Request<'a>>, Error<'a>> {
+    fn parse<'a>(buf: &'a [u8]) -> Result<Status<Self::Output<'a>>, Error<'a>> {
         let Some(bounds) = find_head_end(buf)? else {
             return Ok(Status::Incomplete);
         };
 
-        let head = parse_head_only::<H>(buf, bounds)?;
+        let head = parse_head_only(buf, bounds)?;
         let body_start = bounds.header_end + 4;
         let Some((body, consumed)) = framing::extract_body(buf, body_start, head.framing)? else {
             return Ok(Status::Incomplete);
         };
 
         Ok(Status::Complete(
-            Request {
+            ParsedRequest {
                 method: head.method,
                 query: head.query,
                 path: head.path,
@@ -44,10 +44,10 @@ impl<const H: usize> Parser<H> for H1 {
 
 impl H1 {
     /// Incrementally parses an HTTP/1.x request across fragmented TCP reads using `cursor`.
-    pub fn parse_incremental<'a, const H: usize>(
+    pub fn parse_incremental<'a>(
         buf: &'a [u8],
         cursor: &mut H1Cursor,
-    ) -> Result<Status<Request<'a, H>>, Error<'a>> {
+    ) -> Result<Status<ParsedRequest<'a>>, Error<'a>> {
         let (bounds, framing) =
             if let (Some(header_end), Some(framing)) = (cursor.header_end, cursor.framing) {
                 if header_end + 4 > buf.len() {
@@ -65,7 +65,7 @@ impl H1 {
                 let Some(bounds) = find_head_end_with_cursor(buf, cursor)? else {
                     return Ok(Status::Incomplete);
                 };
-                let head = parse_head_only::<H>(buf, bounds)?;
+                let head = parse_head_only(buf, bounds)?;
                 cursor.head_start = bounds.head_start;
                 cursor.first_crlf = bounds.first_crlf;
                 cursor.header_end = Some(bounds.header_end);
@@ -80,9 +80,9 @@ impl H1 {
             return Ok(Status::Incomplete);
         };
 
-        let head = parse_head_only::<H>(buf, bounds)?;
+        let head = parse_head_only(buf, bounds)?;
         Ok(Status::Complete(
-            Request {
+            ParsedRequest {
                 method: head.method,
                 query: head.query,
                 path: head.path,
@@ -102,12 +102,12 @@ struct HeadBounds {
     header_end: usize,
 }
 
-struct ParsedHead<'a, const H: usize> {
+struct ParsedHead<'a> {
     method: Method,
     path: &'a str,
     query: &'a str,
     version: HttpVersion,
-    headers: Headers<'a, H>,
+    headers: Headers<'a>,
     framing: BodyFraming,
 }
 
@@ -118,10 +118,7 @@ enum HostState<'a> {
     Duplicate,
 }
 
-fn parse_head_only<'a, const H: usize>(
-    buf: &'a [u8],
-    bounds: HeadBounds,
-) -> Result<ParsedHead<'a, H>, Error<'a>> {
+fn parse_head_only<'a>(buf: &'a [u8], bounds: HeadBounds) -> Result<ParsedHead<'a>, Error<'a>> {
     let (request_line, header_bytes) = match bounds.first_crlf {
         Some(crlf) => (
             &buf[bounds.head_start..crlf],
@@ -487,15 +484,16 @@ pub(super) fn parse_header_line(line: &str) -> Result<Header<'_>, Error<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::parser::MAX_HEADERS;
 
-    fn parse_h1<const N: usize>(buf: &[u8]) -> Result<Status<Request<'_, N>>, Error<'_>> {
-        <H1 as Parser<N>>::parse(buf)
+    fn parse_h1(buf: &[u8]) -> Result<Status<ParsedRequest<'_>>, Error<'_>> {
+        H1::parse(buf)
     }
 
     #[test]
     fn parses_bodyless_request_without_headers_and_returns_exact_consumed() {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
-        let res = parse_h1::<8>(raw).expect("valid request");
+        let res = parse_h1(raw).expect("valid request");
         let Status::Complete(req, consumed) = res else {
             panic!("expected complete frame");
         };
@@ -516,7 +514,7 @@ mod tests {
         let mut raw = head.to_vec();
         raw.extend_from_slice(b"GET /next HTTP/1.1\r\n\r\n");
 
-        let res = parse_h1::<8>(&raw).expect("valid request");
+        let res = parse_h1(&raw).expect("valid request");
         let Status::Complete(req, consumed) = res else {
             panic!("expected complete frame");
         };
@@ -545,22 +543,26 @@ mod tests {
     #[test]
     fn returns_incomplete_on_fragmented_head() {
         assert_eq!(
-            parse_h1::<8>(b"GET / HTTP/1.1\r\nHost: a\r\n\r"),
+            parse_h1(b"GET / HTTP/1.1\r\nHost: a\r\n\r"),
             Ok(Status::Incomplete)
         );
-        assert_eq!(parse_h1::<8>(b"GET / HTTP/1.1\r"), Ok(Status::Incomplete));
-        assert_eq!(parse_h1::<8>(b""), Ok(Status::Incomplete));
+        assert_eq!(parse_h1(b"GET / HTTP/1.1\r"), Ok(Status::Incomplete));
+        assert_eq!(parse_h1(b""), Ok(Status::Incomplete));
     }
 
     #[test]
     fn rejects_too_many_headers_instead_of_panicking() {
-        let raw = b"GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n";
-        assert_eq!(parse_h1::<1>(raw), Err(Error::TooManyHeaders));
+        let mut raw = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+        for i in 0..MAX_HEADERS {
+            raw.extend_from_slice(format!("X-H{i}: 1\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+        assert_eq!(parse_h1(&raw), Err(Error::TooManyHeaders));
     }
 
     #[test]
     fn accepts_valid_target_forms_and_extension_methods() {
-        let options = parse_h1::<4>(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let options = parse_h1(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let Status::Complete(req, _) = options else {
             panic!("expected complete");
         };
@@ -569,15 +571,14 @@ mod tests {
         assert_eq!(req.query, "");
 
         let connect =
-            parse_h1::<4>(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-                .unwrap();
+            parse_h1(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").unwrap();
         let Status::Complete(req, _) = connect else {
             panic!("expected complete");
         };
         assert_eq!(req.method, Method::Connect);
         assert_eq!(req.path, "example.com:443");
 
-        let abs = parse_h1::<4>(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n").unwrap();
+        let abs = parse_h1(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n").unwrap();
         let Status::Complete(req, _) = abs else {
             panic!("expected complete");
         };
@@ -588,64 +589,58 @@ mod tests {
     #[test]
     fn rejects_bare_cr_or_lf_in_head() {
         assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/1.1\n\r\n"),
+            parse_h1(b"GET / HTTP/1.1\n\r\n"),
             Err(Error::InvalidRequestLine)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/1.1\rX\r\n\r\n"),
+            parse_h1(b"GET / HTTP/1.1\rX\r\n\r\n"),
             Err(Error::InvalidRequestLine)
         );
         assert!(matches!(
-            parse_h1::<4>(b"GET / HTTP/1.1\r\nHost: a\n\r\n"),
+            parse_h1(b"GET / HTTP/1.1\r\nHost: a\n\r\n"),
             Err(Error::InvalidHeader(_))
         ));
     }
 
     #[test]
     fn rejects_invalid_request_lines_methods_uris_and_versions() {
-        assert_eq!(parse_h1::<4>(b"\r\n\r\n"), Err(Error::InvalidRequestLine));
+        assert_eq!(parse_h1(b"\r\n\r\n"), Err(Error::InvalidRequestLine));
         assert_eq!(
-            parse_h1::<4>(b"GET  / HTTP/1.1\r\n\r\n"),
+            parse_h1(b"GET  / HTTP/1.1\r\n\r\n"),
             Err(Error::InvalidRequestLine)
         );
+        assert_eq!(parse_h1(b"GET /\r\n\r\n"), Err(Error::InvalidRequestLine));
         assert_eq!(
-            parse_h1::<4>(b"GET /\r\n\r\n"),
-            Err(Error::InvalidRequestLine)
-        );
-        assert_eq!(
-            parse_h1::<4>(b"BAD\tMETHOD / HTTP/1.1\r\n\r\n"),
+            parse_h1(b"BAD\tMETHOD / HTTP/1.1\r\n\r\n"),
             Err(Error::InvalidMethod)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET /bad#frag HTTP/1.1\r\n\r\n"),
+            parse_h1(b"GET /bad#frag HTTP/1.1\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET /bad%ZZ HTTP/1.1\r\n\r\n"),
+            parse_h1(b"GET /bad%ZZ HTTP/1.1\r\n\r\n"),
+            Err(Error::InvalidUri)
+        );
+        assert_eq!(parse_h1(b"GET * HTTP/1.1\r\n\r\n"), Err(Error::InvalidUri));
+        assert_eq!(
+            parse_h1(b"GET foo HTTP/1.1\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET * HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1::<4>(b"GET foo HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/2\r\n\r\n"),
+            parse_h1(b"GET / HTTP/2\r\n\r\n"),
             Err(Error::UnsupportedProtocol)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/2.0\r\n\r\n"),
+            parse_h1(b"GET / HTTP/2.0\r\n\r\n"),
             Err(Error::UnsupportedProtocol)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET / GARBAGE\r\n\r\n"),
+            parse_h1(b"GET / GARBAGE\r\n\r\n"),
             Err(Error::InvalidVersion)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET / http/1.1\r\n\r\n"),
+            parse_h1(b"GET / http/1.1\r\n\r\n"),
             Err(Error::InvalidVersion)
         );
     }
@@ -653,8 +648,7 @@ mod tests {
     #[test]
     fn validates_absolute_form_authority_connect_ports_and_host_headers() {
         let Status::Complete(root_abs, _) =
-            parse_h1::<4>(b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-                .unwrap()
+            parse_h1(b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap()
         else {
             panic!("expected complete");
         };
@@ -662,35 +656,32 @@ mod tests {
         assert_eq!(root_abs.query, "a=1");
 
         assert_eq!(
-            parse_h1::<4>(b"GET http://user@example.com/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            parse_h1(b"GET http://user@example.com/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET http://example.com:0/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            parse_h1(b"GET http://example.com:0/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"CONNECT example.com:0 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            parse_h1(b"CONNECT example.com:0 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"CONNECT example.com:080 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            parse_h1(b"CONNECT example.com:080 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Err(Error::InvalidUri)
         );
         assert_eq!(
-            parse_h1::<4>(b"CONNECT example.com:65536 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            parse_h1(b"CONNECT example.com:65536 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Err(Error::InvalidUri)
         );
+        assert_eq!(parse_h1(b"GET / HTTP/1.1\r\n\r\n"), Err(Error::MissingHost));
         assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/1.1\r\n\r\n"),
-            Err(Error::MissingHost)
-        );
-        assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+            parse_h1(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
             Err(Error::InvalidHost)
         );
         assert_eq!(
-            parse_h1::<4>(b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n"),
+            parse_h1(b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n"),
             Err(Error::InvalidHost)
         );
     }
@@ -698,7 +689,7 @@ mod tests {
     #[test]
     fn validates_ordered_transfer_encoding_and_rejects_smuggling() {
         let ok_ordered = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_h1::<8>(ok_ordered).unwrap() else {
+        let Status::Complete(req, consumed) = parse_h1(ok_ordered).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(req.body.as_ref(), b"hello");
@@ -712,14 +703,14 @@ mod tests {
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n"[..],
             &b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
         ] {
-            assert!(matches!(parse_h1::<8>(bad), Err(Error::InvalidHeader(_))));
+            assert!(matches!(parse_h1(bad), Err(Error::InvalidHeader(_))));
         }
     }
 
     #[test]
     fn validates_chunk_extensions_trailers_and_multi_chunk_decode() {
         let quoted_ext = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\"a\\\"b\";flag\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_h1::<8>(quoted_ext).unwrap() else {
+        let Status::Complete(req, consumed) = parse_h1(quoted_ext).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(req.body.as_ref(), b"hello");
@@ -731,7 +722,7 @@ mod tests {
             many.extend_from_slice(b"1\r\nx\r\n");
         }
         many.extend_from_slice(b"0\r\n\r\n");
-        let Status::Complete(many_req, many_consumed) = parse_h1::<8>(&many).unwrap() else {
+        let Status::Complete(many_req, many_consumed) = parse_h1(&many).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(many_req.body.as_ref(), &[b'x'; 20]);
@@ -742,14 +733,14 @@ mod tests {
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;a=\r\nhello\r\n0\r\n\r\n"[..],
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;bad name=1\r\nhello\r\n0\r\n\r\n"[..],
         ] {
-            assert_eq!(parse_h1::<8>(bad_ext), Err(Error::InvalidBody));
+            assert_eq!(parse_h1(bad_ext), Err(Error::InvalidBody));
         }
 
         let mut oversized_ext =
             b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
         oversized_ext.extend_from_slice(&[b'a'; 1025]);
         oversized_ext.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
-        assert_eq!(parse_h1::<8>(&oversized_ext), Err(Error::InvalidBody));
+        assert_eq!(parse_h1(&oversized_ext), Err(Error::InvalidBody));
 
         for forbidden_trailer in [
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nAuthorization: Bearer x\r\n\r\n"[..],
@@ -757,7 +748,7 @@ mod tests {
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Type: text/plain\r\n\r\n"[..],
         ] {
             assert!(matches!(
-                parse_h1::<8>(forbidden_trailer),
+                parse_h1(forbidden_trailer),
                 Err(Error::InvalidHeader(_))
             ));
         }
@@ -770,13 +761,13 @@ mod tests {
 
         for split in 0..raw.len() {
             assert_eq!(
-                H1::parse_incremental::<8>(&raw[..split], &mut cursor),
+                H1::parse_incremental(&raw[..split], &mut cursor),
                 Ok(Status::Incomplete),
                 "split at byte {split} must be incomplete"
             );
         }
 
-        let Status::Complete(req, consumed) = H1::parse_incremental::<8>(raw, &mut cursor).unwrap()
+        let Status::Complete(req, consumed) = H1::parse_incremental(raw, &mut cursor).unwrap()
         else {
             panic!("expected complete frame");
         };

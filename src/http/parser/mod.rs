@@ -38,14 +38,13 @@ pub const MAX_HEADERS_SIZE: usize = match option_env!("RV_MAX_HEADERS_SIZE") {
 };
 
 /// Universal Protocol Parser Trait for Ruvel.
-/// const `H` shows the number of headers per request
-pub trait Parser<const H: usize> {
-    type Request<'a>;
+pub trait Parser {
+    type Output<'a>;
 
-    /// Parses a raw byte buffer into a request representation.
-    /// Returns `Ok(Status::Complete(Request, bytes_consumed))`,
-    /// `Ok(Status::Incomplete)` on fragmented TCP reads, or `Err(ParseError)`.
-    fn parse<'a>(buf: &'a [u8]) -> Result<Status<Self::Request<'a>>, parser::Error<'a>>;
+    /// Parses a raw byte buffer into a zero-copy parsed wire representation.
+    /// Returns `Ok(Status::Complete(Output, bytes_consumed))`,
+    /// `Ok(Status::Incomplete)` on fragmented TCP reads, or `Err(Error)`.
+    fn parse<'a>(buf: &'a [u8]) -> Result<Status<Self::Output<'a>>, parser::Error<'a>>;
 }
 
 /// Protocol version detected or negotiated by a parser.
@@ -79,31 +78,31 @@ pub struct Header<'a> {
 
 /// Fixed-capacity inline header storage without heap allocation or initializing unused slots.
 #[derive(Copy, Clone)]
-pub struct Headers<'a, const N: usize> {
+pub struct Headers<'a> {
     len: usize,
-    entries: [MaybeUninit<Header<'a>>; N],
+    entries: [MaybeUninit<Header<'a>>; MAX_HEADERS],
 }
 
-impl<'a, const N: usize> Default for Headers<'a, N> {
+impl<'a> Default for Headers<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a, const N: usize> Headers<'a, N> {
+impl<'a> Headers<'a> {
     /// Creates an empty inline header buffer without initializing backing array slots.
     #[inline]
     pub const fn new() -> Self {
         Self {
             len: 0,
-            entries: [const { MaybeUninit::uninit() }; N],
+            entries: [const { MaybeUninit::uninit() }; MAX_HEADERS],
         }
     }
 
-    /// Appends a parsed header, returning `Err(Error::TooManyHeaders)` if at capacity `N`.
+    /// Appends a parsed header, returning `Err(Error::TooManyHeaders)` if at [`MAX_HEADERS`].
     #[inline]
     pub fn push(&mut self, header: Header<'a>) -> Result<(), Error<'a>> {
-        if self.len >= N {
+        if self.len >= MAX_HEADERS {
             return Err(Error::TooManyHeaders);
         }
         self.entries[self.len].write(header);
@@ -128,7 +127,7 @@ impl<'a, const N: usize> Headers<'a, N> {
     }
 }
 
-impl<'a, const N: usize> Deref for Headers<'a, N> {
+impl<'a> Deref for Headers<'a> {
     type Target = [Header<'a>];
 
     #[inline]
@@ -137,7 +136,7 @@ impl<'a, const N: usize> Deref for Headers<'a, N> {
     }
 }
 
-impl<'a, 'b, const N: usize> IntoIterator for &'b Headers<'a, N> {
+impl<'a, 'b> IntoIterator for &'b Headers<'a> {
     type Item = &'b Header<'a>;
     type IntoIter = std::slice::Iter<'b, Header<'a>>;
 
@@ -147,31 +146,32 @@ impl<'a, 'b, const N: usize> IntoIterator for &'b Headers<'a, N> {
     }
 }
 
-impl<'a, const N: usize> PartialEq for Headers<'a, N> {
+impl<'a> PartialEq for Headers<'a> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<'a, const N: usize> Eq for Headers<'a, N> {}
+impl<'a> Eq for Headers<'a> {}
 
-impl<'a, const N: usize> std::fmt::Debug for Headers<'a, N> {
+impl<'a> std::fmt::Debug for Headers<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.as_slice().fmt(f)
     }
 }
 
-/// Zero-copy parsed HTTP request backed by the caller's socket read buffer.
+/// Zero-copy parsed HTTP request wire data backed by the caller's socket read buffer.
 ///
-/// Stack size scales linearly with header capacity `N` (`~32 * N + 96` bytes on 64-bit targets,
-/// ~1.1 KB for `N = 32` or ~2.1 KB for `N = 64`), so keep `N` bounded in async `.await` futures.
+/// Stack size scales linearly with [`MAX_HEADERS`] (`~32 * MAX_HEADERS + 96` bytes on 64-bit
+/// targets; ~2.1 KB at the default `64`). Convert into [`crate::http::Request`] via
+/// [`crate::http::Request::capture`].
 #[derive(Debug, PartialEq, Eq)]
-pub struct Request<'a, const H: usize = MAX_HEADERS> {
+pub struct ParsedRequest<'a> {
     pub method: Method,
     pub query: &'a str,
     pub path: &'a str,
     pub version: HttpVersion,
-    pub headers: Headers<'a, H>,
+    pub headers: Headers<'a>,
     pub body: Cow<'a, [u8]>,
 }

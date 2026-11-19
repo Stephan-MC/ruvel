@@ -3,6 +3,7 @@
 //! Run: `cargo bench --bench http`
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use ruvel::http::parser::Status as ParseStatus;
 use ruvel::http::{Kernel, Request, Response};
 use ruvel::routing::Router;
 use std::future::Future;
@@ -50,20 +51,23 @@ fn poll_ready<F: Future<Output = Response>>(fut: F) -> Response {
     }
 }
 
+fn capture_complete(buf: &[u8]) -> (Request, usize) {
+    match Request::capture(buf).unwrap() {
+        ParseStatus::Complete(req, consumed) => (req, consumed),
+        ParseStatus::Incomplete => panic!("benchmark buffer unexpectedly incomplete"),
+    }
+}
+
 fn bench_http(c: &mut Criterion) {
     let mut parse_group = c.benchmark_group("request_parse");
     parse_group.bench_function("get_10_headers", |b| {
-        b.iter(|| Request::parse(black_box(GET_10_HEADERS)).unwrap().unwrap())
+        b.iter(|| capture_complete(black_box(GET_10_HEADERS)))
     });
     parse_group.bench_function("get_root_minimal", |b| {
-        b.iter(|| {
-            Request::parse(black_box(GET_ROOT_MINIMAL))
-                .unwrap()
-                .unwrap()
-        })
+        b.iter(|| capture_complete(black_box(GET_ROOT_MINIMAL)))
     });
     parse_group.bench_function("post_json", |b| {
-        b.iter(|| Request::parse(black_box(POST_JSON)).unwrap().unwrap())
+        b.iter(|| capture_complete(black_box(POST_JSON)))
     });
 
     let mut pipelined = Vec::with_capacity(GET_10_HEADERS.len() * 8);
@@ -76,7 +80,7 @@ fn bench_http(c: &mut Criterion) {
             let mut offset = 0;
             let mut count = 0usize;
             while offset < buf.len() {
-                let (req, consumed) = Request::parse(&buf[offset..]).unwrap().unwrap();
+                let (req, consumed) = capture_complete(&buf[offset..]);
                 black_box(req);
                 offset += consumed;
                 count += 1;
@@ -118,9 +122,7 @@ fn bench_http(c: &mut Criterion) {
     roundtrip_group.bench_function("static_root_minimal", |b| {
         b.iter(|| {
             out.clear();
-            let (req, _) = Request::parse(black_box(GET_ROOT_MINIMAL))
-                .unwrap()
-                .unwrap();
+            let (req, _) = capture_complete(black_box(GET_ROOT_MINIMAL));
             let res = poll_ready(kernel.handle(req));
             res.write_to(&mut out);
             out.len()
@@ -129,7 +131,7 @@ fn bench_http(c: &mut Criterion) {
     roundtrip_group.bench_function("param_10_headers", |b| {
         b.iter(|| {
             out.clear();
-            let (req, _) = Request::parse(black_box(GET_10_HEADERS)).unwrap().unwrap();
+            let (req, _) = capture_complete(black_box(GET_10_HEADERS));
             let res = poll_ready(kernel.handle(req));
             res.write_to(&mut out);
             out.len()

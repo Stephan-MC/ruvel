@@ -6,6 +6,7 @@ use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
+use crate::http::parser::{HttpVersion, Status as ParseStatus, h1::H1Cursor};
 use crate::http::{Kernel, Request};
 use crate::routing::{Router, RoutingServiceProvider};
 use crate::support::{LogServiceProvider, ServiceProvider};
@@ -13,20 +14,23 @@ use crate::support::{LogServiceProvider, ServiceProvider};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+const RV_REQUEST_BUFFER_SIZE: usize = 8 * 1024;
+const RV_RESPONSE_BUFFER_SIZE: usize = 4 * 1024;
+
 const REQUEST_BUFFER_SIZE: usize = match option_env!("RV_REQUEST_BUFFER_SIZE") {
     Some(s) => match usize::from_str_radix(s, 10) {
         Ok(v) if v > 0 => v,
-        _ => 8 * 1024,
+        _ => RV_REQUEST_BUFFER_SIZE,
     },
-    None => 8 * 1024,
+    None => RV_REQUEST_BUFFER_SIZE,
 };
 
 const RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
     Some(s) => match usize::from_str_radix(s, 10) {
         Ok(v) if v > 0 => v,
-        _ => 4096,
+        _ => RV_RESPONSE_BUFFER_SIZE,
     },
-    None => 4096,
+    None => RV_RESPONSE_BUFFER_SIZE,
 };
 
 #[derive(Default)]
@@ -170,17 +174,19 @@ impl Application {
         self.serve(listener).await
     }
 
-    /// Serve HTTP/1.1 connections on an already-bound [`TcpListener`].
+    /// Serve HTTP/1.x connections on an already-bound [`TcpListener`].
     ///
     /// Each accepted connection maintains a streaming read buffer (`read_buffer`) and batch cursor
     /// (`read_pos`) to handle keep-alive, HTTP/1.1 pipelining, and arbitrary TCP fragmentation:
-    /// - When [`Request::parse`] returns `Ok(None)`, any unparsed tail bytes are compacted to the
-    ///   front of `read_buffer` so the next bounded `read_buf` call can append trailing TCP fragments.
-    /// - When [`Request::parse`] returns `Ok(Some((req, consumed)))`, `read_pos` advances by
-    ///   `consumed` and any remaining bytes in `read_buffer` are immediately parsed as pipelined
-    ///   requests before flushing `response_buffer` in a single `write_all` call.
-    /// - When [`Request::parse`] returns `Err(())`, any already-queued pipelined responses plus an
-    ///   `HTTP/1.1 400 Bad Request` (`Connection: close`) response are flushed and the socket closes.
+    /// - When [`Request::capture_incremental`] returns `Ok(ParseStatus::Incomplete)`, any unparsed
+    ///   tail bytes are compacted to the front of `read_buffer` so the next bounded `read` call
+    ///   can append trailing TCP fragments while preserving `H1Cursor` progress.
+    /// - When [`Request::capture_incremental`] returns `Ok(ParseStatus::Complete(req, consumed))`,
+    ///   `read_pos` advances by `consumed` and any remaining bytes in `read_buffer` are immediately
+    ///   parsed as pipelined requests before flushing `response_buffer` in a single `write_all` call.
+    /// - When [`Request::capture_incremental`] returns `Err(_)`, any already-queued pipelined
+    ///   responses plus an `HTTP/1.1 400 Bad Request` (`Connection: close`) response are flushed
+    ///   and the socket closes.
     pub async fn serve(mut self, listener: TcpListener) -> Result<(), Box<dyn Error>> {
         // 1. Ensure all providers are booted before accepting traffic
         self.boot();
@@ -201,6 +207,7 @@ impl Application {
                 let mut read_len = 0usize;
                 let mut response_buffer = [0u8; RESPONSE_BUFFER_SIZE];
                 let mut resp_len = 0usize;
+                let mut cursor = H1Cursor::new();
 
                 'connection: loop {
                     if read_len >= REQUEST_BUFFER_SIZE {
@@ -216,14 +223,18 @@ impl Application {
                             let mut close_connection = false;
 
                             while read_pos < read_len {
-                                let (req, consumed) = match Request::parse(
+                                let (req, consumed) = match Request::capture_incremental(
                                     &read_buffer[read_pos..read_len],
+                                    &mut cursor,
                                 ) {
-                                    Ok(Some(parsed)) => parsed,
+                                    Ok(ParseStatus::Complete(req, consumed)) => {
+                                        cursor.reset();
+                                        (req, consumed)
+                                    }
                                     // Partial frame (split headers, Content-Length body, or chunked
                                     // payload): preserve `&read_buffer[read_pos..read_len]` for the next read.
-                                    Ok(None) => break,
-                                    Err(()) => {
+                                    Ok(ParseStatus::Incomplete) => break,
+                                    Err(_) => {
                                         if resp_len > 0
                                             && socket
                                                 .write_all(&response_buffer[..resp_len])
@@ -247,13 +258,16 @@ impl Application {
                                     break 'connection;
                                 };
 
-                                let req_wants_close =
-                                    should_close_connection(req.header("Connection"));
+                                let req_wants_close = should_close_request_connection(
+                                    req.version,
+                                    req.headers.get_all("Connection"),
+                                );
 
                                 // Dispatch request through HTTP Kernel
                                 let response = kernel_clone.handle(req).await;
-                                let res_wants_close =
-                                    should_close_connection(response.headers.get("Connection"));
+                                let res_wants_close = should_close_response_connection(
+                                    response.headers.get_all("Connection"),
+                                );
 
                                 // Serialize response into the fixed write buffer, flushing early if needed.
                                 if let Some(written) =
@@ -324,13 +338,36 @@ impl Application {
     }
 }
 
-/// Returns `true` when a `Connection` header value contains the `"close"` token
-/// (case-insensitive, comma-separated per RFC 9110 §7.6.1).
-fn should_close_connection(value: Option<&str>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    value
-        .split(',')
-        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+/// Returns `(has_close, has_keep_alive)` across comma-separated `Connection` header values.
+fn connection_token_flags<'a>(values: impl Iterator<Item = &'a str>) -> (bool, bool) {
+    let mut has_close = false;
+    let mut has_keep_alive = false;
+
+    for value in values {
+        for token in value.split(',') {
+            let trimmed = token.trim();
+            if trimmed.eq_ignore_ascii_case("close") {
+                has_close = true;
+            } else if trimmed.eq_ignore_ascii_case("keep-alive") {
+                has_keep_alive = true;
+            }
+        }
+    }
+
+    (has_close, has_keep_alive)
+}
+
+fn should_close_request_connection<'a>(
+    version: HttpVersion,
+    values: impl Iterator<Item = &'a str>,
+) -> bool {
+    let (has_close, has_keep_alive) = connection_token_flags(values);
+    if has_close {
+        return true;
+    }
+    version == HttpVersion::Http1_0 && !has_keep_alive
+}
+
+fn should_close_response_connection<'a>(values: impl Iterator<Item = &'a str>) -> bool {
+    connection_token_flags(values).0
 }
