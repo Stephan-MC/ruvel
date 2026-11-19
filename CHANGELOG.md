@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.10.1...ruvel-v0.11.0) (2026-11-19)
+
+
+### Features
+
+* **http:** integrate H1 parser via Request::capture and remove httparse ([398272f](https://github.com/Stephan-MC/ruvel/commit/398272fe63cdbd0afc492bc90daa8f76b45837ca))
+* Implemented custom HTTP/1.x parser ([f6ea41b](https://github.com/Stephan-MC/ruvel/commit/f6ea41b850e8eb3c29ffa20e273117c03a594533))
+* Implemented Custom parser with Audit ([688dc7c](https://github.com/Stephan-MC/ruvel/commit/688dc7c6b0cb6993f28fd0eb2f2df8579a4bb4da))
+* User's can now set request/response sizes via the RV_*_BUFFER_SIZE env vars ([9592090](https://github.com/Stephan-MC/ruvel/commit/95920900b3a25dad99949543cb81eb0e0a58144a))
+
+
+### Bug Fixes
+
+* Moved http methods to a separate module. ([be87517](https://github.com/Stephan-MC/ruvel/commit/be8751745612205c330c123e361b859b777b8454))
+* Moved http methods to a separate module. ([578ea85](https://github.com/Stephan-MC/ruvel/commit/578ea858c6e0f5092a8a04a8eef6081d045b9453))
+
 ## [0.10.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.10.0...ruvel-v0.10.1) (2026-11-15)
 
 
