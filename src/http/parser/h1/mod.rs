@@ -4,7 +4,10 @@ pub use framing::H1Cursor;
 
 use crate::http::{
     Method,
-    parser::{Error, Header, Headers, HttpVersion, ParsedRequest, Parser, Status, semantics},
+    parser::{
+        Error, Header, Headers, HttpVersion, MAX_HEADERS_SIZE, ParsedRequest, Parser, Status,
+        semantics,
+    },
 };
 use framing::{BodyFraming, FramingMeta};
 
@@ -70,6 +73,8 @@ impl H1 {
                 cursor.first_crlf = bounds.first_crlf;
                 cursor.header_end = Some(bounds.header_end);
                 cursor.framing = Some(head.framing);
+                cursor.expect_100_continue =
+                    head.expect_100_continue && bounds.header_end + 4 == buf.len();
                 (bounds, head.framing)
             };
 
@@ -109,6 +114,7 @@ struct ParsedHead<'a> {
     version: HttpVersion,
     headers: Headers<'a>,
     framing: BodyFraming,
+    expect_100_continue: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -132,6 +138,7 @@ fn parse_head_only<'a>(buf: &'a [u8], bounds: HeadBounds) -> Result<ParsedHead<'
     let mut headers = Headers::new();
     let mut host_state = HostState::Missing;
     let mut framing_meta = FramingMeta::default();
+    let mut expect_100_continue = false;
 
     if !header_bytes.is_empty() {
         let headers_str = std::str::from_utf8(header_bytes).map_err(|_| {
@@ -156,6 +163,14 @@ fn parse_head_only<'a>(buf: &'a [u8], bounds: HeadBounds) -> Result<ParsedHead<'
                     HostState::Missing => HostState::Single(header.value),
                     HostState::Single(_) | HostState::Duplicate => HostState::Duplicate,
                 };
+            } else if header.name.len() == 6 && header.name.eq_ignore_ascii_case("expect") {
+                if header.value.eq_ignore_ascii_case("100-continue") {
+                    if version == HttpVersion::Http1_1 {
+                        expect_100_continue = true;
+                    }
+                } else {
+                    return Err(Error::ExpectationFailed);
+                }
             } else {
                 framing_meta.observe_header(version, header)?;
             }
@@ -174,6 +189,7 @@ fn parse_head_only<'a>(buf: &'a [u8], bounds: HeadBounds) -> Result<ParsedHead<'
         version,
         headers,
         framing,
+        expect_100_continue,
     })
 }
 
@@ -234,11 +250,13 @@ fn scan_head_bounds(
         *scan_pos = *head_start;
     }
 
-    let mut i = (*scan_pos).min(buf.len());
+    let max_end = (*head_start).saturating_add(MAX_HEADERS_SIZE);
+    let scan_buf = &buf[..buf.len().min(max_end)];
+    let mut i = (*scan_pos).min(scan_buf.len());
 
-    while let Some(pos) = semantics::find_cr_or_lf(buf, i) {
+    while let Some(pos) = semantics::find_cr_or_lf(scan_buf, i) {
         let in_headers = first_crlf.is_some();
-        if buf[pos] == b'\n' {
+        if scan_buf[pos] == b'\n' {
             return Err(if in_headers {
                 Error::InvalidHeader(Header {
                     name: "",
@@ -249,11 +267,14 @@ fn scan_head_bounds(
             });
         }
 
-        if pos + 1 >= buf.len() {
+        if pos + 1 >= scan_buf.len() {
+            if buf.len() >= max_end {
+                return Err(Error::HeadersTooLarge);
+            }
             *scan_pos = pos;
             return Ok(None);
         }
-        if buf[pos + 1] != b'\n' {
+        if scan_buf[pos + 1] != b'\n' {
             return Err(if in_headers {
                 Error::InvalidHeader(Header {
                     name: "",
@@ -264,8 +285,8 @@ fn scan_head_bounds(
             });
         }
 
-        if pos + 3 < buf.len() {
-            if buf[pos + 2] == b'\r' && buf[pos + 3] == b'\n' {
+        if pos + 3 < scan_buf.len() {
+            if scan_buf[pos + 2] == b'\r' && scan_buf[pos + 3] == b'\n' {
                 return Ok(Some(HeadBounds {
                     head_start: *head_start,
                     first_crlf: *first_crlf,
@@ -273,6 +294,9 @@ fn scan_head_bounds(
                 }));
             }
         } else {
+            if buf.len() >= max_end {
+                return Err(Error::HeadersTooLarge);
+            }
             // Fewer than 4 bytes remain from this `\r`; resume here on the next fragment.
             *scan_pos = pos;
             return Ok(None);
@@ -284,7 +308,10 @@ fn scan_head_bounds(
         i = pos + 2;
     }
 
-    *scan_pos = buf.len();
+    if buf.len() >= max_end {
+        return Err(Error::HeadersTooLarge);
+    }
+    *scan_pos = scan_buf.len();
     Ok(None)
 }
 
@@ -775,5 +802,100 @@ mod tests {
         assert_eq!(req.query, "v=1");
         assert_eq!(req.body.as_ref(), b"hello world");
         assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn enforces_max_headers_size_exact_boundary() {
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+
+        let exact_pad_len = MAX_HEADERS_SIZE - prefix.len() - suffix.len();
+        let mut exact = Vec::with_capacity(MAX_HEADERS_SIZE + 5);
+        exact.extend_from_slice(prefix);
+        exact.extend(std::iter::repeat_n(b'a', exact_pad_len));
+        exact.extend_from_slice(suffix);
+        assert_eq!(exact.len(), MAX_HEADERS_SIZE);
+
+        let Status::Complete(req, consumed) = H1::parse(&exact).expect("exact limit must pass")
+        else {
+            panic!("expected complete frame");
+        };
+        assert_eq!(consumed, MAX_HEADERS_SIZE);
+        assert_eq!(req.headers.get("Host"), Some("localhost"));
+
+        let mut cursor = H1Cursor::new();
+        assert_eq!(
+            H1::parse_incremental(&exact[..MAX_HEADERS_SIZE - 1], &mut cursor),
+            Ok(Status::Incomplete)
+        );
+        assert!(matches!(
+            H1::parse_incremental(&exact, &mut cursor),
+            Ok(Status::Complete(_, c)) if c == MAX_HEADERS_SIZE
+        ));
+
+        let mut too_large = Vec::with_capacity(MAX_HEADERS_SIZE + 1);
+        too_large.extend_from_slice(prefix);
+        too_large.extend(std::iter::repeat_n(b'a', exact_pad_len + 1));
+        too_large.extend_from_slice(suffix);
+        assert_eq!(too_large.len(), MAX_HEADERS_SIZE + 1);
+        assert_eq!(H1::parse(&too_large), Err(Error::HeadersTooLarge));
+
+        let mut cursor_over = H1Cursor::new();
+        assert_eq!(
+            H1::parse_incremental(&too_large[..MAX_HEADERS_SIZE - 1], &mut cursor_over),
+            Ok(Status::Incomplete)
+        );
+        assert_eq!(
+            H1::parse_incremental(&too_large[..MAX_HEADERS_SIZE], &mut cursor_over),
+            Err(Error::HeadersTooLarge)
+        );
+    }
+
+    #[test]
+    fn validates_expect_header_and_100_continue_cursor_state() {
+        let head_only = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
+        let mut cursor = H1Cursor::new();
+        assert_eq!(
+            H1::parse_incremental(head_only, &mut cursor),
+            Ok(Status::Incomplete)
+        );
+        assert!(cursor.take_expect_100_continue());
+        assert!(!cursor.take_expect_100_continue());
+        assert_eq!(cursor.expected_total_len(), Some(head_only.len() + 5));
+
+        let mut full = head_only.to_vec();
+        full.extend_from_slice(b"hello");
+        let Status::Complete(req, consumed) = H1::parse_incremental(&full, &mut cursor).unwrap()
+        else {
+            panic!("expected complete frame");
+        };
+        assert_eq!(req.body.as_ref(), b"hello");
+        assert_eq!(consumed, full.len());
+
+        // If body arrived in the same buffer as headers, skip unsolicited 100 Continue.
+        let partial_body = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhe";
+        let mut cursor_same_buf = H1Cursor::new();
+        assert_eq!(
+            H1::parse_incremental(partial_body, &mut cursor_same_buf),
+            Ok(Status::Incomplete)
+        );
+        assert!(!cursor_same_buf.take_expect_100_continue());
+
+        // HTTP/1.0 accepts Expect: 100-continue without requesting 100 Continue.
+        let http10 = b"POST /up HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
+        let mut cursor_10 = H1Cursor::new();
+        assert_eq!(
+            H1::parse_incremental(http10, &mut cursor_10),
+            Ok(Status::Incomplete)
+        );
+        assert!(!cursor_10.take_expect_100_continue());
+
+        for bad_expect in [
+            &b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: bogus\r\nContent-Length: 5\r\n\r\n"
+                [..],
+            &b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect:\r\nContent-Length: 5\r\n\r\n"[..],
+        ] {
+            assert_eq!(H1::parse(bad_expect), Err(Error::ExpectationFailed));
+        }
     }
 }

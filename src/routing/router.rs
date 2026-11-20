@@ -29,9 +29,11 @@ pub struct Router {
     middleware_groups: Arc<RwLock<MiddlewareGroupMap>>,
     aliases: Arc<RwLock<MiddlewareAliasMap>>,
 
-    // Cached 404 Fallback and pre-composed global middleware + 404 chain
+    // Cached 404 Fallback and 501 Not Implemented chains with pre-composed global middleware
     fallback_handler: HandlerFn,
     fallback_chain: Arc<ArcSwap<HandlerFn>>,
+    not_implemented_handler: HandlerFn,
+    not_implemented_chain: Arc<ArcSwap<HandlerFn>>,
     has_global_middlewares: Arc<AtomicBool>,
 }
 
@@ -43,7 +45,7 @@ impl Default for Router {
 
 impl Router {
     pub fn new() -> Self {
-        // Allocate the 404 handler ONCE at application boot
+        // Allocate the 404 and 501 handlers ONCE at application boot
         let fallback_handler: HandlerFn = Arc::new(|_req| {
             Box::pin(async {
                 Response::with_body(
@@ -55,6 +57,18 @@ impl Router {
         });
         let fallback_chain = Arc::new(ArcSwap::from_pointee(Arc::clone(&fallback_handler)));
 
+        let not_implemented_handler: HandlerFn = Arc::new(|_req| {
+            Box::pin(async {
+                Response::with_body(
+                    Status::NotImplemented,
+                    "text/plain; charset=utf-8",
+                    b"501 Not Implemented".to_vec(),
+                )
+            })
+        });
+        let not_implemented_chain =
+            Arc::new(ArcSwap::from_pointee(Arc::clone(&not_implemented_handler)));
+
         Self {
             static_routes: FxHashMap::default(),
             routes: Segment::new(),
@@ -63,6 +77,8 @@ impl Router {
             aliases: Arc::new(RwLock::new(HashMap::new())),
             fallback_handler,
             fallback_chain,
+            not_implemented_handler,
+            not_implemented_chain,
             has_global_middlewares: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -71,12 +87,21 @@ impl Router {
         if global.is_empty() {
             self.fallback_chain
                 .store(Arc::new(Arc::clone(&self.fallback_handler)));
+            self.not_implemented_chain
+                .store(Arc::new(Arc::clone(&self.not_implemented_handler)));
             self.has_global_middlewares.store(false, Ordering::Release);
         } else {
-            let chain = Pipeline::new()
+            let fallback_chain = Pipeline::new()
                 .append(global.iter().cloned())
                 .compose(Arc::clone(&self.fallback_handler));
-            self.fallback_chain.store(Arc::new(chain));
+            self.fallback_chain.store(Arc::new(fallback_chain));
+
+            let not_implemented_chain = Pipeline::new()
+                .append(global.iter().cloned())
+                .compose(Arc::clone(&self.not_implemented_handler));
+            self.not_implemented_chain
+                .store(Arc::new(not_implemented_chain));
+
             self.has_global_middlewares.store(true, Ordering::Release);
         }
     }
@@ -394,6 +419,39 @@ impl Router {
                     .insert(Cow::Borrowed(key), Cow::Owned(value.to_owned()));
             }
             return (route.chain)(req);
+        }
+
+        // Unrecognized HTTP method not matched by any route: 501 Not Implemented (RFC 9110 §9.1).
+        if matches!(req.method, Method::Unknown(_)) {
+            if !self.has_global_middlewares.load(Ordering::Acquire) {
+                return (self.not_implemented_handler)(req);
+            }
+            let guard = self.not_implemented_chain.load();
+            return (***guard)(req);
+        }
+
+        // Known method missed, but path exists for other methods: 405 Method Not Allowed + Allow.
+        let mut allowed = Vec::new();
+        self.routes.collect_allowed_methods(trimmed, &mut allowed);
+        if !allowed.is_empty() {
+            let allow_header = allowed.join(", ");
+            let handler: HandlerFn = Arc::new(move |_req| {
+                let allow_header = allow_header.clone();
+                Box::pin(async move {
+                    Response::with_body(
+                        Status::MethodNotAllowed,
+                        "text/plain; charset=utf-8",
+                        b"405 Method Not Allowed".to_vec(),
+                    )
+                    .header("Allow", allow_header)
+                })
+            });
+            if !self.has_global_middlewares.load(Ordering::Acquire) {
+                return handler(req);
+            }
+            let global = { self.middlewares.read().unwrap().clone() };
+            let chain = Pipeline::new().append(global).compose(handler);
+            return chain(req);
         }
 
         // 404 fallback: avoid ArcSwap load overhead when no global middleware is registered.

@@ -327,6 +327,10 @@ impl Constraint {
     }
 }
 
+const STANDARD_METHOD_NAMES: [&str; 9] = [
+    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+];
+
 type CustomMethodRoutes = Vec<(String, Arc<Route>)>;
 
 /// Compact inline storage for routes keyed by HTTP method at a terminal path or segment.
@@ -383,6 +387,26 @@ impl MethodSlots {
                         .map(|(_, r)| r.as_ref());
                 }
                 None
+            }
+        }
+    }
+
+    /// Collect all HTTP method names registered at this node into `out` without duplicates.
+    pub fn collect_allowed_methods<'a>(&'a self, out: &mut Vec<&'a str>) {
+        for (idx, slot) in self.standard.iter().enumerate() {
+            if slot.is_some() {
+                let name = STANDARD_METHOD_NAMES[idx];
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        if let Some(ref list) = self.other {
+            for (name, _) in list.iter() {
+                let s = name.as_str();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
             }
         }
     }
@@ -597,5 +621,31 @@ impl Segment {
         }
 
         None
+    }
+
+    /// Collect all HTTP methods registered on any route matching slash-trimmed `path`.
+    pub fn collect_allowed_methods<'r>(&'r self, path: &str, out: &mut Vec<&'r str>) {
+        if path.is_empty() {
+            self.routes.collect_allowed_methods(out);
+            return;
+        }
+
+        let (segment, remaining) = path.split_once('/').unwrap_or((path, ""));
+        if segment.is_empty() {
+            return;
+        }
+
+        if let Some(child) = self.static_children.get(segment) {
+            child.collect_allowed_methods(remaining, out);
+        }
+
+        for param in &self.param_children {
+            if let Some(ref constraint) = param.constraint
+                && !constraint.matches(segment)
+            {
+                continue;
+            }
+            param.segment.collect_allowed_methods(remaining, out);
+        }
     }
 }
