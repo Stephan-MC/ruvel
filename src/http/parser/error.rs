@@ -21,6 +21,10 @@ pub enum Error<'a> {
     InvalidBody,
     /// Number of header fields exceeds the parser's fixed capacity `N`.
     TooManyHeaders,
+    /// Request line and header block exceed `MAX_HEADERS_SIZE`.
+    HeadersTooLarge,
+    /// Request contains an unsupported `Expect` header value (RFC 9110 §10.1.1).
+    ExpectationFailed,
     /// Wire protocol version is syntactically recognized but unsupported by this parser.
     UnsupportedProtocol,
 }

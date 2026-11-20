@@ -6,18 +6,19 @@ use crate::configuration::ApplicationBuilder;
 use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
-use crate::http::parser::{HttpVersion, Status as ParseStatus, h1::H1Cursor};
-use crate::http::{Kernel, Request};
+use crate::http::parser::{self, HttpVersion, Status as ParseStatus, h1::H1Cursor};
+use crate::http::{Kernel, Method, Request};
 use crate::routing::{Router, RoutingServiceProvider};
 use crate::support::{LogServiceProvider, ServiceProvider};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 const RV_REQUEST_BUFFER_SIZE: usize = 8 * 1024;
 const RV_RESPONSE_BUFFER_SIZE: usize = 4 * 1024;
+const RV_MAX_REQUEST_SIZE: usize = 2 * 1024 * 1024;
 
-const REQUEST_BUFFER_SIZE: usize = match option_env!("RV_REQUEST_BUFFER_SIZE") {
+const COMPILE_REQUEST_BUFFER_SIZE: usize = match option_env!("RV_REQUEST_BUFFER_SIZE") {
     Some(s) => match usize::from_str_radix(s, 10) {
         Ok(v) if v > 0 => v,
         _ => RV_REQUEST_BUFFER_SIZE,
@@ -25,13 +26,71 @@ const REQUEST_BUFFER_SIZE: usize = match option_env!("RV_REQUEST_BUFFER_SIZE") {
     None => RV_REQUEST_BUFFER_SIZE,
 };
 
-const RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
+const COMPILE_RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
     Some(s) => match usize::from_str_radix(s, 10) {
         Ok(v) if v > 0 => v,
         _ => RV_RESPONSE_BUFFER_SIZE,
     },
     None => RV_RESPONSE_BUFFER_SIZE,
 };
+
+const COMPILE_MAX_REQUEST_SIZE: usize = match option_env!("RV_MAX_REQUEST_SIZE") {
+    Some(s) => match usize::from_str_radix(s, 10) {
+        Ok(v) if v > 0 => v,
+        _ => RV_MAX_REQUEST_SIZE,
+    },
+    None => RV_MAX_REQUEST_SIZE,
+};
+
+const HTTP_400_RESPONSE: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_413_RESPONSE: &[u8] =
+    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_417_RESPONSE: &[u8] =
+    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_431_RESPONSE: &[u8] =
+    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_505_RESPONSE: &[u8] =
+    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+fn resolve_env_usize(name: &str, compile_default: usize) -> usize {
+    match env::var(name) {
+        Ok(val) => match val.trim().parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => compile_default,
+        },
+        Err(_) => compile_default,
+    }
+}
+
+#[inline]
+fn parser_error_response(err: &parser::Error<'_>) -> &'static [u8] {
+    match err {
+        parser::Error::UnsupportedProtocol => HTTP_505_RESPONSE,
+        parser::Error::TooManyHeaders | parser::Error::HeadersTooLarge => HTTP_431_RESPONSE,
+        parser::Error::ExpectationFailed => HTTP_417_RESPONSE,
+        _ => HTTP_400_RESPONSE,
+    }
+}
+
+async fn write_error_and_close(
+    socket: &mut TcpStream,
+    response_buffer: &[u8],
+    resp_len: usize,
+    error_bytes: &[u8],
+) {
+    if resp_len > 0
+        && socket
+            .write_all(&response_buffer[..resp_len])
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let _ = socket.write_all(error_bytes).await;
+    let _ = socket.shutdown().await;
+}
 
 #[derive(Default)]
 pub struct Scheduler {}
@@ -176,17 +235,21 @@ impl Application {
 
     /// Serve HTTP/1.x connections on an already-bound [`TcpListener`].
     ///
-    /// Each accepted connection maintains a streaming read buffer (`read_buffer`) and batch cursor
-    /// (`read_pos`) to handle keep-alive, HTTP/1.1 pipelining, and arbitrary TCP fragmentation:
+    /// Each accepted connection maintains a dynamically bounded streaming read buffer
+    /// (`read_buffer`, starting at `RV_REQUEST_BUFFER_SIZE` and growing up to
+    /// `RV_MAX_REQUEST_SIZE`) and batch cursor (`read_pos`) to handle keep-alive, HTTP/1.1
+    /// pipelining, `Expect: 100-continue`, and arbitrary TCP fragmentation:
     /// - When [`Request::capture_incremental`] returns `Ok(ParseStatus::Incomplete)`, any unparsed
     ///   tail bytes are compacted to the front of `read_buffer` so the next bounded `read` call
-    ///   can append trailing TCP fragments while preserving `H1Cursor` progress.
+    ///   can append trailing TCP fragments while preserving `H1Cursor` progress. If an announced
+    ///   `Content-Length` or incoming payload exceeds `RV_MAX_REQUEST_SIZE`, `413 Payload Too Large`
+    ///   is flushed and the connection closes.
     /// - When [`Request::capture_incremental`] returns `Ok(ParseStatus::Complete(req, consumed))`,
     ///   `read_pos` advances by `consumed` and any remaining bytes in `read_buffer` are immediately
     ///   parsed as pipelined requests before flushing `response_buffer` in a single `write_all` call.
-    /// - When [`Request::capture_incremental`] returns `Err(_)`, any already-queued pipelined
-    ///   responses plus an `HTTP/1.1 400 Bad Request` (`Connection: close`) response are flushed
-    ///   and the socket closes.
+    /// - When [`Request::capture_incremental`] returns `Err(err)`, any already-queued pipelined
+    ///   responses plus an appropriate error response (`400`, `417`, `431`, or `505` with
+    ///   `Connection: close`) are flushed and the socket closes.
     pub async fn serve(mut self, listener: TcpListener) -> Result<(), Box<dyn Error>> {
         // 1. Ensure all providers are booted before accepting traffic
         self.boot();
@@ -197,22 +260,39 @@ impl Application {
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
+        let max_request_size = resolve_env_usize("RV_MAX_REQUEST_SIZE", COMPILE_MAX_REQUEST_SIZE);
+        let initial_read_buf_size =
+            resolve_env_usize("RV_REQUEST_BUFFER_SIZE", COMPILE_REQUEST_BUFFER_SIZE)
+                .min(max_request_size);
+        let response_buf_size =
+            resolve_env_usize("RV_RESPONSE_BUFFER_SIZE", COMPILE_RESPONSE_BUFFER_SIZE);
+
         loop {
             let (mut socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
-                let mut read_buffer = [0u8; REQUEST_BUFFER_SIZE];
+                let mut read_buffer = vec![0u8; initial_read_buf_size];
                 let mut read_len = 0usize;
-                let mut response_buffer = [0u8; RESPONSE_BUFFER_SIZE];
+                let mut response_buffer = vec![0u8; response_buf_size];
                 let mut resp_len = 0usize;
                 let mut cursor = H1Cursor::new();
 
                 'connection: loop {
-                    if read_len >= REQUEST_BUFFER_SIZE {
-                        // TODO: Throw an error warning the about request size to large
-                        break;
+                    if read_len >= read_buffer.len() {
+                        if read_buffer.len() >= max_request_size {
+                            write_error_and_close(
+                                &mut socket,
+                                &response_buffer,
+                                resp_len,
+                                HTTP_413_RESPONSE,
+                            )
+                            .await;
+                            break;
+                        }
+                        let new_len = read_buffer.len().saturating_mul(2).min(max_request_size);
+                        read_buffer.resize(new_len, 0);
                     }
 
                     match socket.read(&mut read_buffer[read_len..]).await {
@@ -233,20 +313,45 @@ impl Application {
                                     }
                                     // Partial frame (split headers, Content-Length body, or chunked
                                     // payload): preserve `&read_buffer[read_pos..read_len]` for the next read.
-                                    Ok(ParseStatus::Incomplete) => break,
-                                    Err(_) => {
-                                        if resp_len > 0
-                                            && socket
-                                                .write_all(&response_buffer[..resp_len])
-                                                .await
-                                                .is_err()
+                                    Ok(ParseStatus::Incomplete) => {
+                                        if cursor
+                                            .expected_total_len()
+                                            .is_some_and(|total| total > max_request_size)
                                         {
+                                            write_error_and_close(
+                                                &mut socket,
+                                                &response_buffer,
+                                                resp_len,
+                                                HTTP_413_RESPONSE,
+                                            )
+                                            .await;
                                             break 'connection;
                                         }
-                                        let _ = socket
-                                                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                                                .await;
-                                        let _ = socket.shutdown().await;
+                                        if cursor.take_expect_100_continue() {
+                                            if resp_len > 0 {
+                                                if socket
+                                                    .write_all(&response_buffer[..resp_len])
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break 'connection;
+                                                }
+                                                resp_len = 0;
+                                            }
+                                            if socket.write_all(HTTP_100_CONTINUE).await.is_err() {
+                                                break 'connection;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    Err(ref err) => {
+                                        write_error_and_close(
+                                            &mut socket,
+                                            &response_buffer,
+                                            resp_len,
+                                            parser_error_response(err),
+                                        )
+                                        .await;
                                         break 'connection;
                                     }
                                 };
@@ -258,20 +363,24 @@ impl Application {
                                     break 'connection;
                                 };
 
+                                let is_head = req.method == Method::Head;
                                 let req_wants_close = should_close_request_connection(
                                     req.version,
                                     req.headers.get_all("Connection"),
                                 );
 
                                 // Dispatch request through HTTP Kernel
-                                let response = kernel_clone.handle(req).await;
+                                let mut response = kernel_clone.handle(req).await;
                                 let res_wants_close = should_close_response_connection(
                                     response.headers.get_all("Connection"),
                                 );
+                                if req_wants_close && !res_wants_close {
+                                    response.headers.set("Connection", "close");
+                                }
 
-                                // Serialize response into the fixed write buffer, flushing early if needed.
-                                if let Some(written) =
-                                    response.write_to_slice(&mut response_buffer[resp_len..])
+                                // Serialize response into the write buffer, flushing early if needed.
+                                if let Some(written) = response
+                                    .write_to_slice_for(&mut response_buffer[resp_len..], is_head)
                                 {
                                     resp_len += written;
                                 } else {
@@ -286,10 +395,13 @@ impl Application {
                                         resp_len = 0;
                                     }
                                     if let Some(written) =
-                                        response.write_to_slice(&mut response_buffer)
+                                        response.write_to_slice_for(&mut response_buffer, is_head)
                                     {
                                         resp_len = written;
-                                    } else if socket.write_all(&response.to_bytes()).await.is_err()
+                                    } else if socket
+                                        .write_all(&response.to_bytes_for(is_head))
+                                        .await
+                                        .is_err()
                                     {
                                         break 'connection;
                                     }
@@ -307,6 +419,9 @@ impl Application {
                             // next read iteration with only the unparsed in-flight request fragment.
                             if read_pos >= read_len {
                                 read_len = 0;
+                                if read_buffer.len() > initial_read_buf_size {
+                                    read_buffer = vec![0u8; initial_read_buf_size];
+                                }
                             } else if read_pos > 0 {
                                 let remaining = read_len - read_pos;
                                 read_buffer.copy_within(read_pos..read_len, 0);

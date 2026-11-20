@@ -47,6 +47,18 @@ impl Responsable for Box<str> {
     }
 }
 
+impl Responsable for Vec<u8> {
+    fn to_response(self) -> Response {
+        Response::with_body(Status::Ok, "application/octet-stream", self)
+    }
+}
+
+impl Responsable for &'static [u8] {
+    fn to_response(self) -> Response {
+        Response::with_body(Status::Ok, "application/octet-stream", self.to_vec())
+    }
+}
+
 // 3. Status + Content tuples
 impl<T: Responsable> Responsable for (Status, T) {
     fn to_response(self) -> Response {

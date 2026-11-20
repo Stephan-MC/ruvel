@@ -136,6 +136,10 @@ impl Response {
         Self::new(Status::NotImplemented)
     }
 
+    pub fn method_not_allowed() -> Self {
+        Self::new(Status::MethodNotAllowed)
+    }
+
     /// Helper to get the status code as u16.
     pub fn status_code(&self) -> u16 {
         self.status.code()
@@ -185,30 +189,63 @@ impl Response {
         self
     }
 
+    /// Set response body as raw binary bytes (`Content-Type: application/octet-stream`).
+    pub fn bytes(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.headers
+            .insert("Content-Type", "application/octet-stream");
+        self.body = body.into();
+        self
+    }
+
+    /// Set response body bytes without altering the `Content-Type` header.
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
     /// Serialize this response into a new buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(128 + self.body.len());
-        self.write_to(&mut buffer);
+        self.to_bytes_for(false)
+    }
+
+    /// Serialize this response into a new buffer, suppressing body bytes for `HEAD` requests.
+    pub(crate) fn to_bytes_for(&self, is_head: bool) -> Vec<u8> {
+        let cap = if is_head { 128 } else { 128 + self.body.len() };
+        let mut buffer = Vec::with_capacity(cap);
+        self.write_to_for(&mut buffer, is_head);
         buffer
     }
 
     /// Fast response serialization avoiding `std::fmt::write!` format string parsing
     /// and dynamic formatter dispatch.
     pub fn write_to(&self, buffer: &mut Vec<u8>) {
+        self.write_to_for(buffer, false);
+    }
+
+    /// Fast response serialization supporting `HEAD` body suppression.
+    pub(crate) fn write_to_for(&self, buffer: &mut Vec<u8>, is_head: bool) {
         // Reserve enough space up front to avoid multiple growth reallocations on fresh buffers.
-        buffer.reserve(96 + self.body.len());
-        let _ = self.write_to_sink(buffer);
+        let extra = if is_head { 96 } else { 96 + self.body.len() };
+        buffer.reserve(extra);
+        let _ = self.write_to_sink(buffer, is_head);
     }
 
     /// Serialize this response directly into a fixed byte slice without heap allocation.
     /// Returns `Some(bytes_written)` if the serialized response fits in `dst`, or `None` otherwise.
+    #[allow(dead_code)]
     pub(crate) fn write_to_slice(&self, dst: &mut [u8]) -> Option<usize> {
+        self.write_to_slice_for(dst, false)
+    }
+
+    /// Serialize this response directly into a fixed byte slice without heap allocation,
+    /// suppressing body bytes for `HEAD` requests.
+    pub(crate) fn write_to_slice_for(&self, dst: &mut [u8], is_head: bool) -> Option<usize> {
         let mut sink = SliceSink { dst, pos: 0 };
-        self.write_to_sink(&mut sink).then_some(sink.pos)
+        self.write_to_sink(&mut sink, is_head).then_some(sink.pos)
     }
 
     #[inline]
-    fn write_to_sink<S: ByteSink>(&self, sink: &mut S) -> bool {
+    fn write_to_sink<S: ByteSink>(&self, sink: &mut S, is_head: bool) -> bool {
         let static_status: Option<&[u8]> = match self.status {
             Status::Ok => Some(b"HTTP/1.1 200 OK\r\n"),
             Status::Created => Some(b"HTTP/1.1 201 Created\r\n"),
@@ -232,7 +269,10 @@ impl Response {
                 return false;
             }
         } else if !sink.write_bytes(b"HTTP/1.1 ")
-            || !sink.write_bytes(format_usize_ascii(self.status_code() as usize, &mut num_buf))
+            || !sink.write_bytes(format_usize_ascii(
+                self.status_code() as usize,
+                &mut num_buf,
+            ))
             || !sink.write_bytes(b" ")
             || !sink.write_bytes(self.status_message().as_bytes())
             || !sink.write_bytes(b"\r\n")
@@ -240,14 +280,30 @@ impl Response {
             return false;
         }
 
-        if !sink.write_bytes(b"Content-Length: ")
-            || !sink.write_bytes(format_usize_ascii(self.body.len(), &mut num_buf))
-            || !sink.write_bytes(b"\r\n")
+        let code = self.status_code();
+        let forbid_content_length = (100..200).contains(&code) || code == 204;
+        let suppress_body = is_head || forbid_content_length || code == 304;
+        let preserve_manual_cl = !forbid_content_length && (is_head || code == 304);
+        let has_manual_cl = preserve_manual_cl && self.headers.contains_key("Content-Length");
+
+        if !forbid_content_length
+            && !has_manual_cl
+            && (!sink.write_bytes(b"Content-Length: ")
+                || !sink.write_bytes(format_usize_ascii(self.body.len(), &mut num_buf))
+                || !sink.write_bytes(b"\r\n"))
         {
             return false;
         }
 
+        let skip_header_cl = forbid_content_length || !has_manual_cl;
+        let mut emitted_manual_cl = false;
         for (k, v) in self.headers.iter() {
+            if k.eq_ignore_ascii_case("content-length") {
+                if skip_header_cl || emitted_manual_cl {
+                    continue;
+                }
+                emitted_manual_cl = true;
+            }
             if !sink.write_bytes(k.as_bytes())
                 || !sink.write_bytes(b": ")
                 || !sink.write_bytes(v.as_bytes())
@@ -257,7 +313,14 @@ impl Response {
             }
         }
 
-        sink.write_bytes(b"\r\n") && sink.write_bytes(&self.body)
+        if !sink.write_bytes(b"\r\n") {
+            return false;
+        }
+        if suppress_body {
+            true
+        } else {
+            sink.write_bytes(&self.body)
+        }
     }
 }
 

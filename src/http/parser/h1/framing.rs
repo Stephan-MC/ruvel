@@ -28,6 +28,7 @@ pub struct H1Cursor {
     pub(super) first_crlf: Option<usize>,
     pub(super) header_end: Option<usize>,
     pub(super) framing: Option<BodyFraming>,
+    pub(super) expect_100_continue: bool,
     pub(super) chunk_pos: usize,
     pub(super) chunk_decoded_len: usize,
     pub(super) chunk_count: usize,
@@ -44,6 +45,7 @@ impl H1Cursor {
             first_crlf: None,
             header_end: None,
             framing: None,
+            expect_100_continue: false,
             chunk_pos: 0,
             chunk_decoded_len: 0,
             chunk_count: 0,
@@ -59,10 +61,31 @@ impl H1Cursor {
         self.first_crlf = None;
         self.header_end = None;
         self.framing = None;
+        self.expect_100_continue = false;
         self.chunk_pos = 0;
         self.chunk_decoded_len = 0;
         self.chunk_count = 0;
         self.spans.clear();
+    }
+
+    /// Returns the total wire frame length in bytes (`head + Content-Length`) once headers are parsed.
+    ///
+    /// Returns `None` if headers are still incomplete or if the body uses chunked transfer framing.
+    #[inline]
+    pub fn expected_total_len(&self) -> Option<usize> {
+        let header_end = self.header_end?;
+        match self.framing? {
+            BodyFraming::ContentLength(len) => header_end.checked_add(4)?.checked_add(len),
+            BodyFraming::Chunked => None,
+        }
+    }
+
+    /// Atomically returns and clears whether an interim `100 Continue` response should be emitted.
+    #[inline]
+    pub fn take_expect_100_continue(&mut self) -> bool {
+        let pending = self.expect_100_continue;
+        self.expect_100_continue = false;
+        pending
     }
 }
 

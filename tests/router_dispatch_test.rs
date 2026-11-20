@@ -286,28 +286,29 @@ async fn test_head_options_trace_and_connect_routes() {
     router.trace("/echo", |_req| async { "trace:static" });
     router.connect("example.com:443", |_req| async { "connect:tunnel" });
 
-    // HEAD does not implicitly fall back to GET
+    // HEAD does not implicitly fall back to GET; path exists for GET -> 405 + Allow: GET
     let head_miss = router
-        .dispatch(Request::new(Method::HEAD, "/only-get"))
+        .dispatch(Request::new(Method::Head, "/only-get"))
         .await;
-    assert_eq!(head_miss.status.code(), 404);
+    assert_eq!(head_miss.status.code(), 405);
+    assert_eq!(head_miss.headers.get("Allow"), Some("GET"));
 
-    let head_hit = router.dispatch(Request::new(Method::HEAD, "/status")).await;
+    let head_hit = router.dispatch(Request::new(Method::Head, "/status")).await;
     assert_eq!(head_hit.status.code(), 200);
     assert_eq!(head_hit.body, b"head:static");
 
     let options_hit = router
-        .dispatch(Request::new(Method::OPTIONS, "/cors/users"))
+        .dispatch(Request::new(Method::Options, "/cors/users"))
         .await;
     assert_eq!(options_hit.status.code(), 200);
     assert_eq!(options_hit.body, b"options:users");
 
-    let trace_hit = router.dispatch(Request::new(Method::TRACE, "/echo")).await;
+    let trace_hit = router.dispatch(Request::new(Method::Trace, "/echo")).await;
     assert_eq!(trace_hit.status.code(), 200);
     assert_eq!(trace_hit.body, b"trace:static");
 
     let connect_hit = router
-        .dispatch(Request::new(Method::CONNECT, "example.com:443"))
+        .dispatch(Request::new(Method::Connect, "example.com:443"))
         .await;
     assert_eq!(connect_hit.status.code(), 200);
     assert_eq!(connect_hit.body, b"connect:tunnel");

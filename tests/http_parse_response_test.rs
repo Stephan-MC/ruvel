@@ -243,6 +243,62 @@ fn test_response_defaults_and_responsable_serialization() {
     let from_box: Box<str> = "boxed".into();
     let from_box_res = from_box.to_response();
     assert_eq!(from_box_res.body, b"boxed");
+
+    // Binary response builders & Responsable impls
+    let raw_bytes = vec![0x00, 0x7f, 0x80, 0xff];
+    let bytes_res = Response::ok().bytes(raw_bytes.clone());
+    assert_eq!(
+        bytes_res.headers.get("Content-Type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(bytes_res.body, raw_bytes);
+
+    let body_res = Response::ok()
+        .header("Content-Type", "application/custom")
+        .body(raw_bytes.clone());
+    assert_eq!(
+        body_res.headers.get("Content-Type"),
+        Some("application/custom")
+    );
+    assert_eq!(body_res.body, raw_bytes);
+
+    let vec_res = raw_bytes.clone().to_response();
+    assert_eq!(
+        vec_res.headers.get("Content-Type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(vec_res.body, raw_bytes);
+
+    let slice_res = (&b"\xff\x00\xfe"[..]).to_response();
+    assert_eq!(
+        slice_res.headers.get("Content-Type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(slice_res.body, b"\xff\x00\xfe");
+
+    // Duplicate Content-Length prevention
+    let manual_cl = Response::ok().header("Content-Length", "999").text("abc");
+    let wire_cl = String::from_utf8(manual_cl.to_bytes()).unwrap();
+    assert_eq!(wire_cl.matches("Content-Length:").count(), 1);
+    assert!(wire_cl.contains("Content-Length: 3\r\n"));
+
+    // 204 No Content omits Content-Length and body
+    let mut no_content = Response::no_content().header("Content-Length", "10");
+    no_content.body = b"ignored".to_vec();
+    let wire_204 = String::from_utf8(no_content.to_bytes()).unwrap();
+    assert!(wire_204.starts_with("HTTP/1.1 204 No Content\r\n"));
+    assert!(!wire_204.to_ascii_lowercase().contains("content-length"));
+    assert!(wire_204.ends_with("\r\n\r\n"));
+
+    // 304 Not Modified preserves manual Content-Length (or emits body len) and omits body
+    let not_mod = ruvel::http::Response::status(ruvel::http::Status::NotModified)
+        .header("Content-Length", "42")
+        .body(b"should_not_appear".to_vec());
+    let wire_304 = String::from_utf8(not_mod.to_bytes()).unwrap();
+    assert!(wire_304.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+    assert_eq!(wire_304.matches("Content-Length:").count(), 1);
+    assert!(wire_304.contains("Content-Length: 42\r\n"));
+    assert!(wire_304.ends_with("\r\n\r\n"));
 }
 
 #[test]
@@ -787,6 +843,239 @@ Connection: close\r\n\
         assert!(headers4.starts_with("HTTP/1.1 200 OK\r\n"));
         assert_eq!(body4, b"42");
     }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_tcp_listener_spec_compliance_and_error_responses() {
+    use ruvel::http::parser::MAX_HEADERS_SIZE;
+
+    let app = Application::configure("")
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/spec", |_req| async { Response::ok().text("ruvel!") });
+                router.head("/spec", |_req| async { Response::ok().text("ruvel!") });
+                router.options("/spec", |_req| async {
+                    Response::no_content().header("Allow", "GET, HEAD, POST, OPTIONS")
+                });
+                router.post("/spec", |req| async move { Response::ok().bytes(req.body) });
+                router.r#match(
+                    &[Method::Unknown("PURGE".to_string())],
+                    "/purge",
+                    |_req| async { Response::ok().text("purged") },
+                );
+            });
+        })
+        .create();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("read bound local addr");
+
+    let server = tokio::spawn(async move {
+        let _ = app.serve(listener).await;
+    });
+
+    // 1. Binary POST /spec payloads (non-UTF-8 0x00..=0xFF): 1B, 1024B, 65536B (CL & chunked)
+    {
+        let mut stream = TcpStream::connect(addr).await.expect("connect for /spec");
+        stream.set_nodelay(true).expect("enable TCP_NODELAY");
+        let mut resp_buf = Vec::new();
+
+        let p1 = vec![0xFFu8];
+        let p1024: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        let p65536: Vec<u8> = (0..65536).map(|i| ((i * 31 + 17) & 0xFF) as u8).collect();
+
+        for (label, payload) in [("1B", &p1), ("1024B", &p1024), ("65536B", &p65536)] {
+            let mut raw = format!(
+                "POST /spec HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes();
+            raw.extend_from_slice(payload);
+
+            stream.write_all(&raw).await.expect("write CL POST");
+            let (headers, body) = read_http_response(&mut stream, &mut resp_buf).await;
+            assert!(
+                headers.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{label} CL: {headers:?}"
+            );
+            assert_eq!(body, *payload, "{label} CL body mismatch");
+        }
+
+        for (label, payload, chunk_sz) in [
+            ("chunked 1024B", &p1024, 250usize),
+            ("chunked 65536B", &p65536, 4096usize),
+        ] {
+            let mut raw =
+                b"POST /spec HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec();
+            for chunk in payload.chunks(chunk_sz) {
+                raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                raw.extend_from_slice(chunk);
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(b"0\r\n\r\n");
+
+            stream.write_all(&raw).await.expect("write chunked POST");
+            let (headers, body) = read_http_response(&mut stream, &mut resp_buf).await;
+            assert!(
+                headers.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{label}: {headers:?}"
+            );
+            assert_eq!(body, *payload, "{label} body mismatch");
+        }
+
+        // Custom method registered explicitly succeeds
+        stream
+            .write_all(b"PURGE /purge HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write PURGE");
+        let (purge_h, purge_b) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(purge_h.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(purge_b, b"purged");
+
+        // Expect: 100-continue waits for interim response, then echoes binary body
+        let continue_payload: Vec<u8> = (0..1024).map(|i| (255 - (i & 0xFF)) as u8).collect();
+        let continue_head = format!(
+            "POST /spec HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+            continue_payload.len()
+        );
+        stream
+            .write_all(continue_head.as_bytes())
+            .await
+            .expect("write Expect headers");
+
+        let mut interim = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut interim))
+            .await
+            .expect("timed out waiting for 100 Continue")
+            .expect("read 100 Continue");
+        assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        stream
+            .write_all(&continue_payload)
+            .await
+            .expect("write Expect body");
+        let (cont_h, cont_b) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(cont_h.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(cont_b, continue_payload);
+
+        // HEAD /spec & HEAD /missing must suppress body bytes on wire while keeping Content-Length
+        for head_req in [
+            &b"HEAD /spec HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"HEAD /missing HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            stream.write_all(head_req).await.expect("write HEAD");
+            let mut tmp = [0u8; 512];
+            while !resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut tmp))
+                    .await
+                    .expect("timed out reading HEAD response")
+                    .expect("read HEAD response");
+                assert!(n > 0);
+                resp_buf.extend_from_slice(&tmp[..n]);
+            }
+            let sep = resp_buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("HEAD headers");
+            let head_text = std::str::from_utf8(&resp_buf[..sep + 4]).unwrap();
+            assert!(
+                head_text.to_ascii_lowercase().contains("content-length:"),
+                "HEAD response must report Content-Length: {head_text:?}"
+            );
+            assert_eq!(
+                resp_buf.len(),
+                sep + 4,
+                "HEAD response must send zero body bytes"
+            );
+            resp_buf.clear();
+        }
+
+        // DELETE /spec -> 405 Method Not Allowed with Allow header
+        stream
+            .write_all(b"DELETE /spec HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write DELETE /spec");
+        let (h405, _) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h405.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(h405.contains("Allow:"));
+        assert!(h405.contains("POST"));
+
+        // Lowercase "get" & unknown method "BREW" -> 501 Not Implemented (case-sensitive)
+        for bad_method_req in [
+            &b"get /spec HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"BREW /spec HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            stream
+                .write_all(bad_method_req)
+                .await
+                .expect("write unknown method");
+            let (h501, _) = read_http_response(&mut stream, &mut resp_buf).await;
+            assert!(
+                h501.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+                "expected 501, got {h501:?}"
+            );
+        }
+    }
+
+    // 2. Protocol & limit error status mapping on fresh connections
+    async fn send_expect_status(
+        addr: std::net::SocketAddr,
+        raw: &[u8],
+        expected_status_line: &str,
+    ) {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        s.write_all(raw).await.expect("write request");
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp))
+            .await
+            .expect("timed out waiting for error response")
+            .expect("read error response");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with(expected_status_line),
+            "expected {expected_status_line:?}, got {text:?}"
+        );
+        assert!(
+            !text.starts_with("HTTP/1.1 100"),
+            "must not emit 100 Continue before error: {text:?}"
+        );
+    }
+
+    send_expect_status(
+        addr,
+        b"POST /spec HTTP/1.1\r\nHost: localhost\r\nExpect: unsupported\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 417 Expectation Failed\r\n",
+    )
+    .await;
+
+    send_expect_status(
+        addr,
+        b"POST /spec HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 3000000\r\n\r\n",
+        "HTTP/1.1 413 Payload Too Large\r\n",
+    )
+    .await;
+
+    let mut oversized_headers = b"GET /spec HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    oversized_headers.extend(std::iter::repeat_n(b'x', MAX_HEADERS_SIZE));
+    oversized_headers.extend_from_slice(b"\r\n\r\n");
+    send_expect_status(
+        addr,
+        &oversized_headers,
+        "HTTP/1.1 431 Request Header Fields Too Large\r\n",
+    )
+    .await;
+
+    send_expect_status(
+        addr,
+        b"GET /spec HTTP/2.0\r\nHost: localhost\r\n\r\n",
+        "HTTP/1.1 505 HTTP Version Not Supported\r\n",
+    )
+    .await;
 
     server.abort();
 }

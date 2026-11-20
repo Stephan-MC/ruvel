@@ -28,7 +28,6 @@ pub const MAX_HEADERS: usize = match option_env!("RV_MAX_HEADERS") {
 };
 
 /// The maximum size in bytes allowed for each requests to store headers
-/// TODO: Add this parameter into the request parsing
 pub const MAX_HEADERS_SIZE: usize = match option_env!("RV_MAX_HEADERS_SIZE") {
     Some(val) => match usize::from_str_radix(val, 10) {
         Ok(v) if v > 0 => v,
