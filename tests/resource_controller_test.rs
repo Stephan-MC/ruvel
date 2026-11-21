@@ -120,14 +120,16 @@ async fn test_resource_controller_only_filtering() {
     assert_eq!(res.status.code(), 200);
     assert_eq!(res.body, b"posts.show:42");
 
-    // Filtered out actions
+    // Filtered out actions: routes exist for other methods -> 405 Method Not Allowed + Allow
     let res = kernel.handle(Request::new(Method::Post, "/posts")).await;
-    assert_eq!(res.status.code(), 404);
+    assert_eq!(res.status.code(), 405);
+    assert!(res.headers.get("Allow").is_some_and(|a| a.contains("GET")));
 
     let res = kernel
         .handle(Request::new(Method::Delete, "/posts/42"))
         .await;
-    assert_eq!(res.status.code(), 404);
+    assert_eq!(res.status.code(), 405);
+    assert!(res.headers.get("Allow").is_some_and(|a| a.contains("GET")));
 }
 
 #[tokio::test]
@@ -148,7 +150,8 @@ async fn test_resource_controller_except_filtering() {
     let res = kernel
         .handle(Request::new(Method::Delete, "/posts/42"))
         .await;
-    assert_eq!(res.status.code(), 404);
+    assert_eq!(res.status.code(), 405);
+    assert!(res.headers.get("Allow").is_some_and(|a| a.contains("GET")));
 
     let res = kernel
         .handle(Request::new(Method::Get, "/posts/42/edit"))

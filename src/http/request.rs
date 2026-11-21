@@ -1,7 +1,5 @@
 use crate::http::Method;
-use crate::http::parser::{
-    self, H1, HttpVersion, ParsedRequest, Parser, Status as ParseStatus, h1::H1Cursor,
-};
+use crate::http::parser::{self, HttpVersion, Status as ParseStatus, h1};
 use crate::routing::route::Params;
 
 use super::headers::HeaderMap;
@@ -34,65 +32,96 @@ impl Request {
         }
     }
 
-    /// Capture one complete HTTP/1.x request from the leading bytes of `buf` using [`H1`].
-    pub fn capture<'a>(buf: &'a [u8]) -> Result<ParseStatus<Self>, parser::Error<'a>> {
-        Self::capture_with::<H1>(buf)
+    /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
+    /// using [`h1::Limits::DEFAULT`].
+    pub fn capture(buf: &[u8]) -> Result<ParseStatus<Self>, parser::Error> {
+        Self::capture_with_limits(buf, h1::Limits::DEFAULT)
     }
 
-    /// Capture one complete request from the leading bytes of `buf` using a specific [`Parser`].
-    pub fn capture_with<'a, P>(buf: &'a [u8]) -> Result<ParseStatus<Self>, parser::Error<'a>>
-    where
-        P: Parser<Output<'a> = ParsedRequest<'a>>,
-    {
-        match P::parse(buf)? {
-            ParseStatus::Complete(parsed, consumed) => {
-                Ok(ParseStatus::Complete(Self::from_parsed(parsed), consumed))
+    /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
+    /// enforcing `limits`.
+    pub fn capture_with_limits(
+        buf: &[u8],
+        limits: h1::Limits,
+    ) -> Result<ParseStatus<Self>, parser::Error> {
+        match h1::parse_slice(buf, limits)? {
+            ParseStatus::Complete(slice_req, consumed) => {
+                let raw = slice_req.as_request();
+                let mut req = Self::from_h1_head_only(&raw)?;
+                req.body = match slice_req.body {
+                    Cow::Borrowed([]) => Vec::new(),
+                    Cow::Borrowed(b) => b.to_vec(),
+                    Cow::Owned(v) => v,
+                };
+                Ok(ParseStatus::Complete(req, consumed))
             }
             ParseStatus::Incomplete => Ok(ParseStatus::Incomplete),
         }
     }
 
-    /// Incrementally capture one complete HTTP/1.x request across fragmented TCP reads.
-    pub fn capture_incremental<'a>(
-        buf: &'a [u8],
-        cursor: &mut H1Cursor,
-    ) -> Result<ParseStatus<Self>, parser::Error<'a>> {
-        match H1::parse_incremental(buf, cursor)? {
-            ParseStatus::Complete(parsed, consumed) => {
-                Ok(ParseStatus::Complete(Self::from_parsed(parsed), consumed))
-            }
-            ParseStatus::Incomplete => Ok(ParseStatus::Incomplete),
+    /// Materialize an owned [`Request`] from a zero-copy borrowed [`h1::Request`] view.
+    pub fn from_h1(raw: h1::Request<'_>) -> Result<Self, parser::Error> {
+        let mut req = Self::from_h1_head_only(&raw)?;
+        let body = raw.body();
+        if !body.is_empty() {
+            req.body = body.to_vec();
         }
+        Ok(req)
     }
 
-    fn from_parsed(parsed: ParsedRequest<'_>) -> Self {
-        let path = if parsed.path == "/" {
+    fn from_h1_head_only(raw: &h1::Request<'_>) -> Result<Self, parser::Error> {
+        let method = match raw.method() {
+            h1::Method::Get => Method::Get,
+            h1::Method::Head => Method::Head,
+            h1::Method::Post => Method::Post,
+            h1::Method::Put => Method::Put,
+            h1::Method::Delete => Method::Delete,
+            h1::Method::Patch => Method::Patch,
+            h1::Method::Options => Method::Options,
+            h1::Method::Trace => Method::Trace,
+            h1::Method::Connect => Method::Connect,
+            h1::Method::Other(span) => {
+                let s = std::str::from_utf8(span.of(raw.raw_head()))
+                    .map_err(|_| parser::Error::Malformed)?;
+                Method::Unknown(s.to_owned())
+            }
+        };
+
+        let path_bytes = raw.path();
+        let path = if path_bytes == b"/" {
             Cow::Borrowed("/")
         } else {
-            Cow::Owned(parsed.path.to_owned())
-        };
-        let query = if parsed.query.is_empty() {
-            Cow::Borrowed("")
-        } else {
-            Cow::Owned(parsed.query.to_owned())
+            let s = std::str::from_utf8(path_bytes).map_err(|_| parser::Error::Malformed)?;
+            Cow::Owned(s.to_owned())
         };
 
-        let mut headers = HeaderMap::with_capacity(parsed.headers.len());
-        for header in &parsed.headers {
-            let name = intern_header_name(header.name);
-            let value = intern_common_header_value(header.value);
+        let query_bytes = raw.query();
+        let query = if query_bytes.is_empty() {
+            Cow::Borrowed("")
+        } else {
+            let s = std::str::from_utf8(query_bytes).map_err(|_| parser::Error::Malformed)?;
+            Cow::Owned(s.to_owned())
+        };
+
+        let mut headers = HeaderMap::with_capacity(raw.header_count());
+        for (name_bytes, value_bytes) in raw.headers() {
+            let name_str = std::str::from_utf8(name_bytes).map_err(|_| parser::Error::Malformed)?;
+            let value_str =
+                std::str::from_utf8(value_bytes).map_err(|_| parser::Error::Malformed)?;
+            let name = intern_header_name(name_str);
+            let value = intern_common_header_value(value_str);
             headers.insert(name, value);
         }
 
-        Self {
-            method: parsed.method,
+        Ok(Self {
+            method,
             path,
             query,
-            version: parsed.version,
+            version: HttpVersion::from_h1_minor(raw.minor()),
             headers,
-            body: parsed.body.into_owned(),
+            body: Vec::new(),
             params: Params::new(),
-        }
+        })
     }
 
     /// Retrieve a header value by key (case-insensitive).
