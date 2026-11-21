@@ -30,6 +30,18 @@ const HOST_BYTE_LUT: [bool; 256] = {
     lut
 };
 
+/// 256-entry lookup table for plain host characters (valid [`HOST_BYTE_LUT`] excluding `:`, `[`, `]`).
+const HOST_PLAIN_LUT: [bool; 256] = {
+    let mut lut = [false; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let ch = b as u8;
+        lut[b] = HOST_BYTE_LUT[b] && !matches!(ch, b':' | b'[' | b']');
+        b += 1;
+    }
+    lut
+};
+
 #[inline]
 pub(crate) const fn is_valid_uri_byte(b: u8) -> bool {
     URI_BYTE_LUT[b as usize]
@@ -49,48 +61,59 @@ pub(crate) fn is_valid_scheme(scheme: &[u8]) -> bool {
 /// Validate a `Host` / `:authority` byte slice in a single pass (`uri-host [ ":" port ]`).
 #[inline]
 pub(crate) fn is_valid_host_bytes(bytes: &[u8]) -> bool {
-    validate_host_port(bytes, false)
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && HOST_PLAIN_LUT[bytes[i] as usize] {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return true;
+    }
+    validate_host_port_from(bytes, i, false)
 }
 
 /// Validate `CONNECT` authority-form (`uri-host ":" port`) where port is required (`1..=65535`).
 #[inline]
 pub(crate) fn is_valid_authority_bytes(bytes: &[u8]) -> bool {
-    validate_host_port(bytes, true)
+    validate_host_port_from(bytes, 0, true)
 }
 
-fn validate_host_port(bytes: &[u8], require_port: bool) -> bool {
+#[cold]
+#[inline(never)]
+fn validate_host_port_from(bytes: &[u8], mut i: usize, require_port: bool) -> bool {
     if bytes.is_empty() {
         return false;
     }
 
-    if bytes[0] == b'[' {
-        let mut i = 1;
-        while i < bytes.len() && bytes[i] != b']' {
-            if !HOST_BYTE_LUT[bytes[i] as usize] || bytes[i] == b'[' {
+    if i == 0 && bytes[0] == b'[' {
+        let mut j = 1;
+        while j < bytes.len() && bytes[j] != b']' {
+            if !HOST_BYTE_LUT[bytes[j] as usize] || bytes[j] == b'[' {
                 return false;
             }
-            i += 1;
+            j += 1;
         }
-        if i == 1 || i >= bytes.len() {
+        if j == 1 || j >= bytes.len() {
             return false;
         }
-        i += 1;
-        if i == bytes.len() {
+        j += 1;
+        if j == bytes.len() {
             return !require_port;
         }
-        if bytes[i] != b':' {
+        if bytes[j] != b':' {
             return false;
         }
-        return parse_valid_port(&bytes[i + 1..]).is_some();
+        return parse_valid_port(&bytes[j + 1..]).is_some();
     }
 
-    let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b':' {
             return i > 0 && parse_valid_port(&bytes[i + 1..]).is_some();
         }
-        if !HOST_BYTE_LUT[b as usize] || matches!(b, b'[' | b']') {
+        if !HOST_PLAIN_LUT[b as usize] {
             return false;
         }
         i += 1;
