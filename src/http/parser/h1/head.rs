@@ -112,6 +112,20 @@ impl Head {
     /// `b` must be exactly the head, including the final `\r\n\r\n`.
     #[inline]
     pub fn parse(&mut self, b: &[u8]) -> Result<(), Error> {
+        self.parse_inner::<true>(b).map(|_| ())
+    }
+
+    /// Parse a complete HTTP/1.x request head from the leading prefix of `b`.
+    ///
+    /// Stops at the terminating `\r\n\r\n` and returns the head length in bytes,
+    /// leaving any trailing body or pipelined bytes untouched.
+    #[inline]
+    pub fn parse_prefix(&mut self, b: &[u8]) -> Result<usize, Error> {
+        self.parse_inner::<false>(b)
+    }
+
+    #[inline]
+    fn parse_inner<const EXACT: bool>(&mut self, b: &[u8]) -> Result<usize, Error> {
         if b.len() > u32::MAX as usize {
             return Err(Error::HeaderTooLarge);
         }
@@ -157,10 +171,11 @@ impl Head {
 
         loop {
             if at(b, i) == b'\r' {
-                // Blank line: must be the very end of the head.
-                if at(b, i + 1) != b'\n' || i + 2 != b.len() {
+                // Blank line: terminates the head.
+                if at(b, i + 1) != b'\n' || (EXACT && i + 2 != b.len()) {
                     return Err(Error::Malformed);
                 }
+                i += 2;
                 break;
             }
 
@@ -254,7 +269,7 @@ impl Head {
         } else {
             Body::None
         };
-        Ok(())
+        Ok(i)
     }
 }
 
