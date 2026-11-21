@@ -1,8 +1,10 @@
 //! Span-based HTTP/1.x request head parser.
 
+use std::mem::MaybeUninit;
+
 use crate::http::parser::{Error, MAX_HEADERS, semantics};
 
-use super::scan::{TOKEN, at, scan_name, scan_uri, skip_value};
+use super::scan::{TOKEN, at, scan_name, scan_origin_target, scan_uri, skip_value};
 
 /// Byte range inside the raw request head slice.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -64,29 +66,32 @@ pub struct Head {
     pub body: Body,
     pub host: Option<Span>,
     len: usize,
-    hdrs: [(Span, Span); MAX_HEADERS],
+    hdrs: [MaybeUninit<(Span, Span)>; MAX_HEADERS],
 }
 
 impl Default for Head {
+    #[inline]
     fn default() -> Self {
         Head::new()
     }
 }
 
 impl Head {
-    pub fn new() -> Head {
+    /// Creates an empty [`Head`] without zero-initializing the backing header span table.
+    #[inline]
+    pub const fn new() -> Head {
         Head {
             method: Method::Get,
             minor: 1,
-            target: Span::default(),
-            path: Span::default(),
-            query: Span::default(),
+            target: Span { start: 0, end: 0 },
+            path: Span { start: 0, end: 0 },
+            query: Span { start: 0, end: 0 },
             keep_alive: true,
             expect_100_continue: false,
             body: Body::None,
             host: None,
             len: 0,
-            hdrs: [(Span { start: 0, end: 0 }, Span { start: 0, end: 0 }); MAX_HEADERS],
+            hdrs: [const { MaybeUninit::uninit() }; MAX_HEADERS],
         }
     }
 
@@ -97,13 +102,30 @@ impl Head {
 
     #[inline]
     pub(crate) fn header_spans(&self) -> &[(Span, Span)] {
-        &self.hdrs[..self.len]
+        // SAFETY: `self.hdrs[..self.len]` are always initialized via `MaybeUninit::write`
+        // before `self.len` is incremented in `Head::parse`, and `self.len <= MAX_HEADERS`.
+        unsafe { std::slice::from_raw_parts(self.hdrs.as_ptr().cast(), self.len) }
     }
 
     /// Parse a complete HTTP/1.x request head.
     ///
     /// `b` must be exactly the head, including the final `\r\n\r\n`.
+    #[inline]
     pub fn parse(&mut self, b: &[u8]) -> Result<(), Error> {
+        self.parse_inner::<true>(b).map(|_| ())
+    }
+
+    /// Parse a complete HTTP/1.x request head from the leading prefix of `b`.
+    ///
+    /// Stops at the terminating `\r\n\r\n` and returns the head length in bytes,
+    /// leaving any trailing body or pipelined bytes untouched.
+    #[inline]
+    pub fn parse_prefix(&mut self, b: &[u8]) -> Result<usize, Error> {
+        self.parse_inner::<false>(b)
+    }
+
+    #[inline]
+    fn parse_inner<const EXACT: bool>(&mut self, b: &[u8]) -> Result<usize, Error> {
         if b.len() > u32::MAX as usize {
             return Err(Error::HeaderTooLarge);
         }
@@ -116,48 +138,30 @@ impl Head {
         self.method = method;
 
         let t0 = i;
-        i = scan_uri(b, i);
-        if i == t0 || at(b, i) != b' ' {
-            return Err(Error::Malformed);
+        if at(b, t0) == b'/' {
+            let (t1, question_pos) = scan_origin_target(b, t0)?;
+            let (path, query) = match question_pos {
+                Some(q) => (span(t0, q), span(q + 1, t1)),
+                None => (span(t0, t1), Span { start: 0, end: 0 }),
+            };
+            self.target = span(t0, t1);
+            self.path = path;
+            self.query = query;
+            i = t1 + 1;
+        } else {
+            let (t1, path, query) = parse_non_origin_target(b, t0, method)?;
+            self.target = span(t0, t1);
+            self.path = path;
+            self.query = query;
+            i = t1 + 1;
         }
-        let (path, query) = validate_and_split_target(b, t0, i, method)?;
-        self.target = span(t0, i);
-        self.path = path;
-        self.query = query;
-        i += 1;
 
         match b.get(i..i + 10) {
-            Some(b"HTTP/1.1\r\n") => {
-                self.minor = 1;
-                i += 10;
-            }
-            Some(b"HTTP/1.0\r\n") => {
-                self.minor = 0;
-                i += 10;
-            }
-            Some(
-                [
-                    b'H',
-                    b'T',
-                    b'T',
-                    b'P',
-                    b'/',
-                    b'0'..=b'9',
-                    b'.',
-                    b'0'..=b'9',
-                    b'\r',
-                    b'\n',
-                ],
-            ) => {
-                return Err(Error::VersionNotSupported);
-            }
-            _ => {
-                if matches!(b.get(i..i + 8), Some(b"HTTP/2\r\n" | b"HTTP/3\r\n")) {
-                    return Err(Error::VersionNotSupported);
-                }
-                return Err(Error::Malformed);
-            }
+            Some(b"HTTP/1.1\r\n") => self.minor = 1,
+            Some(b"HTTP/1.0\r\n") => self.minor = 0,
+            _ => return Err(reject_version(b, i)),
         }
+        i += 10;
 
         // ── header fields ──
         let mut content_length: Option<usize> = None;
@@ -167,10 +171,11 @@ impl Head {
 
         loop {
             if at(b, i) == b'\r' {
-                // Blank line: must be the very end of the head.
-                if at(b, i + 1) != b'\n' || i + 2 != b.len() {
+                // Blank line: terminates the head.
+                if at(b, i + 1) != b'\n' || (EXACT && i + 2 != b.len()) {
                     return Err(Error::Malformed);
                 }
+                i += 2;
                 break;
             }
 
@@ -209,22 +214,15 @@ impl Head {
                     self.host = Some(span(v0, v1));
                 }
                 6 if name.eq_ignore_ascii_case(b"expect") => {
-                    if val.eq_ignore_ascii_case(b"100-continue") {
-                        if self.minor == 1 {
-                            self.expect_100_continue = true;
-                        }
-                    } else {
-                        return Err(Error::ExpectationFailed);
-                    }
+                    parse_expect(self.minor, val, &mut self.expect_100_continue)?;
                 }
                 10 if name.eq_ignore_ascii_case(b"connection") => {
-                    for tok in val.split(|&c| c == b',') {
-                        let t = trim_ows(tok);
-                        if t.eq_ignore_ascii_case(b"close") {
-                            close = true;
-                        } else if t.eq_ignore_ascii_case(b"keep-alive") {
-                            ka = true;
-                        }
+                    if val.eq_ignore_ascii_case(b"keep-alive") {
+                        ka = true;
+                    } else if val.eq_ignore_ascii_case(b"close") {
+                        close = true;
+                    } else {
+                        parse_connection_slow(val, &mut close, &mut ka);
                     }
                 }
                 14 if name.eq_ignore_ascii_case(b"content-length") => {
@@ -235,30 +233,11 @@ impl Head {
                     content_length = Some(n);
                 }
                 17 if name.eq_ignore_ascii_case(b"transfer-encoding") => {
-                    // RFC 9112 §6.1: Transfer-Encoding is undefined in HTTP/1.0 and must be rejected.
-                    if self.minor == 0 || val.is_empty() {
-                        return Err(Error::Malformed);
-                    }
-                    if !saw_te && val.eq_ignore_ascii_case(b"chunked") {
+                    if self.minor == 1 && !saw_te && val.eq_ignore_ascii_case(b"chunked") {
                         chunked = true;
                         saw_te = true;
                     } else {
-                        for part in val.split(|&c| c == b',') {
-                            let coding = trim_ows(part);
-                            if coding.is_empty() || !coding.iter().all(|&c| TOKEN[c as usize]) {
-                                return Err(Error::Malformed);
-                            }
-                            // `chunked` must appear at most once and must be the final transfer coding.
-                            if chunked {
-                                return Err(Error::Malformed);
-                            }
-                            if coding.eq_ignore_ascii_case(b"chunked") {
-                                chunked = true;
-                            } else if !coding.eq_ignore_ascii_case(b"identity") {
-                                return Err(Error::UnsupportedEncoding);
-                            }
-                        }
-                        saw_te = true;
+                        parse_transfer_encoding_slow(self.minor, val, &mut saw_te, &mut chunked)?;
                     }
                 }
                 _ => {}
@@ -267,7 +246,7 @@ impl Head {
             if self.len == MAX_HEADERS {
                 return Err(Error::HeaderTooLarge);
             }
-            self.hdrs[self.len] = (span(n0, n1), span(v0, v1));
+            self.hdrs[self.len].write((span(n0, n1), span(v0, v1)));
             self.len += 1;
         }
 
@@ -290,10 +269,11 @@ impl Head {
         } else {
             Body::None
         };
-        Ok(())
+        Ok(i)
     }
 }
 
+#[inline(always)]
 fn parse_method(b: &[u8]) -> Result<(Method, usize), Error> {
     Ok(match b {
         [b'G', b'E', b'T', b' ', ..] => (Method::Get, 4),
@@ -305,35 +285,123 @@ fn parse_method(b: &[u8]) -> Result<(Method, usize), Error> {
         [b'O', b'P', b'T', b'I', b'O', b'N', b'S', b' ', ..] => (Method::Options, 8),
         [b'T', b'R', b'A', b'C', b'E', b' ', ..] => (Method::Trace, 6),
         [b'C', b'O', b'N', b'N', b'E', b'C', b'T', b' ', ..] => (Method::Connect, 8),
-        _ => {
-            let mut i = 0;
-            while TOKEN[at(b, i) as usize] {
-                i += 1;
-            }
-            if i == 0 || at(b, i) != b' ' {
-                return Err(Error::Malformed);
-            }
-            (Method::Other(span(0, i)), i + 1)
-        }
+        _ => return parse_method_other(b),
     })
 }
 
-/// Validate RFC 9112 §3.2 `request-target` bytes and form in a single pass,
-/// returning `(path_span, query_span)`.
-fn validate_and_split_target(
-    b: &[u8],
-    t0: usize,
-    t1: usize,
-    method: Method,
-) -> Result<(Span, Span), Error> {
-    let target = &b[t0..t1];
-    if target.is_empty() {
+#[cold]
+#[inline(never)]
+fn parse_method_other(b: &[u8]) -> Result<(Method, usize), Error> {
+    let mut i = 0;
+    while TOKEN[at(b, i) as usize] {
+        i += 1;
+    }
+    if i == 0 || at(b, i) != b' ' {
         return Err(Error::Malformed);
     }
+    Ok((Method::Other(span(0, i)), i + 1))
+}
+
+#[cold]
+#[inline(never)]
+fn reject_version(b: &[u8], i: usize) -> Error {
+    if matches!(
+        b.get(i..i + 10),
+        Some([
+            b'H',
+            b'T',
+            b'T',
+            b'P',
+            b'/',
+            b'0'..=b'9',
+            b'.',
+            b'0'..=b'9',
+            b'\r',
+            b'\n'
+        ])
+    ) || matches!(b.get(i..i + 8), Some(b"HTTP/2\r\n" | b"HTTP/3\r\n"))
+    {
+        Error::VersionNotSupported
+    } else {
+        Error::Malformed
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn parse_expect(minor: u8, val: &[u8], expect_100_continue: &mut bool) -> Result<(), Error> {
+    if val.eq_ignore_ascii_case(b"100-continue") {
+        if minor == 1 {
+            *expect_100_continue = true;
+        }
+        Ok(())
+    } else {
+        Err(Error::ExpectationFailed)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn parse_connection_slow(val: &[u8], close: &mut bool, ka: &mut bool) {
+    for tok in val.split(|&c| c == b',') {
+        let t = trim_ows(tok);
+        if t.eq_ignore_ascii_case(b"close") {
+            *close = true;
+        } else if t.eq_ignore_ascii_case(b"keep-alive") {
+            *ka = true;
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn parse_transfer_encoding_slow(
+    minor: u8,
+    val: &[u8],
+    saw_te: &mut bool,
+    chunked: &mut bool,
+) -> Result<(), Error> {
+    // RFC 9112 §6.1: Transfer-Encoding is undefined in HTTP/1.0 and must be rejected.
+    if minor == 0 || val.is_empty() {
+        return Err(Error::Malformed);
+    }
+    for part in val.split(|&c| c == b',') {
+        let coding = trim_ows(part);
+        if coding.is_empty() || !coding.iter().all(|&c| TOKEN[c as usize]) {
+            return Err(Error::Malformed);
+        }
+        // `chunked` must appear at most once and must be the final transfer coding.
+        if *chunked {
+            return Err(Error::Malformed);
+        }
+        if coding.eq_ignore_ascii_case(b"chunked") {
+            *chunked = true;
+        } else if !coding.eq_ignore_ascii_case(b"identity") {
+            return Err(Error::UnsupportedEncoding);
+        }
+    }
+    *saw_te = true;
+    Ok(())
+}
+
+/// Validate non-origin RFC 9112 §3.2 `request-target` forms (`*`, `authority-form`, `absolute-form`),
+/// returning `(target_end, path_span, query_span)`.
+#[cold]
+#[inline(never)]
+fn parse_non_origin_target(
+    b: &[u8],
+    t0: usize,
+    method: Method,
+) -> Result<(usize, Span, Span), Error> {
+    let t1 = scan_uri(b, t0);
+    if t1 == t0 || at(b, t1) != b' ' {
+        return Err(Error::Malformed);
+    }
+    let target = &b[t0..t1];
 
     if target == b"*" {
         return if method == Method::Options {
-            Ok((span(t0, t1), Span::default()))
+            Ok((t1, span(t0, t1), Span::default()))
         } else {
             Err(Error::Malformed)
         };
@@ -372,20 +440,12 @@ fn validate_and_split_target(
         i += 1;
     }
 
-    if target[0] == b'/' {
-        let (path, query) = match question_pos {
-            Some(q) => (span(t0, t0 + q), span(t0 + q + 1, t1)),
-            None => (span(t0, t1), Span::default()),
-        };
-        return Ok((path, query));
-    }
-
     if method == Method::Connect {
         return if scheme_sep.is_none()
             && question_pos.is_none()
             && semantics::is_valid_authority_bytes(target)
         {
-            Ok((span(t0, t1), Span::default()))
+            Ok((t1, span(t0, t1), Span::default()))
         } else {
             Err(Error::Malformed)
         };
@@ -423,12 +483,13 @@ fn validate_and_split_target(
             Some(q) => span(t0 + q + 1, t1),
             None => Span::default(),
         };
-        return Ok((path_span, query_span));
+        return Ok((t1, path_span, query_span));
     }
 
     Err(Error::Malformed)
 }
 
+#[inline]
 fn parse_decimal(v: &[u8]) -> Option<usize> {
     if v.is_empty() {
         return None;

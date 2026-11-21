@@ -135,6 +135,8 @@ impl Dechunker {
 
 /// Decode a chunked body from an immutable slice without allocating on `Ok(None)` (incomplete).
 /// Returns `Ok(Some((decoded_body, wire_bytes_consumed)))` when complete.
+#[cold]
+#[inline(never)]
 pub(crate) fn decode_chunked_slice(
     src: &[u8],
     max_body: usize,

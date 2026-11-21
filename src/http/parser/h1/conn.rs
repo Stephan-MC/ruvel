@@ -2,6 +2,7 @@
 //! and zero-copy borrowed `Request<'a>` view.
 
 use std::io::{self, Read};
+use std::sync::OnceLock;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -36,6 +37,9 @@ impl Limits {
 
     /// Resolve limits from runtime environment variables (`RV_REQUEST_BUFFER_SIZE`,
     /// `RV_MAX_HEADER_SIZE`, `RV_MAX_BODY_SIZE`), falling back to [`Limits::DEFAULT`].
+    ///
+    /// Reads process environment variables on each call; prefer calling once at startup
+    /// or using [`Limits::cached`] on hot paths.
     pub fn from_env() -> Limits {
         fn var(key: &str, default: usize) -> usize {
             std::env::var(key)
@@ -52,6 +56,13 @@ impl Limits {
             max_header,
             max_body: var("RV_MAX_BODY_SIZE", d.max_body),
         }
+    }
+
+    /// Return cached process-wide limits initialized once from [`Limits::from_env`].
+    #[inline]
+    pub fn cached() -> Limits {
+        static CACHED: OnceLock<Limits> = OnceLock::new();
+        *CACHED.get_or_init(Self::from_env)
     }
 }
 

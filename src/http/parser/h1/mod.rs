@@ -22,7 +22,8 @@ pub use conn::{Conn, Frame, Limits, Request};
 pub use head::{Body, Head, Method, Span};
 pub use scan::{
     find_head_end, find_head_end_scalar, find_lf, find_lf_swar, scan_name, scan_name_scalar,
-    scan_uri, scan_uri_scalar, skip_value, skip_value_swar,
+    scan_origin_target, scan_origin_target_scalar, scan_uri, scan_uri_scalar, skip_value,
+    skip_value_swar,
 };
 
 /// One complete HTTP/1.x request parsed from an immutable byte slice via [`parse_slice`].
@@ -40,33 +41,26 @@ impl<'a> SliceRequest<'a> {
     }
 }
 
-/// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
-/// enforcing `limits`.
-///
-/// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
-/// input, or `Err(Error)` on malformed syntax or exceeded limits.
-pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
-    let scan_limit = buf.len().min(limits.max_header);
-    let head_len = match find_head_end(&buf[..scan_limit], 0) {
-        Err(()) => return Err(Error::Malformed),
-        Ok(None) => {
-            return if buf.len() >= limits.max_header {
-                Err(Error::HeaderTooLarge)
-            } else {
-                Ok(Status::Incomplete)
-            };
-        }
-        Ok(Some(len)) => {
-            if len > limits.max_header {
-                return Err(Error::HeaderTooLarge);
-            }
-            len
-        }
-    };
+/// `(head_len, body_bytes)` parsed by [`parse_slice_into`].
+pub type SliceParts<'a> = (usize, Cow<'a, [u8]>);
 
-    let raw_head = &buf[..head_len];
-    let mut head = Head::new();
-    head.parse(raw_head)?;
+/// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
+/// writing the parsed head into caller-provided `head` and enforcing `limits`.
+///
+/// Returns `Ok(Status::Complete((head_len, body), bytes_consumed))`, `Ok(Status::Incomplete)` on
+/// partial input, or `Err(Error)` on malformed syntax or exceeded limits.
+#[inline]
+pub fn parse_slice_into<'a>(
+    buf: &'a [u8],
+    head: &mut Head,
+    limits: Limits,
+) -> Result<Status<SliceParts<'a>>, Error> {
+    let max_header = limits.max_header.min(u32::MAX as usize);
+    let scan_limit = buf.len().min(max_header);
+    let head_len = match head.parse_prefix(&buf[..scan_limit]) {
+        Ok(len) => len,
+        Err(err) => return classify_head_error(buf, max_header, err),
+    };
 
     let (body, consumed) = match head.body {
         Body::None => (Cow::Borrowed(&[][..]), head_len),
@@ -93,14 +87,55 @@ pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>
         }
     };
 
-    Ok(Status::Complete(
-        SliceRequest {
-            head,
-            raw_head,
-            body,
-        },
-        consumed,
-    ))
+    Ok(Status::Complete((head_len, body), consumed))
+}
+
+#[cold]
+#[inline(never)]
+fn classify_head_error<'a>(
+    buf: &[u8],
+    max_header: usize,
+    err: Error,
+) -> Result<Status<SliceParts<'a>>, Error> {
+    let scan_limit = buf.len().min(max_header);
+    match find_head_end(&buf[..scan_limit], 0) {
+        Err(()) => Err(Error::Malformed),
+        Ok(None) => {
+            if buf.len() >= max_header {
+                Err(Error::HeaderTooLarge)
+            } else {
+                Ok(Status::Incomplete)
+            }
+        }
+        Ok(Some(len)) => {
+            if len > max_header {
+                Err(Error::HeaderTooLarge)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
+/// enforcing `limits`.
+///
+/// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
+/// input, or `Err(Error)` on malformed syntax or exceeded limits.
+#[inline]
+pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
+    let mut head = Head::new();
+    match parse_slice_into(buf, &mut head, limits)? {
+        Status::Complete((head_len, body), consumed) => Ok(Status::Complete(
+            SliceRequest {
+                head,
+                raw_head: &buf[..head_len],
+                body,
+            },
+            consumed,
+        )),
+        Status::Incomplete => Ok(Status::Incomplete),
+    }
 }
 
 #[cfg(test)]
@@ -738,6 +773,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scan_origin_target_matches_scalar_and_exhaustive_lanes() {
+        let mut rng = Rng(0x7363_616E_5F75_7269);
+        for _ in 0..80_000 {
+            let len = 1 + rng.below(72);
+            let mut buf = Vec::with_capacity(len + 1);
+            buf.push(b'/');
+            for _ in 1..len {
+                let b = match rng.below(14) {
+                    0 => b'/',
+                    1 => b'?',
+                    2 => b'%',
+                    3 => b' ',
+                    4 => b'&',
+                    5 => b'=',
+                    6 => b'_',
+                    7 => b'-',
+                    8 => b'.',
+                    9 => 0x80 + rng.below(0x80) as u8,
+                    10 => rng.below(0x21) as u8,
+                    11 => b"#<>\"{}\\|^`"[rng.below(10)],
+                    12 => b'0' + rng.below(16) as u8,
+                    _ => {
+                        if rng.below(2) == 0 {
+                            b'a' + rng.below(26) as u8
+                        } else {
+                            b'A' + rng.below(26) as u8
+                        }
+                    }
+                };
+                buf.push(b);
+            }
+            let start = rng.below(buf.len());
+            assert_eq!(
+                scan_origin_target(&buf, start).map_err(|_| ()),
+                scan_origin_target_scalar(&buf, start).map_err(|_| ()),
+                "origin target {buf:?} from {start}"
+            );
+        }
+
+        // Exhaustive over every byte 0..=255 in every lane 0..20 inside a 21-byte slice ending with ' '.
+        for v in 0..=255u8 {
+            for lane in 0..20 {
+                let mut buf = vec![b'a'; 21];
+                buf[20] = b' ';
+                buf[lane] = v;
+                assert_eq!(
+                    scan_origin_target(&buf, 0).map_err(|_| ()),
+                    scan_origin_target_scalar(&buf, 0).map_err(|_| ()),
+                    "origin target byte {v:#x} lane {lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_pass_parse_slice_matches_cold_error_and_boundary_cases() {
+        // 1. Exact max_header boundary WITH trailing Content-Length body bytes after max_header.
+        let l = Limits {
+            initial_buf: 256,
+            max_header: 128,
+            max_body: 1024,
+        };
+        let prefix = b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+        let pad_len = l.max_header - prefix.len() - suffix.len();
+        let mut exact_with_body = Vec::with_capacity(l.max_header + 5);
+        exact_with_body.extend_from_slice(prefix);
+        exact_with_body.extend(std::iter::repeat_n(b'a', pad_len));
+        exact_with_body.extend_from_slice(suffix);
+        assert_eq!(exact_with_body.len(), l.max_header);
+        exact_with_body.extend_from_slice(b"he\nlo");
+
+        // 2. Body containing bare `\n` after valid `\r\n\r\n` succeeds without error.
+        let Status::Complete(req, consumed) = parse_slice(&exact_with_body, l).unwrap() else {
+            panic!("expected complete request at exact max_header + body");
+        };
+        assert_eq!(req.raw_head.len(), l.max_header);
+        assert_eq!(req.as_request().body(), b"he\nlo");
+        assert_eq!(consumed, exact_with_body.len());
+
+        // 3. Byte-by-byte truncation (0..raw.len()) returns Ok(Status::Incomplete).
+        for split in 0..GET.len() {
+            assert!(
+                matches!(parse_slice(&GET[..split], lim()), Ok(Status::Incomplete)),
+                "split at {split} must be incomplete"
+            );
+        }
+
+        // 4. Incomplete vs complete HTTP/2.0 and bare LF before terminator.
+        assert!(matches!(
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n", lim()),
+            Ok(Status::Incomplete)
+        ));
+        assert!(matches!(
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n\r\n", lim()),
+            Err(Error::VersionNotSupported)
+        ));
+        assert!(matches!(
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\n\r\n\r\n", lim()),
+            Err(Error::Malformed)
+        ));
+
+        // 5. Incomplete MAX_HEADERS + 1 vs complete MAX_HEADERS + 1 (< max_header).
+        let mut many_incomplete = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+        for i in 0..MAX_HEADERS {
+            many_incomplete.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
+        }
+        assert!(many_incomplete.len() + 2 <= lim().max_header);
+        assert!(matches!(
+            parse_slice(&many_incomplete, lim()),
+            Ok(Status::Incomplete)
+        ));
+        let mut many_complete = many_incomplete;
+        many_complete.extend_from_slice(b"\r\n");
+        assert!(matches!(
+            parse_slice(&many_complete, lim()),
+            Err(Error::HeaderTooLarge)
+        ));
+
+        // 6. parse_slice_into reusing one Head across two pipelined requests.
+        let mut pipelined = post(b"first");
+        pipelined.extend_from_slice(GET);
+        let mut head = Head::new();
+        let Status::Complete((h1_len, b1), c1) =
+            parse_slice_into(&pipelined, &mut head, lim()).unwrap()
+        else {
+            panic!("expected first pipelined request");
+        };
+        assert_eq!(b1.as_ref(), b"first");
+        assert_eq!(h1_len + 5, c1);
+        assert_eq!(head.method, Method::Post);
+
+        let Status::Complete((h2_len, b2), c2) =
+            parse_slice_into(&pipelined[c1..], &mut head, lim()).unwrap()
+        else {
+            panic!("expected second pipelined request");
+        };
+        assert!(b2.is_empty());
+        assert_eq!(h2_len, GET.len());
+        assert_eq!(c2, GET.len());
+        assert_eq!(head.method, Method::Get);
     }
 
     #[test]
