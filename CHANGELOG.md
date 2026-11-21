@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.12.0...ruvel-v0.12.1) (2026-11-21)
+
+
+### Performance Improvements
+
+* **http:** optimize H1 parser hot path with MaybeUninit Head, SSE2 origin target scan, and cold-path outlining ([12b2919](https://github.com/Stephan-MC/ruvel/commit/12b2919d5f91ca1f38e29179e93124a69c149f3b))
+* **parser:** Reduce parcing time but ~15% ([de4337f](https://github.com/Stephan-MC/ruvel/commit/de4337fd20daaf61929d1f98b1dbde8d9f580238))
+
 ## [0.12.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.11.1...ruvel-v0.12.0) (2026-11-21)
 
 
