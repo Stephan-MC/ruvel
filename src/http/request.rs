@@ -71,23 +71,6 @@ impl Request {
     }
 
     fn from_h1_head_only(raw: &h1::Request<'_>) -> Result<Self, parser::Error> {
-        let method = match raw.method() {
-            h1::Method::Get => Method::Get,
-            h1::Method::Head => Method::Head,
-            h1::Method::Post => Method::Post,
-            h1::Method::Put => Method::Put,
-            h1::Method::Delete => Method::Delete,
-            h1::Method::Patch => Method::Patch,
-            h1::Method::Options => Method::Options,
-            h1::Method::Trace => Method::Trace,
-            h1::Method::Connect => Method::Connect,
-            h1::Method::Other(span) => {
-                let s = std::str::from_utf8(span.of(raw.raw_head()))
-                    .map_err(|_| parser::Error::Malformed)?;
-                Method::Unknown(s.to_owned())
-            }
-        };
-
         let path_bytes = raw.path();
         let path = if path_bytes == b"/" {
             Cow::Borrowed("/")
@@ -115,7 +98,7 @@ impl Request {
         }
 
         Ok(Self {
-            method,
+            method: raw.method(),
             path,
             query,
             version: HttpVersion::from_h1_minor(raw.minor()),

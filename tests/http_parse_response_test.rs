@@ -339,7 +339,12 @@ fn test_request_parse_head_options_trace_and_connect_methods() {
         assert_eq!(req.path, expected_path);
     }
 
-    assert_eq!(Method::from("PURGE"), Method::Unknown("PURGE".to_string()));
+    let purge = Method::from("PURGE");
+    assert_eq!(purge, Method::other(b"PURGE").unwrap());
+    assert!(purge.is_other());
+    assert_eq!(purge.as_str(), "PURGE");
+    assert_eq!(purge.to_string(), "PURGE");
+    assert!(Method::other(&[b'A'; 24]).is_none());
 }
 
 #[test]
@@ -860,11 +865,9 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
                     Response::no_content().header("Allow", "GET, HEAD, POST, OPTIONS")
                 });
                 router.post("/spec", |req| async move { Response::ok().bytes(req.body) });
-                router.r#match(
-                    &[Method::Unknown("PURGE".to_string())],
-                    "/purge",
-                    |_req| async { Response::ok().text("purged") },
-                );
+                router.r#match(&[Method::from("PURGE")], "/purge", |_req| async {
+                    Response::ok().text("purged")
+                });
             });
         })
         .create();
