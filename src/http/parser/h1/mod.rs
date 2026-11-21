@@ -920,6 +920,26 @@ mod tests {
     }
 
     #[test]
+    fn custom_method_inline_limit() {
+        let ok_token = "X".repeat(23);
+        let ok_req = format!("{ok_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let Status::Complete(parsed, consumed) =
+            parse_slice(ok_req.as_bytes(), lim()).expect("23-byte custom method must succeed")
+        else {
+            panic!("expected complete request");
+        };
+        assert_eq!(consumed, ok_req.len());
+        assert!(parsed.head.method.is_other());
+        assert_eq!(parsed.head.method.as_str(), ok_token);
+        assert_eq!(parsed.head.method, Method::from(ok_token.as_str()));
+
+        let too_long_token = "X".repeat(24);
+        let bad_req = format!("{too_long_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let err = parse_slice(bad_req.as_bytes(), lim()).err().unwrap();
+        assert_eq!(err.status(), Some(400));
+    }
+
+    #[test]
     fn mutated_input_never_panics_and_fragmentation_is_consistent() {
         let mut seed = Vec::new();
         seed.extend_from_slice(GET);

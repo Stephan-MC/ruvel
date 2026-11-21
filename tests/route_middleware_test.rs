@@ -266,7 +266,7 @@ async fn test_any_method() {
 
     let kernel = app.make::<ruvel::http::Kernel>().unwrap();
 
-    for method in &[
+    for &method in &[
         Method::Get,
         Method::Head,
         Method::Post,
@@ -275,14 +275,14 @@ async fn test_any_method() {
         Method::Delete,
         Method::Options,
     ] {
-        let req = Request::new(method.clone(), "/any");
+        let req = Request::new(method, "/any");
         let res = kernel.handle(req).await;
         assert_eq!(res.status.code(), 200);
         assert_eq!(res.body, b"any response");
     }
 
-    for method in &[Method::Trace, Method::Connect] {
-        let req = Request::new(method.clone(), "/any");
+    for &method in &[Method::Trace, Method::Connect] {
+        let req = Request::new(method, "/any");
         let res = kernel.handle(req).await;
         assert_eq!(res.status.code(), 405);
         assert!(res.headers.get("Allow").is_some());

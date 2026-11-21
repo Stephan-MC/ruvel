@@ -171,10 +171,9 @@ impl Router {
 
         if trimmed.is_empty() {
             let slots = self.static_routes.entry(Box::from("")).or_default();
-            for method in methods {
-                slots.insert(method.clone(), Arc::clone(&route));
-                self.routes
-                    .insert_arc(method.clone(), &[], Arc::clone(&route));
+            for &method in methods {
+                slots.insert(method, Arc::clone(&route));
+                self.routes.insert_arc(method, &[], Arc::clone(&route));
             }
             return;
         }
@@ -189,14 +188,14 @@ impl Router {
                 Box::from(segments.join("/"))
             };
             let slots = self.static_routes.entry(key).or_default();
-            for method in methods {
-                slots.insert(method.clone(), Arc::clone(&route));
+            for &method in methods {
+                slots.insert(method, Arc::clone(&route));
             }
         }
 
-        for method in methods {
+        for &method in methods {
             self.routes
-                .insert_arc(method.clone(), &segments, Arc::clone(&route));
+                .insert_arc(method, &segments, Arc::clone(&route));
         }
     }
 
@@ -422,7 +421,7 @@ impl Router {
         }
 
         // Unrecognized HTTP method not matched by any route: 501 Not Implemented (RFC 9110 §9.1).
-        if matches!(req.method, Method::Unknown(_)) {
+        if req.method.is_other() {
             if !self.has_global_middlewares.load(Ordering::Acquire) {
                 return (self.not_implemented_handler)(req);
             }
