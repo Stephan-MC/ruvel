@@ -98,7 +98,7 @@ impl Default for Application {
 impl Application {
     pub fn new(_base_path: &str) -> Self {
         let mut app = Self {
-            version: "0.12.0", // x-release-please-version
+            version: "0.12.1", // x-release-please-version
             container: Container::new(),
             providers: Vec::new(),
             scheduler: Scheduler::default(),
