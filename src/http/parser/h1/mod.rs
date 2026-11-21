@@ -1,901 +1,779 @@
-mod framing;
+//! Std-only SIMD/SWAR HTTP/1.x request framing and head parser.
+//!
+//! Architecture summary:
+//! - One growable, always-initialized `Vec<u8>` per connection ([`Conn`]). Reads go straight
+//!   into its spare room without per-read copies or zeroing on the hot path.
+//! - The head is located first (`find_head_end`), then parsed once over a complete slice
+//!   into `(u32, u32)` [`Span`]s inside a reused [`Head`].
+//! - Content-Length bodies are sized from the header; chunked bodies are decoded *in place*
+//!   inside [`Conn`], keeping body bytes contiguous without per-request allocation.
+//! - Every state is resumable across arbitrary TCP fragmentation.
 
-pub use framing::H1Cursor;
+mod conn;
+mod dechunk;
+mod head;
+mod scan;
 
-use crate::http::{
-    Method,
-    parser::{
-        Error, Header, Headers, HttpVersion, MAX_HEADERS_SIZE, ParsedRequest, Parser, Status,
-        semantics,
-    },
+use std::borrow::Cow;
+
+use crate::http::parser::{Error, Status};
+
+pub use conn::{Conn, Frame, Limits, Request};
+pub use head::{Body, Head, Method, Span};
+pub use scan::{
+    find_head_end, find_head_end_scalar, find_lf, find_lf_swar, scan_name, scan_name_scalar,
+    scan_uri, scan_uri_scalar, skip_value, skip_value_swar,
 };
-use framing::{BodyFraming, FramingMeta};
 
-/// Optional bound on leading empty `CRLF` lines tolerated prior to the request line (RFC 9112 §2.2).
-/// Keep `None` for strict rejection unless explicitly enabled (e.g., `Some(1)`).
-const LEADING_CRLF_LIMIT: Option<usize> = None;
+/// One complete HTTP/1.x request parsed from an immutable byte slice via [`parse_slice`].
+pub struct SliceRequest<'a> {
+    pub head: Head,
+    pub raw_head: &'a [u8],
+    pub body: Cow<'a, [u8]>,
+}
 
-pub struct H1;
-
-impl Parser for H1 {
-    type Output<'a> = ParsedRequest<'a>;
-
-    fn parse<'a>(buf: &'a [u8]) -> Result<Status<Self::Output<'a>>, Error<'a>> {
-        let Some(bounds) = find_head_end(buf)? else {
-            return Ok(Status::Incomplete);
-        };
-
-        let head = parse_head_only(buf, bounds)?;
-        let body_start = bounds.header_end + 4;
-        let Some((body, consumed)) = framing::extract_body(buf, body_start, head.framing)? else {
-            return Ok(Status::Incomplete);
-        };
-
-        Ok(Status::Complete(
-            ParsedRequest {
-                method: head.method,
-                query: head.query,
-                path: head.path,
-                version: head.version,
-                headers: head.headers,
-                body,
-            },
-            consumed,
-        ))
+impl<'a> SliceRequest<'a> {
+    /// Borrow this parsed slice frame as an [`h1::Request`](Request) view.
+    #[inline]
+    pub fn as_request(&self) -> Request<'_> {
+        Request::from_parts(&self.head, self.raw_head, &self.body)
     }
 }
 
-impl H1 {
-    /// Incrementally parses an HTTP/1.x request across fragmented TCP reads using `cursor`.
-    pub fn parse_incremental<'a>(
-        buf: &'a [u8],
-        cursor: &mut H1Cursor,
-    ) -> Result<Status<ParsedRequest<'a>>, Error<'a>> {
-        let (bounds, framing) =
-            if let (Some(header_end), Some(framing)) = (cursor.header_end, cursor.framing) {
-                if header_end + 4 > buf.len() {
-                    return Err(Error::InvalidBody);
-                }
-                (
-                    HeadBounds {
-                        head_start: cursor.head_start,
-                        first_crlf: cursor.first_crlf,
-                        header_end,
-                    },
-                    framing,
-                )
+/// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
+/// enforcing `limits`.
+///
+/// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
+/// input, or `Err(Error)` on malformed syntax or exceeded limits.
+pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
+    let scan_limit = buf.len().min(limits.max_header);
+    let head_len = match find_head_end(&buf[..scan_limit], 0) {
+        Err(()) => return Err(Error::Malformed),
+        Ok(None) => {
+            return if buf.len() >= limits.max_header {
+                Err(Error::HeaderTooLarge)
             } else {
-                let Some(bounds) = find_head_end_with_cursor(buf, cursor)? else {
-                    return Ok(Status::Incomplete);
-                };
-                let head = parse_head_only(buf, bounds)?;
-                cursor.head_start = bounds.head_start;
-                cursor.first_crlf = bounds.first_crlf;
-                cursor.header_end = Some(bounds.header_end);
-                cursor.framing = Some(head.framing);
-                cursor.expect_100_continue =
-                    head.expect_100_continue && bounds.header_end + 4 == buf.len();
-                (bounds, head.framing)
+                Ok(Status::Incomplete)
             };
-
-        let body_start = bounds.header_end + 4;
-        let Some((body, consumed)) =
-            framing::extract_body_with_cursor(buf, body_start, framing, cursor)?
-        else {
-            return Ok(Status::Incomplete);
-        };
-
-        let head = parse_head_only(buf, bounds)?;
-        Ok(Status::Complete(
-            ParsedRequest {
-                method: head.method,
-                query: head.query,
-                path: head.path,
-                version: head.version,
-                headers: head.headers,
-                body,
-            },
-            consumed,
-        ))
-    }
-}
-
-#[derive(Copy, Clone)]
-struct HeadBounds {
-    head_start: usize,
-    first_crlf: Option<usize>,
-    header_end: usize,
-}
-
-struct ParsedHead<'a> {
-    method: Method,
-    path: &'a str,
-    query: &'a str,
-    version: HttpVersion,
-    headers: Headers<'a>,
-    framing: BodyFraming,
-    expect_100_continue: bool,
-}
-
-#[derive(Copy, Clone)]
-enum HostState<'a> {
-    Missing,
-    Single(&'a str),
-    Duplicate,
-}
-
-fn parse_head_only<'a>(buf: &'a [u8], bounds: HeadBounds) -> Result<ParsedHead<'a>, Error<'a>> {
-    let (request_line, header_bytes) = match bounds.first_crlf {
-        Some(crlf) => (
-            &buf[bounds.head_start..crlf],
-            &buf[crlf + 2..bounds.header_end],
-        ),
-        None => (&buf[bounds.head_start..bounds.header_end], &[][..]),
+        }
+        Ok(Some(len)) => {
+            if len > limits.max_header {
+                return Err(Error::HeaderTooLarge);
+            }
+            len
+        }
     };
 
-    let (method, path, query, version) = parse_request_line(request_line)?;
+    let raw_head = &buf[..head_len];
+    let mut head = Head::new();
+    head.parse(raw_head)?;
 
-    let mut headers = Headers::new();
-    let mut host_state = HostState::Missing;
-    let mut framing_meta = FramingMeta::default();
-    let mut expect_100_continue = false;
-
-    if !header_bytes.is_empty() {
-        let headers_str = std::str::from_utf8(header_bytes).map_err(|_| {
-            Error::InvalidHeader(Header {
-                name: "",
-                value: "",
-            })
-        })?;
-
-        let mut pos = 0usize;
-        while pos < header_bytes.len() {
-            let line_end = match semantics::find_byte(header_bytes, b'\n', pos) {
-                Some(lf_pos) => lf_pos.saturating_sub(1),
-                None => header_bytes.len(),
+    let (body, consumed) = match head.body {
+        Body::None => (Cow::Borrowed(&[][..]), head_len),
+        Body::Length(n) => {
+            if n > limits.max_body {
+                return Err(Error::BodyTooLarge);
+            }
+            let total = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
+            if buf.len() < total {
+                return Ok(Status::Incomplete);
+            }
+            (Cow::Borrowed(&buf[head_len..total]), total)
+        }
+        Body::Chunked => {
+            let Some((decoded, wire_consumed)) =
+                dechunk::decode_chunked_slice(&buf[head_len..], limits.max_body)?
+            else {
+                return Ok(Status::Incomplete);
             };
-            let line = &headers_str[pos..line_end];
-            let header = parse_header_line(line)?;
-            headers.push(header)?;
-
-            if header.name.len() == 4 && header.name.eq_ignore_ascii_case("host") {
-                host_state = match host_state {
-                    HostState::Missing => HostState::Single(header.value),
-                    HostState::Single(_) | HostState::Duplicate => HostState::Duplicate,
-                };
-            } else if header.name.len() == 6 && header.name.eq_ignore_ascii_case("expect") {
-                if header.value.eq_ignore_ascii_case("100-continue") {
-                    if version == HttpVersion::Http1_1 {
-                        expect_100_continue = true;
-                    }
-                } else {
-                    return Err(Error::ExpectationFailed);
-                }
-            } else {
-                framing_meta.observe_header(version, header)?;
-            }
-
-            pos = line_end.saturating_add(2);
+            let total = head_len
+                .checked_add(wire_consumed)
+                .ok_or(Error::BodyTooLarge)?;
+            (Cow::Owned(decoded), total)
         }
-    }
-
-    validate_host_state(version, host_state)?;
-    let framing = framing_meta.finalize()?;
-
-    Ok(ParsedHead {
-        method,
-        path,
-        query,
-        version,
-        headers,
-        framing,
-        expect_100_continue,
-    })
-}
-
-#[inline]
-fn validate_host_state<'a>(
-    version: HttpVersion,
-    host_state: HostState<'a>,
-) -> Result<(), Error<'a>> {
-    match host_state {
-        HostState::Missing if version == HttpVersion::Http1_1 => Err(Error::MissingHost),
-        HostState::Missing => Ok(()),
-        HostState::Single(value) if semantics::is_valid_host_value(value) => Ok(()),
-        HostState::Single(_) | HostState::Duplicate => Err(Error::InvalidHost),
-    }
-}
-
-/// Locate the `\r\n\r\n` head terminator and first `\r\n` in a single SWAR pass.
-#[inline]
-fn find_head_end(buf: &[u8]) -> Result<Option<HeadBounds>, Error<'static>> {
-    let mut scan_pos = 0usize;
-    let mut head_start = 0usize;
-    let mut first_crlf = None;
-    scan_head_bounds(buf, &mut scan_pos, &mut head_start, &mut first_crlf)
-}
-
-#[inline]
-fn find_head_end_with_cursor(
-    buf: &[u8],
-    cursor: &mut H1Cursor,
-) -> Result<Option<HeadBounds>, Error<'static>> {
-    scan_head_bounds(
-        buf,
-        &mut cursor.head_scan_pos,
-        &mut cursor.head_start,
-        &mut cursor.first_crlf,
-    )
-}
-
-fn scan_head_bounds(
-    buf: &[u8],
-    scan_pos: &mut usize,
-    head_start: &mut usize,
-    first_crlf: &mut Option<usize>,
-) -> Result<Option<HeadBounds>, Error<'static>> {
-    if *scan_pos == 0
-        && first_crlf.is_none()
-        && let Some(limit) = LEADING_CRLF_LIMIT
-    {
-        let mut skipped = 0usize;
-        while skipped < limit
-            && *head_start + 1 < buf.len()
-            && buf[*head_start] == b'\r'
-            && buf[*head_start + 1] == b'\n'
-        {
-            *head_start += 2;
-            skipped += 1;
-        }
-        *scan_pos = *head_start;
-    }
-
-    let max_end = (*head_start).saturating_add(MAX_HEADERS_SIZE);
-    let scan_buf = &buf[..buf.len().min(max_end)];
-    let mut i = (*scan_pos).min(scan_buf.len());
-
-    while let Some(pos) = semantics::find_cr_or_lf(scan_buf, i) {
-        let in_headers = first_crlf.is_some();
-        if scan_buf[pos] == b'\n' {
-            return Err(if in_headers {
-                Error::InvalidHeader(Header {
-                    name: "",
-                    value: "",
-                })
-            } else {
-                Error::InvalidRequestLine
-            });
-        }
-
-        if pos + 1 >= scan_buf.len() {
-            if buf.len() >= max_end {
-                return Err(Error::HeadersTooLarge);
-            }
-            *scan_pos = pos;
-            return Ok(None);
-        }
-        if scan_buf[pos + 1] != b'\n' {
-            return Err(if in_headers {
-                Error::InvalidHeader(Header {
-                    name: "",
-                    value: "",
-                })
-            } else {
-                Error::InvalidRequestLine
-            });
-        }
-
-        if pos + 3 < scan_buf.len() {
-            if scan_buf[pos + 2] == b'\r' && scan_buf[pos + 3] == b'\n' {
-                return Ok(Some(HeadBounds {
-                    head_start: *head_start,
-                    first_crlf: *first_crlf,
-                    header_end: pos,
-                }));
-            }
-        } else {
-            if buf.len() >= max_end {
-                return Err(Error::HeadersTooLarge);
-            }
-            // Fewer than 4 bytes remain from this `\r`; resume here on the next fragment.
-            *scan_pos = pos;
-            return Ok(None);
-        }
-
-        if first_crlf.is_none() {
-            *first_crlf = Some(pos);
-        }
-        i = pos + 2;
-    }
-
-    if buf.len() >= max_end {
-        return Err(Error::HeadersTooLarge);
-    }
-    *scan_pos = scan_buf.len();
-    Ok(None)
-}
-
-/// Parse and validate `method SP request-target SP HTTP-version` (RFC 9112 §3) without `Split`.
-fn parse_request_line(line: &[u8]) -> Result<(Method, &str, &str, HttpVersion), Error<'static>> {
-    if line.is_empty() {
-        return Err(Error::InvalidRequestLine);
-    }
-
-    let Some(sp1) = semantics::find_byte(line, b' ', 0) else {
-        return Err(Error::InvalidRequestLine);
-    };
-    let method_bytes = &line[..sp1];
-
-    let rest_start = sp1 + 1;
-    let Some(sp2) = semantics::find_byte(line, b' ', rest_start) else {
-        return Err(Error::InvalidRequestLine);
-    };
-    let target_bytes = &line[rest_start..sp2];
-    let version_bytes = &line[sp2 + 1..];
-
-    if method_bytes.is_empty()
-        || target_bytes.is_empty()
-        || version_bytes.is_empty()
-        || semantics::find_byte(version_bytes, b' ', 0).is_some()
-    {
-        return Err(Error::InvalidRequestLine);
-    }
-
-    let method = parse_method(method_bytes)?;
-    let (path, query) = parse_target(target_bytes, &method)?;
-    let version = parse_version(version_bytes)?;
-
-    Ok((method, path, query, version))
-}
-
-/// Validate that the method is a non-empty HTTP token (`1*tchar`) before converting.
-fn parse_method(method_bytes: &[u8]) -> Result<Method, Error<'static>> {
-    if method_bytes.is_empty() || !method_bytes.iter().copied().all(semantics::is_tchar) {
-        return Err(Error::InvalidMethod);
-    }
-
-    let method_str = std::str::from_utf8(method_bytes).map_err(|_| Error::InvalidMethod)?;
-    Ok(Method::from(method_str))
-}
-
-/// Validate `request-target` bytes and form in a single scan, returning `(path, query)`.
-fn parse_target<'a>(
-    target_bytes: &'a [u8],
-    method: &Method,
-) -> Result<(&'a str, &'a str), Error<'static>> {
-    if target_bytes.is_empty() {
-        return Err(Error::InvalidUri);
-    }
-
-    if target_bytes == b"*" {
-        return if *method == Method::Options {
-            Ok(("*", ""))
-        } else {
-            Err(Error::InvalidUri)
-        };
-    }
-
-    let mut question_pos: Option<usize> = None;
-    let mut scheme_sep: Option<usize> = None;
-    let mut i = 0usize;
-
-    while i < target_bytes.len() {
-        let b = target_bytes[i];
-        if !semantics::is_valid_uri_byte(b) {
-            return Err(Error::InvalidUri);
-        }
-        if b == b'%' {
-            if i + 2 >= target_bytes.len()
-                || !target_bytes[i + 1].is_ascii_hexdigit()
-                || !target_bytes[i + 2].is_ascii_hexdigit()
-            {
-                return Err(Error::InvalidUri);
-            }
-            i += 3;
-            continue;
-        }
-        if b == b'?' && question_pos.is_none() {
-            question_pos = Some(i);
-        } else if b == b':'
-            && scheme_sep.is_none()
-            && question_pos.is_none()
-            && i + 2 < target_bytes.len()
-            && target_bytes[i + 1] == b'/'
-            && target_bytes[i + 2] == b'/'
-        {
-            scheme_sep = Some(i);
-        }
-        i += 1;
-    }
-
-    let target = std::str::from_utf8(target_bytes).map_err(|_| Error::InvalidUri)?;
-
-    if target_bytes[0] == b'/' {
-        return Ok(split_at_question(target, question_pos));
-    }
-
-    if *method == Method::Connect {
-        return if scheme_sep.is_none()
-            && question_pos.is_none()
-            && semantics::is_valid_authority_form(target)
-        {
-            Ok((target, ""))
-        } else {
-            Err(Error::InvalidUri)
-        };
-    }
-
-    if let Some(colon) = scheme_sep {
-        if !semantics::is_valid_scheme(&target_bytes[..colon]) {
-            return Err(Error::InvalidUri);
-        }
-
-        let after_scheme_start = colon + 3;
-        let query_end = question_pos.unwrap_or(target.len());
-        if after_scheme_start >= query_end {
-            return Err(Error::InvalidUri);
-        }
-
-        let after_scheme = &target[after_scheme_start..query_end];
-        let (authority, path) = match semantics::find_byte(after_scheme.as_bytes(), b'/', 0) {
-            Some(slash) => (&after_scheme[..slash], &after_scheme[slash..]),
-            None => (after_scheme, "/"),
-        };
-
-        if !semantics::is_valid_host_value(authority) {
-            return Err(Error::InvalidUri);
-        }
-
-        let query = match question_pos {
-            Some(q) => &target[q + 1..],
-            None => "",
-        };
-        return Ok((path, query));
-    }
-
-    Err(Error::InvalidUri)
-}
-
-#[inline]
-fn split_at_question(target: &str, question_pos: Option<usize>) -> (&str, &str) {
-    match question_pos {
-        Some(q) => (&target[..q], &target[q + 1..]),
-        None => (target, ""),
-    }
-}
-
-/// Accept only `HTTP/1.0` and `HTTP/1.1` in the HTTP/1.x parser.
-fn parse_version(version_bytes: &[u8]) -> Result<HttpVersion, Error<'static>> {
-    let version_str = std::str::from_utf8(version_bytes).map_err(|_| Error::InvalidVersion)?;
-    match HttpVersion::from(version_str) {
-        HttpVersion::Http1_0 => Ok(HttpVersion::Http1_0),
-        HttpVersion::Http1_1 => Ok(HttpVersion::Http1_1),
-        HttpVersion::Http2 | HttpVersion::Http3 => Err(Error::UnsupportedProtocol),
-        HttpVersion::Unknown => {
-            // Syntactically valid `HTTP/x.y` versions outside 1.0/1.1 are unsupported protocols.
-            if matches!(
-                version_bytes,
-                [b'H', b'T', b'T', b'P', b'/', b'0'..=b'9', b'.', b'0'..=b'9']
-            ) {
-                Err(Error::UnsupportedProtocol)
-            } else {
-                Err(Error::InvalidVersion)
-            }
-        }
-    }
-}
-
-/// Parse and validate one header field line (`field-name ":" OWS field-value OWS`) per RFC 9112 §5.
-pub(super) fn parse_header_line(line: &str) -> Result<Header<'_>, Error<'_>> {
-    let Some(colon) = semantics::find_byte(line.as_bytes(), b':', 0) else {
-        return Err(Error::InvalidHeader(Header {
-            name: line,
-            value: "",
-        }));
     };
 
-    let name = &line[..colon];
-    let value = line[colon + 1..].trim_matches([' ', '\t']);
-
-    if name.is_empty() || !name.bytes().all(semantics::is_tchar) {
-        return Err(Error::InvalidHeader(Header { name, value }));
-    }
-
-    if !value.bytes().all(semantics::is_valid_header_value_byte) {
-        return Err(Error::InvalidHeader(Header { name, value }));
-    }
-
-    Ok(Header { name, value })
+    Ok(Status::Complete(
+        SliceRequest {
+            head,
+            raw_head,
+            body,
+        },
+        consumed,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Read};
+
+    use super::scan::VALUE;
     use super::*;
     use crate::http::parser::MAX_HEADERS;
 
-    fn parse_h1(buf: &[u8]) -> Result<Status<ParsedRequest<'_>>, Error<'_>> {
-        H1::parse(buf)
+    /// Hands out at most `step` bytes per read(): worst-case TCP fragmentation.
+    struct Dribble<'a> {
+        data: &'a [u8],
+        pos: usize,
+        step: usize,
     }
 
-    #[test]
-    fn parses_bodyless_request_without_headers_and_returns_exact_consumed() {
-        let raw = b"GET / HTTP/1.0\r\n\r\n";
-        let res = parse_h1(raw).expect("valid request");
-        let Status::Complete(req, consumed) = res else {
-            panic!("expected complete frame");
-        };
-
-        assert_eq!(req.method, Method::Get);
-        assert_eq!(req.path, "/");
-        assert_eq!(req.query, "");
-        assert_eq!(req.version, HttpVersion::Http1_0);
-        assert!(req.headers.is_empty());
-        assert!(req.body.is_empty());
-        assert_eq!(consumed, raw.len());
-    }
-
-    #[test]
-    fn splits_query_populates_headers_and_preserves_pipelined_tail() {
-        let head =
-            b"GET /users?page=2&sort=asc HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
-        let mut raw = head.to_vec();
-        raw.extend_from_slice(b"GET /next HTTP/1.1\r\n\r\n");
-
-        let res = parse_h1(&raw).expect("valid request");
-        let Status::Complete(req, consumed) = res else {
-            panic!("expected complete frame");
-        };
-
-        assert_eq!(req.method, Method::Get);
-        assert_eq!(req.path, "/users");
-        assert_eq!(req.query, "page=2&sort=asc");
-        assert_eq!(req.version, HttpVersion::Http1_1);
-        assert_eq!(req.headers.len(), 2);
-        assert_eq!(
-            req.headers.as_slice(),
-            &[
-                Header {
-                    name: "Host",
-                    value: "example.com"
-                },
-                Header {
-                    name: "Accept",
-                    value: "*/*"
-                },
-            ]
-        );
-        assert_eq!(consumed, head.len());
-    }
-
-    #[test]
-    fn returns_incomplete_on_fragmented_head() {
-        assert_eq!(
-            parse_h1(b"GET / HTTP/1.1\r\nHost: a\r\n\r"),
-            Ok(Status::Incomplete)
-        );
-        assert_eq!(parse_h1(b"GET / HTTP/1.1\r"), Ok(Status::Incomplete));
-        assert_eq!(parse_h1(b""), Ok(Status::Incomplete));
-    }
-
-    #[test]
-    fn rejects_too_many_headers_instead_of_panicking() {
-        let mut raw = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
-        for i in 0..MAX_HEADERS {
-            raw.extend_from_slice(format!("X-H{i}: 1\r\n").as_bytes());
+    impl Read for Dribble<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let n = self.step.min(out.len()).min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
         }
-        raw.extend_from_slice(b"\r\n");
-        assert_eq!(parse_h1(&raw), Err(Error::TooManyHeaders));
     }
 
-    #[test]
-    fn accepts_valid_target_forms_and_extension_methods() {
-        let options = parse_h1(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-        let Status::Complete(req, _) = options else {
-            panic!("expected complete");
+    #[derive(Debug, PartialEq)]
+    struct Got {
+        method: String,
+        target: Vec<u8>,
+        path: Vec<u8>,
+        query: Vec<u8>,
+        body: Vec<u8>,
+        keep_alive: bool,
+        host: Vec<u8>,
+    }
+
+    fn run(stream: &[u8], step: usize, lim: Limits) -> Result<Vec<Got>, Error> {
+        let mut conn = Conn::new(lim);
+        let mut src = Dribble {
+            data: stream,
+            pos: 0,
+            step,
         };
-        assert_eq!(req.method, Method::Options);
-        assert_eq!(req.path, "*");
-        assert_eq!(req.query, "");
+        let mut out = Vec::new();
+        while let Some(f) = conn.read_request(&mut src)? {
+            {
+                let q = conn.request(f);
+                out.push(Got {
+                    method: format!("{:?}", q.method()),
+                    target: q.target().to_vec(),
+                    path: q.path().to_vec(),
+                    query: q.query().to_vec(),
+                    body: q.body().to_vec(),
+                    keep_alive: q.keep_alive(),
+                    host: q.header(b"HOST").unwrap_or(b"").to_vec(),
+                });
+            }
+            conn.consume(f);
+        }
+        Ok(out)
+    }
 
-        let connect =
-            parse_h1(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").unwrap();
-        let Status::Complete(req, _) = connect else {
-            panic!("expected complete");
+    fn lim() -> Limits {
+        Limits {
+            initial_buf: 256,
+            max_header: 8 * 1024,
+            max_body: 1 << 20,
+        }
+    }
+
+    const GET: &[u8] =
+        b"GET /a?b=1 HTTP/1.1\r\nHost: x.test\r\nUser-Agent: t\r\nAccept: */*\r\n\r\n";
+
+    fn post(body: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "POST /p HTTP/1.1\r\nHost: x.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn chunked(parts: &[&[u8]]) -> Vec<u8> {
+        let mut v =
+            b"POST /c HTTP/1.1\r\nHost: x.test\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for p in parts {
+            v.extend_from_slice(format!("{:x};ext=1\r\n", p.len()).as_bytes());
+            v.extend_from_slice(p);
+            v.extend_from_slice(b"\r\n");
+        }
+        v.extend_from_slice(b"0\r\nX-Trailer: 1\r\n\r\n");
+        v
+    }
+
+    fn status(stream: &[u8], l: Limits) -> Option<u16> {
+        match run(stream, 7, l) {
+            Err(e) => e.status(),
+            Ok(_) => Some(200),
+        }
+    }
+
+    #[test]
+    fn head_fields() {
+        let mut h = Head::new();
+        h.parse(b"PUT /x HTTP/1.1\r\nHost: a\r\nConnection: Keep-Alive, close\r\nContent-Length: 5\r\nX-A:  v \t\r\n\r\n").unwrap();
+        assert_eq!(h.method, Method::Put);
+        assert_eq!(h.body, Body::Length(5));
+        assert!(!h.keep_alive);
+        assert_eq!(h.header_count(), 4);
+
+        let mut h = Head::new();
+        h.parse(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        assert!(h.keep_alive && h.minor == 0);
+    }
+
+    #[test]
+    fn every_fragmentation_gives_same_result() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(GET);
+        stream.extend_from_slice(&post(b"hello world"));
+        stream.extend_from_slice(&chunked(&[b"abc", b"defghij", b"k"]));
+        stream.extend_from_slice(GET);
+        stream.extend_from_slice(&post(&vec![b'z'; 3000]));
+        stream.extend_from_slice(&chunked(&[&vec![b'q'; 5000], b"tail"]));
+        stream
+            .extend_from_slice(b"GET /last HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n");
+
+        let whole = run(&stream, usize::MAX, lim()).unwrap();
+        assert_eq!(whole.len(), 7);
+        assert_eq!(whole[0].path, b"/a");
+        assert_eq!(whole[0].query, b"b=1");
+        assert_eq!(whole[2].body, b"abcdefghijk");
+        assert_eq!(whole[5].body.len(), 5004);
+        assert!(!whole[6].keep_alive);
+
+        let mut steps: Vec<usize> = (1..=64).collect();
+        steps.extend([97, 255, 256, 257, 1000, 4096, 8191]);
+        for step in steps {
+            let got = run(&stream, step, lim()).unwrap();
+            assert_eq!(got, whole, "step={step}");
+        }
+    }
+
+    #[test]
+    fn small_initial_buffer_grows_for_headers_and_bodies() {
+        let mut req = b"GET /big HTTP/1.1\r\nHost: x.test\r\n".to_vec();
+        req.extend_from_slice(b"X-Big: ");
+        req.extend_from_slice(&vec![b'a'; 6000]);
+        req.extend_from_slice(b"\r\n\r\n");
+        let l = Limits {
+            initial_buf: 256,
+            max_header: 8192,
+            max_body: 4 << 20,
         };
-        assert_eq!(req.method, Method::Connect);
-        assert_eq!(req.path, "example.com:443");
+        assert_eq!(run(&req, 100, l).unwrap().len(), 1);
 
-        let abs = parse_h1(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n").unwrap();
-        let Status::Complete(req, _) = abs else {
-            panic!("expected complete");
+        let body = vec![b'x'; 1 << 20]; // lazy (geometric) growth path
+        let got = run(&post(&body), 8192, l).unwrap();
+        assert_eq!(got[0].body.len(), body.len());
+    }
+
+    #[test]
+    fn buffer_shrinks_after_big_request() {
+        let l = Limits {
+            initial_buf: 1024,
+            max_header: 8192,
+            max_body: 4 << 20,
         };
-        assert_eq!(req.path, "/v1");
-        assert_eq!(req.query, "x=1%202");
+        let mut stream = post(&vec![b'x'; 300_000]);
+        stream.extend_from_slice(GET);
+        let mut conn = Conn::new(l);
+        let mut src = Dribble {
+            data: &stream,
+            pos: 0,
+            step: 65536,
+        };
+        let f = conn.read_request(&mut src).unwrap().unwrap();
+        assert!(conn.buffer_capacity() >= 300_000);
+        conn.consume(f);
+        assert_eq!(conn.buffer_capacity(), 1024);
+        let f = conn.read_request(&mut src).unwrap().unwrap(); // pipelined leftover survives
+        assert_eq!(conn.request(f).target(), b"/a?b=1");
     }
 
     #[test]
-    fn rejects_bare_cr_or_lf_in_head() {
+    fn rejections() {
+        let l = lim();
+        // limits
+        let mut big = b"GET / HTTP/1.1\r\nHost: x\r\nX: ".to_vec();
+        big.extend_from_slice(&vec![b'a'; 9000]);
+        big.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(status(&big, l), Some(431));
+
+        let cl = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n";
+        assert_eq!(status(cl, l), Some(413));
+
+        let mut many = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        for i in 0..MAX_HEADERS {
+            many.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"\r\n");
+        assert_eq!(status(&many, l), Some(431));
+
+        // chunked body over the limit
+        let small = Limits { max_body: 10, ..l };
+        assert_eq!(status(&chunked(&[b"0123456", b"789abc"]), small), Some(413));
+
+        // smuggling / malformed
+        let cases: &[&[u8]] = &[
+            b"GET / HTTP/1.1\nHost: x\n\n",                                              // bare LF
+            b"GET / HTTP/1.1\r\nHost: x\r\nFoo: a\nb\r\n\r\n",                           // bare LF in value
+            b"GET / HTTP/1.1\r\nHost: x\r\nFoo: a\rb\r\n\r\n",                           // bare CR in value
+            b"GET / HTTP/1.1\r\nHost : x\r\n\r\n",                                       // SP before colon
+            b"GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n",                             // obs-fold
+            b"GET / HTTP/1.1\r\n\r\n",                                                   // no Host
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",                             // two Hosts
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 1\r\n\r\na",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: +1\r\n\r\na",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"G(T / HTTP/1.1\r\nHost: x\r\n\r\n",                                         // bad method
+            b"GET  / HTTP/1.1\r\nHost: x\r\n\r\n",                                       // double SP
+            b"GET /a b HTTP/1.1\r\nHost: x\r\n\r\n",                                     // SP in target
+            b"GET / HTTP/1.1\r\nHost: x\r\nA\x01: v\r\n\r\n",                            // CTL in name
+            b"GET / HTTP/1.1\r\nHost: x\r\nA: v\x00\r\n\r\n",                            // NUL in value
+            b"GET / HTTP/1.1\r\nHost: x\r\nA: v\x7f\r\n\r\n",                            // DEL in value
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",   // bad chunk size
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nabX0\r\n\r\n", // missing CRLF after data
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            assert_eq!(
+                status(c, l),
+                Some(400),
+                "case {i}: {}",
+                String::from_utf8_lossy(c)
+            );
+        }
+        assert_eq!(status(b"GET / HTTP/2.0\r\nHost: x\r\n\r\n", l), Some(505));
+        assert_eq!(status(b"GET / HTTP/2\r\nHost: x\r\n\r\n", l), Some(505));
         assert_eq!(
-            parse_h1(b"GET / HTTP/1.1\n\r\n"),
-            Err(Error::InvalidRequestLine)
+            status(
+                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                l
+            ),
+            Some(501)
         );
-        assert_eq!(
-            parse_h1(b"GET / HTTP/1.1\rX\r\n\r\n"),
-            Err(Error::InvalidRequestLine)
-        );
-        assert!(matches!(
-            parse_h1(b"GET / HTTP/1.1\r\nHost: a\n\r\n"),
-            Err(Error::InvalidHeader(_))
-        ));
     }
 
     #[test]
-    fn rejects_invalid_request_lines_methods_uris_and_versions() {
-        assert_eq!(parse_h1(b"\r\n\r\n"), Err(Error::InvalidRequestLine));
-        assert_eq!(
-            parse_h1(b"GET  / HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidRequestLine)
-        );
-        assert_eq!(parse_h1(b"GET /\r\n\r\n"), Err(Error::InvalidRequestLine));
-        assert_eq!(
-            parse_h1(b"BAD\tMETHOD / HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidMethod)
-        );
-        assert_eq!(
-            parse_h1(b"GET /bad#frag HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"GET /bad%ZZ HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(parse_h1(b"GET * HTTP/1.1\r\n\r\n"), Err(Error::InvalidUri));
-        assert_eq!(
-            parse_h1(b"GET foo HTTP/1.1\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"GET / HTTP/2\r\n\r\n"),
-            Err(Error::UnsupportedProtocol)
-        );
-        assert_eq!(
-            parse_h1(b"GET / HTTP/2.0\r\n\r\n"),
-            Err(Error::UnsupportedProtocol)
-        );
-        assert_eq!(
-            parse_h1(b"GET / GARBAGE\r\n\r\n"),
-            Err(Error::InvalidVersion)
-        );
-        assert_eq!(
-            parse_h1(b"GET / http/1.1\r\n\r\n"),
-            Err(Error::InvalidVersion)
-        );
-    }
-
-    #[test]
-    fn validates_absolute_form_authority_connect_ports_and_host_headers() {
-        let Status::Complete(root_abs, _) =
-            parse_h1(b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap()
+    fn rfc9112_target_forms_host_and_expect_compliance() {
+        // Valid target forms
+        let Status::Complete(opt, _) =
+            parse_slice(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n", lim()).unwrap()
         else {
             panic!("expected complete");
         };
-        assert_eq!(root_abs.path, "/");
-        assert_eq!(root_abs.query, "a=1");
+        assert_eq!(opt.as_request().method(), Method::Options);
+        assert_eq!(opt.as_request().path(), b"*");
+        assert_eq!(opt.as_request().query(), b"");
 
-        assert_eq!(
-            parse_h1(b"GET http://user@example.com/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"GET http://example.com:0/p HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"CONNECT example.com:0 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"CONNECT example.com:080 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(
-            parse_h1(b"CONNECT example.com:65536 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Err(Error::InvalidUri)
-        );
-        assert_eq!(parse_h1(b"GET / HTTP/1.1\r\n\r\n"), Err(Error::MissingHost));
-        assert_eq!(
-            parse_h1(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
-            Err(Error::InvalidHost)
-        );
-        assert_eq!(
-            parse_h1(b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n"),
-            Err(Error::InvalidHost)
-        );
-    }
-
-    #[test]
-    fn validates_ordered_transfer_encoding_and_rejects_smuggling() {
-        let ok_ordered = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_h1(ok_ordered).unwrap() else {
+        let Status::Complete(conn_req, _) = parse_slice(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            lim(),
+        )
+        .unwrap() else {
             panic!("expected complete");
         };
-        assert_eq!(req.body.as_ref(), b"hello");
-        assert!(matches!(req.body, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(consumed, ok_ordered.len());
+        assert_eq!(conn_req.as_request().method(), Method::Connect);
+        assert_eq!(conn_req.as_request().path(), b"example.com:443");
 
+        let Status::Complete(abs, _) =
+            parse_slice(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n", lim()).unwrap()
+        else {
+            panic!("expected complete");
+        };
+        assert_eq!(abs.as_request().path(), b"/v1");
+        assert_eq!(abs.as_request().query(), b"x=1%202");
+
+        let Status::Complete(root_abs, _) = parse_slice(
+            b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            lim(),
+        )
+        .unwrap() else {
+            panic!("expected complete");
+        };
+        assert_eq!(root_abs.as_request().path(), b"/");
+        assert_eq!(root_abs.as_request().query(), b"a=1");
+
+        // Invalid targets / host ports
         for bad in [
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, identity\r\n\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
+            &b"GET /bad#frag HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET /bad%ZZ HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET * HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET foo HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET http://user@example.com/p HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"GET http://example.com:0/p HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"CONNECT example.com:0 HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"CONNECT example.com:080 HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"CONNECT example.com:65536 HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n"[..],
+            &b"GET / http/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET / GARBAGE\r\nHost: a\r\n\r\n"[..],
         ] {
-            assert!(matches!(parse_h1(bad), Err(Error::InvalidHeader(_))));
-        }
-    }
-
-    #[test]
-    fn validates_chunk_extensions_trailers_and_multi_chunk_decode() {
-        let quoted_ext = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\"a\\\"b\";flag\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_h1(quoted_ext).unwrap() else {
-            panic!("expected complete");
-        };
-        assert_eq!(req.body.as_ref(), b"hello");
-        assert_eq!(consumed, quoted_ext.len());
-
-        // > 16 chunks exercises span cache spill path
-        let mut many = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-        for _ in 0..20 {
-            many.extend_from_slice(b"1\r\nx\r\n");
-        }
-        many.extend_from_slice(b"0\r\n\r\n");
-        let Status::Complete(many_req, many_consumed) = parse_h1(&many).unwrap() else {
-            panic!("expected complete");
-        };
-        assert_eq!(many_req.body.as_ref(), &[b'x'; 20]);
-        assert_eq!(many_consumed, many.len());
-
-        for bad_ext in [
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;\r\nhello\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;a=\r\nhello\r\n0\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;bad name=1\r\nhello\r\n0\r\n\r\n"[..],
-        ] {
-            assert_eq!(parse_h1(bad_ext), Err(Error::InvalidBody));
-        }
-
-        let mut oversized_ext =
-            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
-        oversized_ext.extend_from_slice(&[b'a'; 1025]);
-        oversized_ext.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
-        assert_eq!(parse_h1(&oversized_ext), Err(Error::InvalidBody));
-
-        for forbidden_trailer in [
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nAuthorization: Bearer x\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nCookie: a=1\r\n\r\n"[..],
-            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Type: text/plain\r\n\r\n"[..],
-        ] {
-            assert!(matches!(
-                parse_h1(forbidden_trailer),
-                Err(Error::InvalidHeader(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn incremental_cursor_parses_chunked_byte_by_byte() {
-        let raw = b"POST /up?v=1 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nX-Check: ok\r\n\r\n";
-        let mut cursor = H1Cursor::new();
-
-        for split in 0..raw.len() {
             assert_eq!(
-                H1::parse_incremental(&raw[..split], &mut cursor),
-                Ok(Status::Incomplete),
-                "split at byte {split} must be incomplete"
+                status(bad, lim()),
+                Some(400),
+                "{}",
+                String::from_utf8_lossy(bad)
             );
         }
 
-        let Status::Complete(req, consumed) = H1::parse_incremental(raw, &mut cursor).unwrap()
-        else {
-            panic!("expected complete frame");
-        };
-        assert_eq!(req.path, "/up");
-        assert_eq!(req.query, "v=1");
-        assert_eq!(req.body.as_ref(), b"hello world");
-        assert_eq!(consumed, raw.len());
-    }
-
-    #[test]
-    fn enforces_max_headers_size_exact_boundary() {
-        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
-        let suffix = b"\r\n\r\n";
-
-        let exact_pad_len = MAX_HEADERS_SIZE - prefix.len() - suffix.len();
-        let mut exact = Vec::with_capacity(MAX_HEADERS_SIZE + 5);
-        exact.extend_from_slice(prefix);
-        exact.extend(std::iter::repeat_n(b'a', exact_pad_len));
-        exact.extend_from_slice(suffix);
-        assert_eq!(exact.len(), MAX_HEADERS_SIZE);
-
-        let Status::Complete(req, consumed) = H1::parse(&exact).expect("exact limit must pass")
-        else {
-            panic!("expected complete frame");
-        };
-        assert_eq!(consumed, MAX_HEADERS_SIZE);
-        assert_eq!(req.headers.get("Host"), Some("localhost"));
-
-        let mut cursor = H1Cursor::new();
-        assert_eq!(
-            H1::parse_incremental(&exact[..MAX_HEADERS_SIZE - 1], &mut cursor),
-            Ok(Status::Incomplete)
-        );
-        assert!(matches!(
-            H1::parse_incremental(&exact, &mut cursor),
-            Ok(Status::Complete(_, c)) if c == MAX_HEADERS_SIZE
-        ));
-
-        let mut too_large = Vec::with_capacity(MAX_HEADERS_SIZE + 1);
-        too_large.extend_from_slice(prefix);
-        too_large.extend(std::iter::repeat_n(b'a', exact_pad_len + 1));
-        too_large.extend_from_slice(suffix);
-        assert_eq!(too_large.len(), MAX_HEADERS_SIZE + 1);
-        assert_eq!(H1::parse(&too_large), Err(Error::HeadersTooLarge));
-
-        let mut cursor_over = H1Cursor::new();
-        assert_eq!(
-            H1::parse_incremental(&too_large[..MAX_HEADERS_SIZE - 1], &mut cursor_over),
-            Ok(Status::Incomplete)
-        );
-        assert_eq!(
-            H1::parse_incremental(&too_large[..MAX_HEADERS_SIZE], &mut cursor_over),
-            Err(Error::HeadersTooLarge)
-        );
-    }
-
-    #[test]
-    fn validates_expect_header_and_100_continue_cursor_state() {
-        let head_only = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
-        let mut cursor = H1Cursor::new();
-        assert_eq!(
-            H1::parse_incremental(head_only, &mut cursor),
-            Ok(Status::Incomplete)
-        );
-        assert!(cursor.take_expect_100_continue());
-        assert!(!cursor.take_expect_100_continue());
-        assert_eq!(cursor.expected_total_len(), Some(head_only.len() + 5));
-
-        let mut full = head_only.to_vec();
-        full.extend_from_slice(b"hello");
-        let Status::Complete(req, consumed) = H1::parse_incremental(&full, &mut cursor).unwrap()
-        else {
-            panic!("expected complete frame");
-        };
-        assert_eq!(req.body.as_ref(), b"hello");
-        assert_eq!(consumed, full.len());
-
-        // If body arrived in the same buffer as headers, skip unsolicited 100 Continue.
-        let partial_body = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhe";
-        let mut cursor_same_buf = H1Cursor::new();
-        assert_eq!(
-            H1::parse_incremental(partial_body, &mut cursor_same_buf),
-            Ok(Status::Incomplete)
-        );
-        assert!(!cursor_same_buf.take_expect_100_continue());
-
-        // HTTP/1.0 accepts Expect: 100-continue without requesting 100 Continue.
-        let http10 = b"POST /up HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
-        let mut cursor_10 = H1Cursor::new();
-        assert_eq!(
-            H1::parse_incremental(http10, &mut cursor_10),
-            Ok(Status::Incomplete)
-        );
-        assert!(!cursor_10.take_expect_100_continue());
-
+        // Expect: 100-continue and 417 Expectation Failed
         for bad_expect in [
             &b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: bogus\r\nContent-Length: 5\r\n\r\n"
                 [..],
             &b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect:\r\nContent-Length: 5\r\n\r\n"[..],
         ] {
-            assert_eq!(H1::parse(bad_expect), Err(Error::ExpectationFailed));
+            assert_eq!(status(bad_expect, lim()), Some(417));
+        }
+
+        // Expect: 100-continue triggers only when headers arrive without body bytes on HTTP/1.1
+        let head_only = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
+        let mut conn = Conn::new(lim());
+        let mut rdr = io::Cursor::new(head_only);
+        assert!(conn.fill(&mut rdr).unwrap() == head_only.len());
+        assert!(conn.try_next_request().unwrap().is_none());
+        assert!(conn.take_expect_100_continue());
+        assert!(!conn.take_expect_100_continue());
+
+        let partial_body = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhe";
+        let mut conn2 = Conn::new(lim());
+        let mut rdr2 = io::Cursor::new(partial_body);
+        assert!(conn2.fill(&mut rdr2).unwrap() == partial_body.len());
+        assert!(conn2.try_next_request().unwrap().is_none());
+        assert!(!conn2.take_expect_100_continue());
+    }
+
+    #[test]
+    fn transfer_encoding_chunk_ext_and_trailer_compliance() {
+        let ok_ordered = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let Status::Complete(req, consumed) = parse_slice(ok_ordered, lim()).unwrap() else {
+            panic!("expected complete");
+        };
+        assert_eq!(req.as_request().body(), b"hello");
+        assert_eq!(consumed, ok_ordered.len());
+
+        let quoted_ext = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\"a\\\"b\";flag\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n";
+        let Status::Complete(req, consumed) = parse_slice(quoted_ext, lim()).unwrap() else {
+            panic!("expected complete");
+        };
+        assert_eq!(req.as_request().body(), b"hello");
+        assert_eq!(consumed, quoted_ext.len());
+
+        // > 16 chunks exercises span cache spill path in slice decoder
+        let mut many = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..20 {
+            many.extend_from_slice(b"1\r\nx\r\n");
+        }
+        many.extend_from_slice(b"0\r\n\r\n");
+        let Status::Complete(many_req, many_consumed) = parse_slice(&many, lim()).unwrap() else {
+            panic!("expected complete");
+        };
+        assert_eq!(many_req.as_request().body(), &[b'x'; 20]);
+        assert_eq!(many_consumed, many.len());
+
+        // Malformed chunk extensions & forbidden trailers -> 400
+        for bad in [
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, identity\r\n\r\n0\r\n\r\n"
+                [..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n"
+                [..],
+            &b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;\r\nhello\r\n0\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;a=\r\nhello\r\n0\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;bad name=1\r\nhello\r\n0\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nAuthorization: Bearer x\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nCookie: a=1\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Type: text/plain\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBadTrailer\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                status(bad, lim()),
+                Some(400),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // Unknown transfer-encoding -> 501
+        assert_eq!(
+            status(
+                b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n",
+                lim()
+            ),
+            Some(501)
+        );
+
+        let mut oversized_ext =
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
+        oversized_ext.extend_from_slice(&[b'a'; 1025]);
+        oversized_ext.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+        assert_eq!(status(&oversized_ext, lim()), Some(400));
+    }
+
+    #[test]
+    fn enforces_max_header_exact_boundary() {
+        let l = Limits {
+            initial_buf: 256,
+            max_header: 512,
+            max_body: 1024,
+        };
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+
+        let exact_pad_len = l.max_header - prefix.len() - suffix.len();
+        let mut exact = Vec::with_capacity(l.max_header);
+        exact.extend_from_slice(prefix);
+        exact.extend(std::iter::repeat_n(b'a', exact_pad_len));
+        exact.extend_from_slice(suffix);
+        assert_eq!(exact.len(), l.max_header);
+
+        let Status::Complete(_, consumed) = parse_slice(&exact, l).unwrap() else {
+            panic!("expected complete");
+        };
+        assert_eq!(consumed, l.max_header);
+        assert_eq!(run(&exact, 13, l).unwrap().len(), 1);
+
+        let mut too_large = Vec::with_capacity(l.max_header + 1);
+        too_large.extend_from_slice(prefix);
+        too_large.extend(std::iter::repeat_n(b'a', exact_pad_len + 1));
+        too_large.extend_from_slice(suffix);
+        assert_eq!(too_large.len(), l.max_header + 1);
+        assert!(matches!(
+            parse_slice(&too_large, l),
+            Err(Error::HeaderTooLarge)
+        ));
+        assert_eq!(status(&too_large, l), Some(431));
+    }
+
+    #[test]
+    fn eof_handling() {
+        assert!(run(b"", 1, lim()).unwrap().is_empty()); // clean close
+        assert!(matches!(
+            run(&GET[..GET.len() - 1], 5, lim()),
+            Err(Error::Eof)
+        ));
+        let p = post(b"0123456789");
+        assert!(matches!(run(&p[..p.len() - 1], 5, lim()), Err(Error::Eof)));
+    }
+
+    #[tokio::test]
+    async fn async_conn_reads_pipelined_and_chunked() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(GET);
+        stream.extend_from_slice(&post(b"async body"));
+        stream.extend_from_slice(&chunked(&[b"hello ", b"async"]));
+
+        let mut conn = Conn::new(lim());
+        let mut cursor = io::Cursor::new(stream);
+
+        let f1 = conn.read_request_async(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(conn.request(f1).path(), b"/a");
+        assert_eq!(conn.request(f1).query(), b"b=1");
+        conn.consume(f1);
+
+        let f2 = conn.read_request_async(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(conn.request(f2).body(), b"async body");
+        conn.consume(f2);
+
+        let f3 = conn.read_request_async(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(conn.request(f3).body(), b"hello async");
+        conn.consume(f3);
+
+        assert!(
+            conn.read_request_async(&mut cursor)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ── tiny PRNG so the property tests need no extra dev-dependencies ──
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn find_lf_matches_naive() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..50_000 {
+            let len = rng.below(80);
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match rng.below(6) {
+                    0 => b'\n',
+                    1 => b'\r',
+                    2 => 0x8A, // 0x0A with the high bit set: classic SWAR trap
+                    3 => 0x0B,
+                    4 => 0x09,
+                    _ => rng.next() as u8,
+                })
+                .collect();
+            let want = buf.iter().position(|&b| b == b'\n');
+            assert_eq!(find_lf(&buf), want, "{buf:?}");
+            assert_eq!(find_lf_swar(&buf), want, "{buf:?}");
+        }
+    }
+
+    #[test]
+    fn skip_value_matches_naive() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..50_000 {
+            let len = rng.below(70);
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match rng.below(8) {
+                    0 => b'\t',
+                    1 => 0x7F,
+                    2 => 0xFF,
+                    3 => 0x80,
+                    4 => b'\r',
+                    5 => rng.below(0x20) as u8,
+                    _ => 0x20 + rng.below(0x5F) as u8,
+                })
+                .collect();
+            let start = rng.below(len + 1);
+            let mut want = start;
+            while want < buf.len() && VALUE[buf[want] as usize] {
+                want += 1;
+            }
+            assert_eq!(skip_value(&buf, start), want, "{buf:?} from {start}");
+            assert_eq!(skip_value_swar(&buf, start), want, "{buf:?} from {start}");
+        }
+    }
+
+    #[test]
+    fn find_head_end_block_matches_scalar() {
+        let mut rng = Rng(0x0BAD_C0DE_F00D_1234);
+        for round in 0..80_000 {
+            let len = rng.below(300);
+            let mut buf: Vec<u8> = (0..len)
+                .map(|_| match rng.below(10) {
+                    0..=2 => b'\r',
+                    3..=5 => b'\n',
+                    _ => b'a' + rng.below(3) as u8,
+                })
+                .collect();
+            if round % 3 == 0 && len > 8 {
+                let mut j = 0;
+                while j + 6 < len && rng.below(8) != 0 {
+                    buf[j] = b'x';
+                    buf[j + 1] = b'\r';
+                    buf[j + 2] = b'\n';
+                    j += 3;
+                }
+                if j + 4 <= len {
+                    buf[j..j + 4].copy_from_slice(b"\r\n\r\n");
+                }
+            }
+            let from = rng.below(len + 1);
+            let prefix_ok = find_head_end_scalar(&buf[..from], 0)
+                .map(|r| r.is_none())
+                .unwrap_or(false);
+            if !prefix_ok {
+                continue;
+            }
+            let a = find_head_end(&buf, from);
+            let b = find_head_end_scalar(&buf, from);
+            assert_eq!(a, b, "from={from} buf={:?}", String::from_utf8_lossy(&buf));
+        }
+    }
+
+    #[test]
+    fn scan_name_and_uri_match_table_loops() {
+        let mut rng = Rng(0x5EED_5EED_1357_9BDF);
+        for _ in 0..80_000 {
+            let len = rng.below(60);
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match rng.below(12) {
+                    0 => b':',
+                    1 => b' ',
+                    2 => b'_',
+                    3 => b'.',
+                    4 => b'-',
+                    5 => 0x80 + rng.below(0x80) as u8,
+                    6 => rng.below(0x21) as u8,
+                    7 => b"@[`{}/;<>?\\\"()=,"[rng.below(16)],
+                    8 => b'0' + rng.below(10) as u8,
+                    9 => b"!#$%&'*+^|~"[rng.below(11)],
+                    _ => {
+                        if rng.below(2) == 0 {
+                            b'a' + rng.below(26) as u8
+                        } else {
+                            b'A' + rng.below(26) as u8
+                        }
+                    }
+                })
+                .collect();
+            let start = rng.below(len + 1);
+            assert_eq!(
+                scan_name(&buf, start),
+                scan_name_scalar(&buf, start),
+                "name {buf:?} from {start}"
+            );
+            assert_eq!(
+                scan_uri(&buf, start),
+                scan_uri_scalar(&buf, start),
+                "uri {buf:?} from {start}"
+            );
+        }
+        // Exhaustive over every single byte value in every lane of a 16-byte block.
+        for v in 0..=255u8 {
+            for lane in 0..20 {
+                let mut buf = vec![b'a'; 20];
+                buf[lane] = v;
+                assert_eq!(
+                    scan_name(&buf, 0),
+                    scan_name_scalar(&buf, 0),
+                    "byte {v:#x} lane {lane}"
+                );
+                assert_eq!(
+                    scan_uri(&buf, 0),
+                    scan_uri_scalar(&buf, 0),
+                    "byte {v:#x} lane {lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutated_input_never_panics_and_fragmentation_is_consistent() {
+        let mut seed = Vec::new();
+        seed.extend_from_slice(GET);
+        seed.extend_from_slice(&post(b"hello"));
+        seed.extend_from_slice(&chunked(&[b"ab", b"cdef"]));
+        let l = lim();
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for _ in 0..15_000 {
+            let mut s = seed.clone();
+            for _ in 0..1 + rng.below(4) {
+                let i = rng.below(s.len());
+                match rng.below(4) {
+                    0 => s[i] = rng.next() as u8,
+                    1 => s[i] = b"\r\n: ,;0aZ"[rng.below(9)],
+                    2 => {
+                        s.remove(i);
+                    }
+                    _ => s.insert(i, b"\r\n: ,;0aZ"[rng.below(9)]),
+                }
+            }
+            let whole = run(&s, usize::MAX, l);
+            let drib = run(&s, 1 + rng.below(9), l);
+            match (whole, drib) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => {
+                    assert_eq!(
+                        std::mem::discriminant(&a),
+                        std::mem::discriminant(&b),
+                        "{a:?} vs {b:?}"
+                    )
+                }
+                (a, b) => panic!("fragmentation changed the outcome: {a:?} vs {b:?} for {s:?}"),
+            }
         }
     }
 }

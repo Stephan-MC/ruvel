@@ -3,10 +3,11 @@
 //! Run: `cargo bench --bench http`
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ruvel::http::parser::Status as ParseStatus;
+use ruvel::http::parser::{Status as ParseStatus, h1};
 use ruvel::http::{Kernel, Request, Response};
 use ruvel::routing::Router;
 use std::future::Future;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -37,7 +38,7 @@ Host: api.example.com\r\n\
 User-Agent: curl/8.5.0\r\n\
 Accept: application/json\r\n\
 Content-Type: application/json\r\n\
-Content-Length: 43\r\n\
+Content-Length: 44\r\n\
 Connection: keep-alive\r\n\
 \r\n\
 {\"name\":\"Alice\",\"email\":\"alice@example.com\"}";
@@ -89,6 +90,75 @@ fn bench_http(c: &mut Criterion) {
         })
     });
     parse_group.finish();
+
+    let chunked_post: &[u8] = b"\
+POST /api/v1/users HTTP/1.1\r\n\
+Host: api.example.com\r\n\
+Content-Type: application/json\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+10\r\n\
+{\"name\":\"Alice\",\r\n\
+1c\r\n\
+\"email\":\"alice@example.com\"}\r\n\
+0\r\n\
+\r\n";
+
+    let mut conn_group = c.benchmark_group("conn_parse");
+    conn_group.bench_function("get_10_headers", |b| {
+        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        b.iter(|| {
+            let mut src = Cursor::new(black_box(GET_10_HEADERS));
+            let frame = conn.read_request(&mut src).unwrap().unwrap();
+            let target_len = conn.request(frame).target().len();
+            conn.consume(frame);
+            target_len
+        })
+    });
+    conn_group.bench_function("get_root_minimal", |b| {
+        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        b.iter(|| {
+            let mut src = Cursor::new(black_box(GET_ROOT_MINIMAL));
+            let frame = conn.read_request(&mut src).unwrap().unwrap();
+            let target_len = conn.request(frame).target().len();
+            conn.consume(frame);
+            target_len
+        })
+    });
+    conn_group.bench_function("post_json", |b| {
+        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        b.iter(|| {
+            let mut src = Cursor::new(black_box(POST_JSON));
+            let frame = conn.read_request(&mut src).unwrap().unwrap();
+            let body_len = conn.request(frame).body().len();
+            conn.consume(frame);
+            body_len
+        })
+    });
+    conn_group.bench_function("chunked_in_place", |b| {
+        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        b.iter(|| {
+            let mut src = Cursor::new(black_box(chunked_post));
+            let frame = conn.read_request(&mut src).unwrap().unwrap();
+            let body_len = conn.request(frame).body().len();
+            conn.consume(frame);
+            body_len
+        })
+    });
+    conn_group.bench_function("pipelined_8_requests", |b| {
+        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        b.iter(|| {
+            let mut src = Cursor::new(black_box(pipelined.as_slice()));
+            let mut count = 0usize;
+            while let Some(frame) = conn.read_request(&mut src).unwrap() {
+                black_box(conn.request(frame).path());
+                conn.consume(frame);
+                count += 1;
+            }
+            count
+        })
+    });
+    conn_group.finish();
 
     let mut write_group = c.benchmark_group("response_write");
     let mut out = Vec::with_capacity(4096);
