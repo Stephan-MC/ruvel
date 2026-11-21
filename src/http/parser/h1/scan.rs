@@ -1,6 +1,8 @@
 //! Low-level byte-class tables and cfg-dispatched SIMD (x86_64 SSE2) + portable
 //! SWAR / scalar scanners for HTTP/1.x request head and chunk framing.
 
+use crate::http::parser::{Error, semantics};
+
 const fn is_tchar(c: u8) -> bool {
     matches!(
         c,
@@ -312,6 +314,142 @@ pub fn scan_uri_scalar(b: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Single-pass `origin-form` request-target scanner + RFC 9112 validator starting at `start`.
+///
+/// Advances over valid URI bytes, validates `%XX` percent-escapes, records the first `?`
+/// delimiter, and returns `(space_index, first_question_index)` upon reaching `b' '`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn scan_origin_target(b: &[u8], start: usize) -> Result<(usize, Option<usize>), Error> {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_cmplt_epi8, _mm_loadu_si128,
+        _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
+    };
+
+    let mut i = start;
+    let mut question_pos: Option<usize> = None;
+
+    while i + 16 <= b.len() {
+        // SAFETY: SSE2 is baseline on x86_64; the 16-byte load stays strictly inside `b`.
+        let m = unsafe {
+            let v = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
+            let lo = _mm_or_si128(v, _mm_set1_epi8(0x20)); // fold A-Z -> a-z
+            let alpha = _mm_and_si128(
+                _mm_cmpgt_epi8(lo, _mm_set1_epi8(0x60)),
+                _mm_cmplt_epi8(lo, _mm_set1_epi8(0x7B)),
+            );
+            // `-`, `.`, `/`, `0`..=`9` (`0x2D..=0x39`); signed compare rejects `>= 0x80`.
+            let num_path = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2C)),
+                _mm_cmplt_epi8(v, _mm_set1_epi8(0x3A)),
+            );
+            let extra = _mm_or_si128(
+                _mm_or_si128(
+                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8)),
+                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'=' as i8)),
+                ),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'&' as i8)),
+            );
+            let ok = _mm_or_si128(_mm_or_si128(alpha, num_path), extra);
+            !(_mm_movemask_epi8(ok) as u32) & 0xFFFF
+        };
+        if m == 0 {
+            i += 16;
+            continue;
+        }
+        i += m.trailing_zeros() as usize;
+        match b[i] {
+            b' ' => return Ok((i, question_pos)),
+            b'?' => {
+                if question_pos.is_none() {
+                    question_pos = Some(i);
+                }
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= b.len()
+                    || !b[i + 1].is_ascii_hexdigit()
+                    || !b[i + 2].is_ascii_hexdigit()
+                {
+                    return Err(Error::Malformed);
+                }
+                i += 3;
+            }
+            c if semantics::is_valid_uri_byte(c) => {
+                i += 1;
+            }
+            _ => return Err(Error::Malformed),
+        }
+    }
+
+    while i < b.len() {
+        match b[i] {
+            b' ' => return Ok((i, question_pos)),
+            b'?' => {
+                if question_pos.is_none() {
+                    question_pos = Some(i);
+                }
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= b.len()
+                    || !b[i + 1].is_ascii_hexdigit()
+                    || !b[i + 2].is_ascii_hexdigit()
+                {
+                    return Err(Error::Malformed);
+                }
+                i += 3;
+            }
+            c if semantics::is_valid_uri_byte(c) => {
+                i += 1;
+            }
+            _ => return Err(Error::Malformed),
+        }
+    }
+
+    Err(Error::Malformed)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn scan_origin_target(b: &[u8], start: usize) -> Result<(usize, Option<usize>), Error> {
+    scan_origin_target_scalar(b, start)
+}
+
+/// Portable scalar version of [`scan_origin_target`].
+#[inline]
+pub fn scan_origin_target_scalar(b: &[u8], start: usize) -> Result<(usize, Option<usize>), Error> {
+    let mut i = start;
+    let mut question_pos: Option<usize> = None;
+
+    while i < b.len() {
+        match b[i] {
+            b' ' => return Ok((i, question_pos)),
+            b'?' => {
+                if question_pos.is_none() {
+                    question_pos = Some(i);
+                }
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= b.len()
+                    || !b[i + 1].is_ascii_hexdigit()
+                    || !b[i + 2].is_ascii_hexdigit()
+                {
+                    return Err(Error::Malformed);
+                }
+                i += 3;
+            }
+            c if semantics::is_valid_uri_byte(c) => {
+                i += 1;
+            }
+            _ => return Err(Error::Malformed),
+        }
+    }
+
+    Err(Error::Malformed)
 }
 
 /// Locates the end of the head (`\r\n\r\n`) in `data`, resuming at `from` (everything

@@ -22,7 +22,8 @@ pub use conn::{Conn, Frame, Limits, Request};
 pub use head::{Body, Head, Method, Span};
 pub use scan::{
     find_head_end, find_head_end_scalar, find_lf, find_lf_swar, scan_name, scan_name_scalar,
-    scan_uri, scan_uri_scalar, skip_value, skip_value_swar,
+    scan_origin_target, scan_origin_target_scalar, scan_uri, scan_uri_scalar, skip_value,
+    skip_value_swar,
 };
 
 /// One complete HTTP/1.x request parsed from an immutable byte slice via [`parse_slice`].
@@ -40,12 +41,20 @@ impl<'a> SliceRequest<'a> {
     }
 }
 
+/// `(head_len, body_bytes)` parsed by [`parse_slice_into`].
+pub type SliceParts<'a> = (usize, Cow<'a, [u8]>);
+
 /// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
-/// enforcing `limits`.
+/// writing the parsed head into caller-provided `head` and enforcing `limits`.
 ///
-/// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
-/// input, or `Err(Error)` on malformed syntax or exceeded limits.
-pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
+/// Returns `Ok(Status::Complete((head_len, body), bytes_consumed))`, `Ok(Status::Incomplete)` on
+/// partial input, or `Err(Error)` on malformed syntax or exceeded limits.
+#[inline]
+pub fn parse_slice_into<'a>(
+    buf: &'a [u8],
+    head: &mut Head,
+    limits: Limits,
+) -> Result<Status<SliceParts<'a>>, Error> {
     let scan_limit = buf.len().min(limits.max_header);
     let head_len = match find_head_end(&buf[..scan_limit], 0) {
         Err(()) => return Err(Error::Malformed),
@@ -64,9 +73,7 @@ pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>
         }
     };
 
-    let raw_head = &buf[..head_len];
-    let mut head = Head::new();
-    head.parse(raw_head)?;
+    head.parse(&buf[..head_len])?;
 
     let (body, consumed) = match head.body {
         Body::None => (Cow::Borrowed(&[][..]), head_len),
@@ -93,14 +100,28 @@ pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>
         }
     };
 
-    Ok(Status::Complete(
-        SliceRequest {
-            head,
-            raw_head,
-            body,
-        },
-        consumed,
-    ))
+    Ok(Status::Complete((head_len, body), consumed))
+}
+
+/// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
+/// enforcing `limits`.
+///
+/// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
+/// input, or `Err(Error)` on malformed syntax or exceeded limits.
+#[inline]
+pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
+    let mut head = Head::new();
+    match parse_slice_into(buf, &mut head, limits)? {
+        Status::Complete((head_len, body), consumed) => Ok(Status::Complete(
+            SliceRequest {
+                head,
+                raw_head: &buf[..head_len],
+                body,
+            },
+            consumed,
+        )),
+        Status::Incomplete => Ok(Status::Incomplete),
+    }
 }
 
 #[cfg(test)]
@@ -735,6 +756,61 @@ mod tests {
                     scan_uri(&buf, 0),
                     scan_uri_scalar(&buf, 0),
                     "byte {v:#x} lane {lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_origin_target_matches_scalar_and_exhaustive_lanes() {
+        let mut rng = Rng(0x7363_616E_5F75_7269);
+        for _ in 0..80_000 {
+            let len = 1 + rng.below(72);
+            let mut buf = Vec::with_capacity(len + 1);
+            buf.push(b'/');
+            for _ in 1..len {
+                let b = match rng.below(14) {
+                    0 => b'/',
+                    1 => b'?',
+                    2 => b'%',
+                    3 => b' ',
+                    4 => b'&',
+                    5 => b'=',
+                    6 => b'_',
+                    7 => b'-',
+                    8 => b'.',
+                    9 => 0x80 + rng.below(0x80) as u8,
+                    10 => rng.below(0x21) as u8,
+                    11 => b"#<>\"{}\\|^`"[rng.below(10)],
+                    12 => b'0' + rng.below(16) as u8,
+                    _ => {
+                        if rng.below(2) == 0 {
+                            b'a' + rng.below(26) as u8
+                        } else {
+                            b'A' + rng.below(26) as u8
+                        }
+                    }
+                };
+                buf.push(b);
+            }
+            let start = rng.below(buf.len());
+            assert_eq!(
+                scan_origin_target(&buf, start).map_err(|_| ()),
+                scan_origin_target_scalar(&buf, start).map_err(|_| ()),
+                "origin target {buf:?} from {start}"
+            );
+        }
+
+        // Exhaustive over every byte 0..=255 in every lane 0..20 inside a 21-byte slice ending with ' '.
+        for v in 0..=255u8 {
+            for lane in 0..20 {
+                let mut buf = vec![b'a'; 21];
+                buf[20] = b' ';
+                buf[lane] = v;
+                assert_eq!(
+                    scan_origin_target(&buf, 0).map_err(|_| ()),
+                    scan_origin_target_scalar(&buf, 0).map_err(|_| ()),
+                    "origin target byte {v:#x} lane {lane}"
                 );
             }
         }

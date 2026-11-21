@@ -44,11 +44,12 @@ impl Request {
         buf: &[u8],
         limits: h1::Limits,
     ) -> Result<ParseStatus<Self>, parser::Error> {
-        match h1::parse_slice(buf, limits)? {
-            ParseStatus::Complete(slice_req, consumed) => {
-                let raw = slice_req.as_request();
+        let mut head = h1::Head::new();
+        match h1::parse_slice_into(buf, &mut head, limits)? {
+            ParseStatus::Complete((head_len, body), consumed) => {
+                let raw = h1::Request::from_parts(&head, &buf[..head_len], &body);
                 let mut req = Self::from_h1_head_only(&raw)?;
-                req.body = match slice_req.body {
+                req.body = match body {
                     Cow::Borrowed([]) => Vec::new(),
                     Cow::Borrowed(b) => b.to_vec(),
                     Cow::Owned(v) => v,
