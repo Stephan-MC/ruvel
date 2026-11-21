@@ -1,21 +1,5 @@
-//! Protocol-independent RFC 9110 / RFC 9112 byte tables, SWAR scanners, and semantic validators
+//! Protocol-independent RFC 9110 / RFC 9112 byte tables and semantic validators
 //! shared across HTTP/1.x, HTTP/2, and HTTP/3 parsers.
-
-/// 256-entry lookup table for RFC 9110 §5.6.2 HTTP `token` characters (`tchar`).
-const TCHAR_LUT: [bool; 256] = {
-    let mut lut = [false; 256];
-    let mut b = 0usize;
-    while b < 256 {
-        let ch = b as u8;
-        lut[b] = matches!(
-            ch,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
-                | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
-        );
-        b += 1;
-    }
-    lut
-};
 
 /// 256-entry lookup table for visible US-ASCII bytes permitted in wire `request-target` (no `#`).
 const URI_BYTE_LUT: [bool; 256] = {
@@ -34,18 +18,6 @@ const URI_BYTE_LUT: [bool; 256] = {
     lut
 };
 
-/// 256-entry lookup table for RFC 9110 §5.5 header field values (VCHAR, SP, HTAB, obs-text).
-const HEADER_VAL_LUT: [bool; 256] = {
-    let mut lut = [false; 256];
-    let mut b = 0usize;
-    while b < 256 {
-        let ch = b as u8;
-        lut[b] = ch == b'\t' || (ch >= 0x20 && ch != 0x7F);
-        b += 1;
-    }
-    lut
-};
-
 /// 256-entry lookup table for visible ASCII bytes allowed inside an authority host segment.
 const HOST_BYTE_LUT: [bool; 256] = {
     let mut lut = [false; 256];
@@ -59,85 +31,8 @@ const HOST_BYTE_LUT: [bool; 256] = {
 };
 
 #[inline]
-const fn has_zero_byte(word: u64) -> u64 {
-    word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080
-}
-
-/// Find the first occurrence of `needle` at or after `i` using 64-bit SWAR scanning.
-#[inline]
-pub(crate) fn find_byte(bytes: &[u8], needle: u8, mut i: usize) -> Option<usize> {
-    let mask = u64::from_ne_bytes([needle; 8]);
-    while i + 8 <= bytes.len() {
-        let word = u64::from_le_bytes([
-            bytes[i],
-            bytes[i + 1],
-            bytes[i + 2],
-            bytes[i + 3],
-            bytes[i + 4],
-            bytes[i + 5],
-            bytes[i + 6],
-            bytes[i + 7],
-        ]);
-        let hits = has_zero_byte(word ^ mask);
-        if hits != 0 {
-            return Some(i + (hits.trailing_zeros() as usize >> 3));
-        }
-        i += 8;
-    }
-    while i < bytes.len() {
-        if bytes[i] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Find the first `b'\r'` or `b'\n'` at or after `i` using 64-bit SWAR scanning.
-#[inline]
-pub(crate) fn find_cr_or_lf(bytes: &[u8], mut i: usize) -> Option<usize> {
-    const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
-    const LF: u64 = 0x0A0A_0A0A_0A0A_0A0A;
-
-    while i + 8 <= bytes.len() {
-        let word = u64::from_le_bytes([
-            bytes[i],
-            bytes[i + 1],
-            bytes[i + 2],
-            bytes[i + 3],
-            bytes[i + 4],
-            bytes[i + 5],
-            bytes[i + 6],
-            bytes[i + 7],
-        ]);
-        let hits = has_zero_byte(word ^ CR) | has_zero_byte(word ^ LF);
-        if hits != 0 {
-            return Some(i + (hits.trailing_zeros() as usize >> 3));
-        }
-        i += 8;
-    }
-    while i < bytes.len() {
-        if matches!(bytes[i], b'\r' | b'\n') {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[inline]
-pub(crate) const fn is_tchar(b: u8) -> bool {
-    TCHAR_LUT[b as usize]
-}
-
-#[inline]
 pub(crate) const fn is_valid_uri_byte(b: u8) -> bool {
     URI_BYTE_LUT[b as usize]
-}
-
-#[inline]
-pub(crate) const fn is_valid_header_value_byte(b: u8) -> bool {
-    HEADER_VAL_LUT[b as usize]
 }
 
 #[inline]
@@ -151,16 +46,16 @@ pub(crate) fn is_valid_scheme(scheme: &[u8]) -> bool {
             .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
-/// Validate a `Host` / `:authority` value in a single byte pass (`uri-host [ ":" port ]`).
+/// Validate a `Host` / `:authority` byte slice in a single pass (`uri-host [ ":" port ]`).
 #[inline]
-pub(crate) fn is_valid_host_value(value: &str) -> bool {
-    validate_host_port(value.as_bytes(), false)
+pub(crate) fn is_valid_host_bytes(bytes: &[u8]) -> bool {
+    validate_host_port(bytes, false)
 }
 
 /// Validate `CONNECT` authority-form (`uri-host ":" port`) where port is required (`1..=65535`).
 #[inline]
-pub(crate) fn is_valid_authority_form(target: &str) -> bool {
-    validate_host_port(target.as_bytes(), true)
+pub(crate) fn is_valid_authority_bytes(bytes: &[u8]) -> bool {
+    validate_host_port(bytes, true)
 }
 
 fn validate_host_port(bytes: &[u8], require_port: bool) -> bool {
@@ -222,83 +117,63 @@ pub(crate) fn parse_valid_port(port: &[u8]) -> Option<u16> {
     u16::try_from(val).ok()
 }
 
-/// Parse strict `Content-Length` (`1*DIGIT`) with checked `usize` arithmetic.
-#[inline]
-pub(crate) fn parse_content_length(value: &str) -> Option<usize> {
-    if value.is_empty() {
-        return None;
-    }
-
-    let mut length = 0usize;
-    for byte in value.bytes() {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        length = length
-            .checked_mul(10)?
-            .checked_add(usize::from(byte - b'0'))?;
-    }
-
-    Some(length)
-}
-
 /// Returns true if `name` is forbidden in trailer fields per RFC 9110 §6.5.1 / RFC 9112 §7.1.2.
 #[inline]
-pub(crate) fn is_forbidden_trailer(name: &str) -> bool {
+pub(crate) fn is_forbidden_trailer(name: &[u8]) -> bool {
     match name.len() {
-        2 => name.eq_ignore_ascii_case("te"),
-        3 => name.eq_ignore_ascii_case("age"),
+        2 => name.eq_ignore_ascii_case(b"te"),
+        3 => name.eq_ignore_ascii_case(b"age"),
         4 => {
-            name.eq_ignore_ascii_case("host")
-                || name.eq_ignore_ascii_case("date")
-                || name.eq_ignore_ascii_case("vary")
+            name.eq_ignore_ascii_case(b"host")
+                || name.eq_ignore_ascii_case(b"date")
+                || name.eq_ignore_ascii_case(b"vary")
         }
-        5 => name.eq_ignore_ascii_case("range"),
+        5 => name.eq_ignore_ascii_case(b"range"),
         6 => {
-            name.eq_ignore_ascii_case("cookie")
-                || name.eq_ignore_ascii_case("expect")
-                || name.eq_ignore_ascii_case("pragma")
+            name.eq_ignore_ascii_case(b"cookie")
+                || name.eq_ignore_ascii_case(b"expect")
+                || name.eq_ignore_ascii_case(b"pragma")
         }
         7 => {
-            name.eq_ignore_ascii_case("trailer")
-                || name.eq_ignore_ascii_case("upgrade")
-                || name.eq_ignore_ascii_case("warning")
-                || name.eq_ignore_ascii_case("expires")
+            name.eq_ignore_ascii_case(b"trailer")
+                || name.eq_ignore_ascii_case(b"upgrade")
+                || name.eq_ignore_ascii_case(b"warning")
+                || name.eq_ignore_ascii_case(b"expires")
         }
         8 => {
-            name.eq_ignore_ascii_case("location")
-                || name.eq_ignore_ascii_case("if-match")
-                || name.eq_ignore_ascii_case("if-range")
+            name.eq_ignore_ascii_case(b"location")
+                || name.eq_ignore_ascii_case(b"if-match")
+                || name.eq_ignore_ascii_case(b"if-range")
         }
         10 => {
-            name.eq_ignore_ascii_case("set-cookie")
-                || name.eq_ignore_ascii_case("connection")
-                || name.eq_ignore_ascii_case("keep-alive")
+            name.eq_ignore_ascii_case(b"set-cookie")
+                || name.eq_ignore_ascii_case(b"connection")
+                || name.eq_ignore_ascii_case(b"keep-alive")
         }
-        11 => name.eq_ignore_ascii_case("retry-after"),
+        11 => name.eq_ignore_ascii_case(b"retry-after"),
         12 => {
-            name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("max-forwards")
+            name.eq_ignore_ascii_case(b"content-type") || name.eq_ignore_ascii_case(b"max-forwards")
         }
         13 => {
-            name.eq_ignore_ascii_case("authorization")
-                || name.eq_ignore_ascii_case("cache-control")
-                || name.eq_ignore_ascii_case("content-range")
-                || name.eq_ignore_ascii_case("if-none-match")
+            name.eq_ignore_ascii_case(b"authorization")
+                || name.eq_ignore_ascii_case(b"cache-control")
+                || name.eq_ignore_ascii_case(b"content-range")
+                || name.eq_ignore_ascii_case(b"if-none-match")
         }
-        14 => name.eq_ignore_ascii_case("content-length"),
+        14 => name.eq_ignore_ascii_case(b"content-length"),
         16 => {
-            name.eq_ignore_ascii_case("content-encoding")
-                || name.eq_ignore_ascii_case("www-authenticate")
-                || name.eq_ignore_ascii_case("proxy-connection")
+            name.eq_ignore_ascii_case(b"content-encoding")
+                || name.eq_ignore_ascii_case(b"www-authenticate")
+                || name.eq_ignore_ascii_case(b"proxy-connection")
         }
         17 => {
-            name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("if-modified-since")
+            name.eq_ignore_ascii_case(b"transfer-encoding")
+                || name.eq_ignore_ascii_case(b"if-modified-since")
         }
-        18 => name.eq_ignore_ascii_case("proxy-authenticate"),
+        18 => name.eq_ignore_ascii_case(b"proxy-authenticate"),
         19 => {
-            name.eq_ignore_ascii_case("proxy-authorization")
-                || name.eq_ignore_ascii_case("if-unmodified-since")
+            name.eq_ignore_ascii_case(b"proxy-authorization")
+                || name.eq_ignore_ascii_case(b"if-unmodified-since")
         }
         _ => false,
     }

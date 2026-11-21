@@ -849,7 +849,7 @@ Connection: close\r\n\
 
 #[tokio::test]
 async fn test_tcp_listener_spec_compliance_and_error_responses() {
-    use ruvel::http::parser::MAX_HEADERS_SIZE;
+    use ruvel::http::parser::h1::Limits;
 
     let app = Application::configure("")
         .with_routing(|routing| {
@@ -1061,7 +1061,7 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
     .await;
 
     let mut oversized_headers = b"GET /spec HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
-    oversized_headers.extend(std::iter::repeat_n(b'x', MAX_HEADERS_SIZE));
+    oversized_headers.extend(std::iter::repeat_n(b'x', Limits::DEFAULT.max_header));
     oversized_headers.extend_from_slice(b"\r\n\r\n");
     send_expect_status(
         addr,
@@ -1072,10 +1072,55 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
 
     send_expect_status(
         addr,
+        b"POST /spec HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        "HTTP/1.1 501 Not Implemented\r\n",
+    )
+    .await;
+
+    send_expect_status(
+        addr,
+        b"POST /spec HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "HTTP/1.1 501 Not Implemented\r\n",
+    )
+    .await;
+
+    send_expect_status(
+        addr,
         b"GET /spec HTTP/2.0\r\nHost: localhost\r\n\r\n",
         "HTTP/1.1 505 HTTP Version Not Supported\r\n",
     )
     .await;
+
+    // 3. Large upload followed immediately by a pipelined small request (exercises buffer growth + shrink)
+    {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect for large upload + pipelined follow-up");
+        stream.set_nodelay(true).expect("enable TCP_NODELAY");
+        let mut resp_buf = Vec::new();
+
+        let big_payload: Vec<u8> = (0..128 * 1024).map(|i| (i & 0xFF) as u8).collect();
+        let mut batch = format!(
+            "POST /spec HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            big_payload.len()
+        )
+        .into_bytes();
+        batch.extend_from_slice(&big_payload);
+        batch.extend_from_slice(b"GET /spec HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        stream
+            .write_all(&batch)
+            .await
+            .expect("write big upload + pipelined GET");
+
+        let (h1, b1) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h1.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(b1, big_payload);
+
+        let (h2, b2) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h2.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(b2, b"ruvel!");
+    }
 
     server.abort();
 }
