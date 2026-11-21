@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.11.1...ruvel-v0.12.0) (2026-11-21)
+
+
+### Features
+
+* Optimized request parser ([dc46622](https://github.com/Stephan-MC/ruvel/commit/dc46622d5c770f67393817f118d5706571be8561))
+
+
+### Bug Fixes
+
+* Minor issues ([f3f9ce8](https://github.com/Stephan-MC/ruvel/commit/f3f9ce8cc412ea95960b8d2e7a938606c434c2ce))
+
 ## [0.11.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.11.0...ruvel-v0.11.1) (2026-11-19)
 
 
