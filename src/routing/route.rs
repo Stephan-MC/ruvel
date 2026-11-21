@@ -331,7 +331,7 @@ const STANDARD_METHOD_NAMES: [&str; 9] = [
     "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT",
 ];
 
-type CustomMethodRoutes = Vec<(String, Arc<Route>)>;
+type CustomMethodRoutes = Vec<(Method, Arc<Route>)>;
 
 /// Compact inline storage for routes keyed by HTTP method at a terminal path or segment.
 #[derive(Clone, Default)]
@@ -353,7 +353,7 @@ impl MethodSlots {
             Method::Options => Some(6),
             Method::Trace => Some(7),
             Method::Connect => Some(8),
-            Method::Unknown(_) => None,
+            Method::Other(..) => None,
         }
     }
 
@@ -361,13 +361,11 @@ impl MethodSlots {
         match Self::slot_index(&method) {
             Some(idx) => self.standard[idx] = Some(route),
             None => {
-                if let Method::Unknown(name) = method {
-                    let list = self.other.get_or_insert_with(|| Box::new(Vec::new()));
-                    if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == name) {
-                        *existing = route;
-                    } else {
-                        list.push((name, route));
-                    }
+                let list = self.other.get_or_insert_with(|| Box::new(Vec::new()));
+                if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == method) {
+                    *existing = route;
+                } else {
+                    list.push((method, route));
                 }
             }
         }
@@ -377,17 +375,11 @@ impl MethodSlots {
     pub fn get(&self, method: &Method) -> Option<&Route> {
         match Self::slot_index(method) {
             Some(idx) => self.standard[idx].as_deref(),
-            None => {
-                if let Method::Unknown(name) = method
-                    && let Some(ref list) = self.other
-                {
-                    return list
-                        .iter()
-                        .find(|(k, _)| k == name)
-                        .map(|(_, r)| r.as_ref());
-                }
-                None
-            }
+            None => self.other.as_ref().and_then(|list| {
+                list.iter()
+                    .find(|(k, _)| k == method)
+                    .map(|(_, r)| r.as_ref())
+            }),
         }
     }
 
@@ -402,8 +394,8 @@ impl MethodSlots {
             }
         }
         if let Some(ref list) = self.other {
-            for (name, _) in list.iter() {
-                let s = name.as_str();
+            for (method, _) in list.iter() {
+                let s = method.as_str();
                 if !out.contains(&s) {
                     out.push(s);
                 }

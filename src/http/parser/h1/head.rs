@@ -4,6 +4,8 @@ use std::mem::MaybeUninit;
 
 use crate::http::parser::{Error, MAX_HEADERS, semantics};
 
+pub use crate::http::Method;
+
 use super::scan::{TOKEN, at, scan_name, scan_origin_target, scan_uri, skip_value};
 
 /// Byte range inside the raw request head slice.
@@ -26,22 +28,6 @@ fn span(a: usize, b: usize) -> Span {
         start: a as u32,
         end: b as u32,
     }
-}
-
-/// Wire HTTP request method with zero-allocation matching for standard methods
-/// and [`Method::Other`] spans for extension/custom tokens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Method {
-    Get,
-    Head,
-    Post,
-    Put,
-    Delete,
-    Patch,
-    Options,
-    Trace,
-    Connect,
-    Other(Span),
 }
 
 /// Body framing determined from validated HTTP/1.x headers.
@@ -299,7 +285,8 @@ fn parse_method_other(b: &[u8]) -> Result<(Method, usize), Error> {
     if i == 0 || at(b, i) != b' ' {
         return Err(Error::Malformed);
     }
-    Ok((Method::Other(span(0, i)), i + 1))
+    let method = Method::other_from_bytes(&b[..i]).ok_or(Error::Malformed)?;
+    Ok((method, i + 1))
 }
 
 #[cold]
