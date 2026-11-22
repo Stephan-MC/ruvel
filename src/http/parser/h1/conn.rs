@@ -40,7 +40,7 @@ impl Limits {
     ///
     /// Reads process environment variables on each call; prefer calling once at startup
     /// or using [`Limits::cached`] on hot paths.
-    pub fn from_env() -> Limits {
+    pub fn new() -> Limits {
         fn var(key: &str, default: usize) -> usize {
             std::env::var(key)
                 .ok()
@@ -58,11 +58,11 @@ impl Limits {
         }
     }
 
-    /// Return cached process-wide limits initialized once from [`Limits::from_env`].
+    /// Return cached process-wide limits initialized once from [`Limits::new`].
     #[inline]
     pub fn cached() -> Limits {
         static CACHED: OnceLock<Limits> = OnceLock::new();
-        *CACHED.get_or_init(Self::from_env)
+        *CACHED.get_or_init(Self::new)
     }
 }
 
@@ -479,5 +479,11 @@ impl<'a> Request<'a> {
         self.headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
