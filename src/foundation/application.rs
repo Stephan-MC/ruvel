@@ -122,6 +122,8 @@ pub struct Application {
     pub scheduler: Scheduler,
     pub providers: Vec<Box<dyn ServiceProvider>>,
     booted: bool,
+    /// Used to enaled or disable no delay mode in TCP Listener
+    tcp_no_delay: bool,
 }
 
 impl Default for Application {
@@ -138,6 +140,7 @@ impl Application {
             providers: Vec::new(),
             scheduler: Scheduler::default(),
             booted: false,
+            tcp_no_delay: true,
         };
 
         app.register_base_bindings();
@@ -201,6 +204,12 @@ impl Application {
         }
 
         self.providers.push(provider);
+
+        self
+    }
+
+    pub fn set_tcp_no_delay(&mut self, delay: bool) -> &mut Self {
+        self.tcp_no_delay = delay;
 
         self
     }
@@ -283,7 +292,7 @@ impl Application {
         // Initiate the listener's loop that runs indefinitely until stopped
         loop {
             let (mut socket, _) = listener.accept().await?;
-            let _ = socket.set_nodelay(true);
+            let _ = socket.set_nodelay(self.tcp_no_delay);
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
