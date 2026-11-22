@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.13.0...ruvel-v0.14.0) (2026-11-22)
+
+
+### Features
+
+* **application:** Added possibility to enable/disable TCP_NO_DELAY ([0ae5aa5](https://github.com/Stephan-MC/ruvel/commit/0ae5aa53c37ee2b5c4157d5d6a1905a129504784))
+
 ## [0.13.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.12.1...ruvel-v0.13.0) (2026-11-22)
 
 
