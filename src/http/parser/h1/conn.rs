@@ -6,13 +6,15 @@ use std::sync::OnceLock;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::constants::{
+    MAX_REQUEST_BODY_SIZE, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE, REQUEST_HEADER_SIZE,
+};
 use crate::http::parser::Error;
 
 use super::dechunk::{Dechunker, MAX_CHUNK_LINE, MAX_TRAILER};
 use super::head::{Body, Head, Method};
 use super::scan::find_head_end;
 
-const EAGER_BODY: usize = 64 * 1024; // bodies up to this are allocated exactly, in one step
 const TIER_1: usize = 16 * 1024; // head buffer tier between `initial` and `max_header`
 const RETAIN_MAX: usize = 64 * 1024; // buffers bigger than this are shrunk when idle
 const CHUNK_SLACK: usize = MAX_CHUNK_LINE + MAX_TRAILER + 64;
@@ -22,21 +24,25 @@ const CHUNK_SLACK: usize = MAX_CHUNK_LINE + MAX_TRAILER + 64;
 pub struct Limits {
     /// Initial per-connection buffer (`RV_REQUEST_BUFFER_SIZE`). Most requests fit in it.
     pub initial_buf: usize,
-    /// Hard cap on request line + headers (`RV_MAX_HEADER_SIZE`), exceeding -> 431.
+    /// Hard cap on request line + headers (`RV_REQUEST_HEADER_SIZE`), exceeding -> 431.
     pub max_header: usize,
-    /// Hard cap on the (decoded) body (`RV_MAX_BODY_SIZE`), exceeding -> 413.
+    /// Initial eager buffer hint for bodies (`RV_REQUEST_BODY_SIZE`) before geometric growth.
+    pub initial_body_buf: usize,
+    /// Hard cap on the (decoded) body (`RV_MAX_REQUEST_BODY_SIZE`), exceeding -> 413.
     pub max_body: usize,
 }
 
 impl Limits {
     pub const DEFAULT: Limits = Limits {
-        initial_buf: 4 * 1024,
-        max_header: 16 * 1024,
-        max_body: 2 * 1024 * 1024,
+        initial_buf: REQUEST_BUFFER_SIZE,
+        max_header: REQUEST_HEADER_SIZE,
+        initial_body_buf: REQUEST_BODY_SIZE,
+        max_body: MAX_REQUEST_BODY_SIZE,
     };
 
     /// Resolve limits from runtime environment variables (`RV_REQUEST_BUFFER_SIZE`,
-    /// `RV_MAX_HEADER_SIZE`, `RV_MAX_BODY_SIZE`), falling back to [`Limits::DEFAULT`].
+    /// `RV_REQUEST_HEADER_SIZE`, `RV_REQUEST_BODY_SIZE`, `RV_MAX_REQUEST_BODY_SIZE`),
+    /// falling back to [`Limits::DEFAULT`].
     ///
     /// Reads process environment variables on each call; prefer calling once at startup
     /// or using [`Limits::cached`] on hot paths.
@@ -49,12 +55,14 @@ impl Limits {
                 .unwrap_or(default)
         }
         let d = Limits::DEFAULT;
-        let max_header = var("RV_MAX_HEADER_SIZE", d.max_header).min(u32::MAX as usize);
+        let max_header = var("RV_REQUEST_HEADER_SIZE", d.max_header).min(u32::MAX as usize);
+        let max_body = var("RV_MAX_REQUEST_BODY_SIZE", d.max_body);
         Limits {
             initial_buf: var("RV_REQUEST_BUFFER_SIZE", d.initial_buf)
                 .clamp(256, max_header.max(256)),
             max_header,
-            max_body: var("RV_MAX_BODY_SIZE", d.max_body),
+            initial_body_buf: var("RV_REQUEST_BODY_SIZE", d.initial_body_buf).min(max_body.max(1)),
+            max_body,
         }
     }
 
@@ -194,26 +202,28 @@ impl Conn {
                     self.reserve(want);
                 }
             }
-            Phase::Body { need, .. } => {
+            Phase::Body { head_len, need } => {
                 let unread = self.filled - self.pos;
-                // Exact allocation for ordinary bodies. For big ones grow geometrically
-                // with the bytes that really arrived, so a lying Content-Length can't
-                // make us reserve megabytes up front.
-                let want = if need <= EAGER_BODY {
+                let eager_body = head_len.saturating_add(self.lim.initial_body_buf.max(1));
+                // Exact allocation for ordinary bodies up to `initial_body_buf`. For larger ones
+                // grow geometrically with the bytes that really arrived, so a lying Content-Length
+                // cannot force megabytes to be reserved up front.
+                let want = if need <= eager_body {
                     need
                 } else {
-                    need.min(unread.saturating_mul(2)).max(EAGER_BODY)
+                    need.min(unread.saturating_mul(2).max(eager_body).max(unread + 1))
                 };
                 self.reserve(want);
             }
             Phase::Chunked { head_len, .. } => {
                 let unread = self.filled - self.pos;
+                let eager_body = head_len.saturating_add(self.lim.initial_body_buf.max(1));
                 let cap = head_len
                     .saturating_add(self.lim.max_body)
                     .saturating_add(CHUNK_SLACK);
                 let want = unread
                     .saturating_mul(2)
-                    .max(EAGER_BODY)
+                    .max(eager_body)
                     .min(cap)
                     .max(unread + 1);
                 self.reserve(want);
@@ -473,7 +483,7 @@ impl<'a> Request<'a> {
             .map(move |&(n, v)| (n.of(raw), v.of(raw)))
     }
 
-    /// Case-insensitive lookup; linear over at most `MAX_HEADERS` short names.
+    /// Case-insensitive lookup; linear over at most `MAX_REQUEST_HEADERS` short names.
     #[inline]
     pub fn header(&self, name: &[u8]) -> Option<&'a [u8]> {
         self.headers()

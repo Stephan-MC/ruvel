@@ -144,7 +144,7 @@ mod tests {
 
     use super::scan::VALUE;
     use super::*;
-    use crate::http::parser::MAX_HEADERS;
+    use crate::constants::MAX_REQUEST_HEADERS;
 
     /// Hands out at most `step` bytes per read(): worst-case TCP fragmentation.
     struct Dribble<'a> {
@@ -204,6 +204,7 @@ mod tests {
             initial_buf: 256,
             max_header: 8 * 1024,
             max_body: 1 << 20,
+            ..Limits::DEFAULT
         }
     }
 
@@ -292,6 +293,7 @@ mod tests {
             initial_buf: 256,
             max_header: 8192,
             max_body: 4 << 20,
+            ..Limits::DEFAULT
         };
         assert_eq!(run(&req, 100, l).unwrap().len(), 1);
 
@@ -306,6 +308,7 @@ mod tests {
             initial_buf: 1024,
             max_header: 8192,
             max_body: 4 << 20,
+            ..Limits::DEFAULT
         };
         let mut stream = post(&vec![b'x'; 300_000]);
         stream.extend_from_slice(GET);
@@ -336,7 +339,7 @@ mod tests {
         assert_eq!(status(cl, l), Some(413));
 
         let mut many = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
-        for i in 0..MAX_HEADERS {
+        for i in 0..MAX_REQUEST_HEADERS {
             many.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
         }
         many.extend_from_slice(b"\r\n");
@@ -549,6 +552,7 @@ mod tests {
             initial_buf: 256,
             max_header: 512,
             max_body: 1024,
+            ..Limits::DEFAULT
         };
         let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
         let suffix = b"\r\n\r\n";
@@ -837,6 +841,7 @@ mod tests {
             initial_buf: 256,
             max_header: 128,
             max_body: 1024,
+            ..Limits::DEFAULT
         };
         let prefix = b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nX-Pad: ";
         let suffix = b"\r\n\r\n";
@@ -878,9 +883,9 @@ mod tests {
             Err(Error::Malformed)
         ));
 
-        // 5. Incomplete MAX_HEADERS + 1 vs complete MAX_HEADERS + 1 (< max_header).
+        // 5. Incomplete MAX_REQUEST_HEADERS + 1 vs complete MAX_REQUEST_HEADERS + 1 (< max_header).
         let mut many_incomplete = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
-        for i in 0..MAX_HEADERS {
+        for i in 0..MAX_REQUEST_HEADERS {
             many_incomplete.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
         }
         assert!(many_incomplete.len() + 2 <= lim().max_header);
@@ -937,6 +942,28 @@ mod tests {
         let bad_req = format!("{too_long_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let err = parse_slice(bad_req.as_bytes(), lim()).err().unwrap();
         assert_eq!(err.status(), Some(400));
+    }
+
+    #[test]
+    fn limits_default_uses_system_constants_and_grows_past_initial_body_buf() {
+        use crate::constants::{
+            MAX_REQUEST_BODY_SIZE, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE, REQUEST_HEADER_SIZE,
+        };
+
+        assert_eq!(Limits::DEFAULT.initial_buf, REQUEST_BUFFER_SIZE);
+        assert_eq!(Limits::DEFAULT.max_header, REQUEST_HEADER_SIZE);
+        assert_eq!(Limits::DEFAULT.initial_body_buf, REQUEST_BODY_SIZE);
+        assert_eq!(Limits::DEFAULT.max_body, MAX_REQUEST_BODY_SIZE);
+
+        let large_cl = vec![b'b'; REQUEST_BODY_SIZE * 4];
+        let cl_got = run(&post(&large_cl), 1024, Limits::DEFAULT).unwrap();
+        assert_eq!(cl_got.len(), 1);
+        assert_eq!(cl_got[0].body, large_cl);
+
+        let part = vec![b'c'; REQUEST_BODY_SIZE + 512];
+        let chunked_got = run(&chunked(&[&part, &part]), 768, Limits::DEFAULT).unwrap();
+        assert_eq!(chunked_got.len(), 1);
+        assert_eq!(chunked_got[0].body.len(), part.len() * 2);
     }
 
     #[test]

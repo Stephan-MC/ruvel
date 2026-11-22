@@ -3,6 +3,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::configuration::ApplicationBuilder;
+use crate::constants::RESPONSE_BUFFER_SIZE;
 use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
@@ -13,16 +14,6 @@ use crate::support::{LogServiceProvider, ServiceProvider};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-
-const RV_RESPONSE_BUFFER_SIZE: usize = 4 * 1024;
-
-const COMPILE_RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
-    Some(s) => match usize::from_str_radix(s, 10) {
-        Ok(v) if v > 0 => v,
-        _ => RV_RESPONSE_BUFFER_SIZE,
-    },
-    None => RV_RESPONSE_BUFFER_SIZE,
-};
 
 const HTTP_400_RESPONSE: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -37,16 +28,6 @@ const HTTP_501_RESPONSE: &[u8] =
 const HTTP_505_RESPONSE: &[u8] =
     b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
-
-fn resolve_env_usize(name: &str, compile_default: usize) -> usize {
-    match env::var(name) {
-        Ok(val) => match val.trim().parse::<usize>() {
-            Ok(v) if v > 0 => v,
-            _ => compile_default,
-        },
-        Err(_) => compile_default,
-    }
-}
 
 #[inline]
 fn parser_error_response(err: &parser::Error) -> &'static [u8] {
@@ -221,8 +202,9 @@ impl Application {
 
     /// Serve HTTP/1.x connections on an already-bound [`TcpListener`].
     ///
-    /// Each accepted connection owns an [`h1::Conn`] configured from [`h1::Limits::from_env`]
-    /// (`RV_REQUEST_BUFFER_SIZE`, `RV_MAX_HEADER_SIZE`, `RV_MAX_BODY_SIZE`) to handle keep-alive,
+    /// Each accepted connection owns an [`h1::Conn`] configured from [`h1::Limits::new`]
+    /// (`RV_REQUEST_BUFFER_SIZE`, `RV_REQUEST_HEADER_SIZE`, `RV_REQUEST_BODY_SIZE`,
+    /// `RV_MAX_REQUEST_BODY_SIZE`) to handle keep-alive,
     /// HTTP/1.1 pipelining, in-place chunked decoding, `Expect: 100-continue`, and arbitrary TCP
     /// fragmentation:
     /// - [`h1::Conn::try_next_request`] drains all complete buffered requests (pipelining) without
@@ -245,8 +227,6 @@ impl Application {
         };
 
         let limits = h1::Limits::new();
-        let response_buf_size =
-            resolve_env_usize("RV_RESPONSE_BUFFER_SIZE", COMPILE_RESPONSE_BUFFER_SIZE);
 
         // Initiate the listener's loop that runs indefinitely until stopped
         loop {
@@ -256,7 +236,7 @@ impl Application {
 
             tokio::spawn(async move {
                 let mut conn = h1::Conn::new(limits);
-                let mut response_buffer = vec![0u8; response_buf_size];
+                let mut response_buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
                 let mut resp_len = 0usize;
 
                 'connection: loop {

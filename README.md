@@ -180,10 +180,10 @@ You register each action on the router yourself. There is no `resource()` helper
 ### Also in place
 
 - **Application lifecycle.** `Application::configure(base_path)` returns a builder. `with_provider`, `with_routing`, and `with_middleware` shape it. `create()` returns the `Application`. `listen(host, port)` / `serve(listener)` boots every provider, then accepts TCP connections.
-- **HTTP/1.1 server.** Requests are parsed by a custom std-only SIMD/SWAR HTTP/1.x parser (`http::parser::h1::Conn`) with zero-copy `(u32, u32)` span heads, tiered header buffer growth, lazy geometric body growth, automatic idle shrinking, and in-place chunked transfer decoding. Connections support HTTP/1.1 keep-alive, `Connection: close`, `Expect: 100-continue`, and pipelined requests across arbitrary TCP fragmentation. Runtime limits are configured via `RV_REQUEST_BUFFER_SIZE` (default 4 KiB), `RV_MAX_HEADER_SIZE` (default 16 KiB → `431`), `RV_MAX_BODY_SIZE` (default 2 MiB → `413`), and `RV_RESPONSE_BUFFER_SIZE` (default 4 KiB). Protocol/limit violations return `400`, `413`, `417`, `431`, `501`, or `505` with `Connection: close`.
+- **HTTP/1.1 server.** Requests are parsed by a custom std-only SIMD/SWAR HTTP/1.x parser (`http::parser::h1::Conn`) with zero-copy `(u32, u32)` span heads, tiered header buffer growth, lazy geometric body growth, automatic idle shrinking, and in-place chunked transfer decoding. Connections support HTTP/1.1 keep-alive, `Connection: close`, `Expect: 100-continue`, and pipelined requests across arbitrary TCP fragmentation. Runtime limits are configured via `RV_REQUEST_BUFFER_SIZE` (default 4 KiB), `RV_REQUEST_HEADER_SIZE` (default 8 KiB → `431`), `RV_REQUEST_BODY_SIZE` (default 4 KiB initial eager body buffer hint), and `RV_MAX_REQUEST_BODY_SIZE` (default 2 MiB → `413`), alongside compile-time `RV_RESPONSE_BUFFER_SIZE` (default 4 KiB), `RV_MAX_ROUTE_PARAMS` (default 4), and `RV_MAX_REQUEST_HEADERS` (default 64) in `constants`. Protocol/limit violations return `400`, `413`, `417`, `431`, `501`, or `505` with `Connection: close`.
 - **`Responsable`.** Route handlers can return `&'static str`, `String`, `Cow<str>`, `Box<str>`, `Response`, `()`, `(Status, T)`, or `(u16, T)`. Strings become `200 OK` with `Content-Type: text/html; charset=utf-8`.
 - **Responses.** `Response::ok`, `created`, `no_content`, `bad_request`, `not_found`, and `not_implemented`, plus `.text()`, `.json()`, `.html()`, and `.header()`. Numeric constants such as `Response::HTTP_OK` are available. `Status` covers the usual RFC codes, with `code()` and `message()`.
-- **Headers.** `HeaderMap` looks up names without regard to case and writes the casing of the last insert.
+- **Headers.** `Headers` looks up names without regard to case and writes the casing of the last insert.
 
 ```rust
 use ruvel::foundation::Application;
@@ -254,7 +254,7 @@ src/
 ├── foundation/              # Application bootstrap and TCP listener
 ├── http/
 │   ├── controllers.rs       # Resource controller trait
-│   ├── headers.rs           # Case-insensitive HeaderMap
+│   ├── headers.rs           # Case-insensitive Headers
 │   ├── middleware/          # Middleware trait and Next pipeline
 │   ├── parser/              # Custom SIMD/SWAR HTTP/1.x parser (Conn, Head, Dechunker)
 │   ├── request.rs           # Request struct, capture, and typed input helpers
