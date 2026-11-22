@@ -12,17 +12,6 @@ pub use h2::H2;
 pub use h3::H3;
 pub use status::Status;
 
-const RV_MAX_HEADERS: usize = 64;
-
-/// Maximum number of header fields accepted per HTTP request.
-pub const MAX_HEADERS: usize = match option_env!("RV_MAX_HEADERS") {
-    Some(val) => match usize::from_str_radix(val, 10) {
-        Ok(v) if v > 0 => v,
-        _ => RV_MAX_HEADERS,
-    },
-    None => RV_MAX_HEADERS,
-};
-
 /// Protocol version detected or negotiated by a parser.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum HttpVersion {

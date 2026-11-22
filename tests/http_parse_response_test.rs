@@ -1,8 +1,8 @@
+use ruvel::constants::MAX_ROUTE_PARAMS;
 use ruvel::contracts::support::Responsable;
 use ruvel::foundation::Application;
 use ruvel::http::parser::Status as ParseStatus;
-use ruvel::http::{HeaderMap, Method, Request, Response};
-use ruvel::routing::route::MAX_ROUTE_PARAMS;
+use ruvel::http::{Headers, Method, Request, Response};
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -164,7 +164,7 @@ fn test_route_params_insert_overwrite_clone_and_capacity() {
 
 #[test]
 fn test_header_map_multi_value_singleton_overwrite_and_case_preservation() {
-    let mut headers = HeaderMap::new();
+    let mut headers = Headers::new();
     headers.insert("Set-Cookie", "a=1");
     headers.insert("set-cookie", "b=2");
     headers.insert("X-Custom", "one");

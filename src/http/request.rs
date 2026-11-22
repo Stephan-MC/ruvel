@@ -2,7 +2,7 @@ use crate::http::Method;
 use crate::http::parser::{self, HttpVersion, Status as ParseStatus, h1};
 use crate::routing::route::Params;
 
-use super::headers::HeaderMap;
+use super::headers::Headers;
 use std::borrow::Cow;
 
 #[derive(Debug)]
@@ -14,7 +14,7 @@ pub struct Request {
     pub query: Cow<'static, str>,
     /// Wire HTTP protocol version negotiated/parsed for this request.
     pub version: HttpVersion,
-    pub headers: HeaderMap,
+    pub headers: Headers,
     pub body: Vec<u8>,
     pub params: Params,
 }
@@ -26,7 +26,7 @@ impl Request {
             path: path.into(),
             query: Cow::Borrowed(""),
             version: HttpVersion::Http1_1,
-            headers: HeaderMap::new(),
+            headers: Headers::new(),
             body: Vec::new(),
             params: Params::new(),
         }
@@ -87,7 +87,7 @@ impl Request {
             Cow::Owned(s.to_owned())
         };
 
-        let mut headers = HeaderMap::with_capacity(raw.header_count());
+        let mut headers = Headers::with_capacity(raw.header_count());
         for (name_bytes, value_bytes) in raw.headers() {
             let name_str = std::str::from_utf8(name_bytes).map_err(|_| parser::Error::Malformed)?;
             let value_str =
