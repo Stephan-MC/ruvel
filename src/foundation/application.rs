@@ -1,6 +1,8 @@
 use std::env;
 use std::error::Error;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
 
 use crate::configuration::ApplicationBuilder;
 use crate::constants::RESPONSE_BUFFER_SIZE;
@@ -8,12 +10,12 @@ use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
 use crate::http::parser::{self, h1};
-use crate::http::{Kernel, Request};
+use crate::http::{Kernel, Request, Response};
 use crate::routing::{Router, RoutingServiceProvider};
 use crate::support::{LogServiceProvider, ServiceProvider};
 
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const HTTP_400_RESPONSE: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -41,76 +43,56 @@ fn parser_error_response(err: &parser::Error) -> &'static [u8] {
     }
 }
 
-async fn write_error_and_close(
-    socket: &mut TcpStream,
+async fn flush_response_buffer<S: AsyncWrite + Unpin>(
+    socket: &mut S,
+    buf: &[u8],
+    len: &mut usize,
+) -> bool {
+    let n = *len;
+    if n == 0 {
+        return true;
+    }
+    *len = 0;
+    socket.write_all(&buf[..n]).await.is_ok()
+}
+
+async fn write_error_and_close<S: AsyncWrite + Unpin>(
+    socket: &mut S,
     response_buffer: &[u8],
     resp_len: usize,
     error_bytes: &[u8],
 ) {
-    if resp_len > 0
-        && socket
-            .write_all(&response_buffer[..resp_len])
-            .await
-            .is_err()
-    {
+    let mut pending = resp_len;
+    if !flush_response_buffer(socket, response_buffer, &mut pending).await {
         return;
     }
     let _ = socket.write_all(error_bytes).await;
     let _ = socket.shutdown().await;
 }
 
-const HTTP_400_RESPONSE: &[u8] =
-    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_413_RESPONSE: &[u8] =
-    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_417_RESPONSE: &[u8] =
-    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_431_RESPONSE: &[u8] =
-    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_501_RESPONSE: &[u8] =
-    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_505_RESPONSE: &[u8] =
-    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
-
-fn resolve_env_usize(name: &str, compile_default: usize) -> usize {
-    match env::var(name) {
-        Ok(val) => match val.trim().parse::<usize>() {
-            Ok(v) if v > 0 => v,
-            _ => compile_default,
-        },
-        Err(_) => compile_default,
+async fn write_response_buffered<S: AsyncWrite + Unpin>(
+    socket: &mut S,
+    response_buffer: &mut [u8],
+    resp_len: &mut usize,
+    response: &Response,
+    is_head: bool,
+) -> bool {
+    if let Some(written) = response.write_to_slice_for(&mut response_buffer[*resp_len..], is_head) {
+        *resp_len += written;
+        return true;
     }
-}
-
-#[inline]
-fn parser_error_response(err: &parser::Error) -> &'static [u8] {
-    match err.status() {
-        Some(413) => HTTP_413_RESPONSE,
-        Some(417) => HTTP_417_RESPONSE,
-        Some(431) => HTTP_431_RESPONSE,
-        Some(501) => HTTP_501_RESPONSE,
-        Some(505) => HTTP_505_RESPONSE,
-        _ => HTTP_400_RESPONSE,
+    if !flush_response_buffer(socket, response_buffer, resp_len).await {
+        return false;
     }
-}
-
-async fn write_error_and_close(
-    socket: &mut TcpStream,
-    response_buffer: &[u8],
-    resp_len: usize,
-    error_bytes: &[u8],
-) {
-    if resp_len > 0
-        && socket
-            .write_all(&response_buffer[..resp_len])
+    if let Some(written) = response.write_to_slice_for(response_buffer, is_head) {
+        *resp_len = written;
+        true
+    } else {
+        socket
+            .write_all(&response.to_bytes_for(is_head))
             .await
-            .is_err()
-    {
-        return;
+            .is_ok()
     }
-    let _ = socket.write_all(error_bytes).await;
-    let _ = socket.shutdown().await;
 }
 
 #[derive(Default)]
@@ -272,7 +254,9 @@ impl Application {
     /// fragmentation:
     /// - [`h1::Conn::try_next_request`] drains all complete buffered requests (pipelining) without
     ///   blocking on socket I/O, materializing each request via [`Request::from_h1`] and batching
-    ///   serialized responses into `response_buffer` before flushing in a single `write_all` call.
+    ///   immediately-ready serialized responses into `response_buffer` while flushing prior
+    ///   buffered responses on `Poll::Pending` (no reverse head-of-line blocking) or buffer
+    ///   saturation (`RESPONSE_BUFFER_SIZE`).
     /// - When more bytes are required, [`h1::Conn::take_expect_100_continue`] emits an interim
     ///   `100 Continue` response if requested, then [`h1::Conn::prepare_read`] and
     ///   [`h1::Conn::fill_async`] compact/grow the connection buffer and read from the socket.
@@ -291,133 +275,127 @@ impl Application {
 
         // Initiate the listener's loop that runs indefinitely until stopped
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(self.tcp_no_delay);
             let kernel_clone = Arc::clone(&kernel);
 
-            tokio::spawn(async move {
-                let mut conn = h1::Conn::new();
-                let mut response_buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
-                let mut resp_len = 0usize;
+            tokio::spawn(serve_connection(socket, kernel_clone));
+        }
+    }
+}
 
-                'connection: loop {
-                    let mut close_connection = false;
+async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, kernel: Arc<Kernel>) {
+    let mut conn = h1::Conn::new();
+    let mut response_buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
+    let mut resp_len = 0usize;
 
-                    // Drain every complete request already buffered in `conn` (pipelining).
-                    loop {
-                        let frame = match conn.try_next_request() {
-                            Ok(Some(frame)) => frame,
-                            Ok(None) => break,
-                            Err(ref err) => {
-                                write_error_and_close(
-                                    &mut socket,
-                                    &response_buffer,
-                                    resp_len,
-                                    parser_error_response(err),
-                                )
-                                .await;
-                                break 'connection;
-                            }
-                        };
+    'connection: loop {
+        let mut close_connection = false;
 
-                        let (req, is_head, keep_alive) = {
-                            let raw = conn.request(frame);
-                            let is_head = raw.method() == h1::Method::Head;
-                            let keep_alive = raw.keep_alive();
-                            match Request::from_h1(raw) {
-                                Ok(req) => (req, is_head, keep_alive),
-                                Err(ref err) => {
-                                    write_error_and_close(
-                                        &mut socket,
-                                        &response_buffer,
-                                        resp_len,
-                                        parser_error_response(err),
-                                    )
-                                    .await;
-                                    break 'connection;
-                                }
-                            }
-                        };
-                        conn.consume(frame);
+        // Drain every complete request already buffered in `conn` (pipelining).
+        loop {
+            let frame = match conn.try_next_request() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(ref err) => {
+                    write_error_and_close(
+                        &mut socket,
+                        &response_buffer,
+                        resp_len,
+                        parser_error_response(err),
+                    )
+                    .await;
+                    break 'connection;
+                }
+            };
 
-                        let req_wants_close = !keep_alive;
-
-                        // Dispatch request through HTTP Kernel
-                        let mut response = kernel_clone.handle(req).await;
-                        let res_wants_close = should_close_response_connection(
-                            response.headers.get_all("Connection"),
-                        );
-                        if req_wants_close && !res_wants_close {
-                            response.headers.set("Connection", "close");
-                        }
-
-                        // Serialize response into the write buffer, flushing early if needed.
-                        if let Some(written) =
-                            response.write_to_slice_for(&mut response_buffer[resp_len..], is_head)
-                        {
-                            resp_len += written;
-                        } else {
-                            if resp_len > 0 {
-                                if socket
-                                    .write_all(&response_buffer[..resp_len])
-                                    .await
-                                    .is_err()
-                                {
-                                    break 'connection;
-                                }
-                                resp_len = 0;
-                            }
-                            if let Some(written) =
-                                response.write_to_slice_for(&mut response_buffer, is_head)
-                            {
-                                resp_len = written;
-                            } else if socket
-                                .write_all(&response.to_bytes_for(is_head))
-                                .await
-                                .is_err()
-                            {
-                                break 'connection;
-                            }
-                        }
-
-                        if req_wants_close || res_wants_close {
-                            close_connection = true;
-                            break;
-                        }
+            let (req, is_head, keep_alive) = {
+                let raw = conn.request(frame);
+                let is_head = raw.method() == h1::Method::Head;
+                let keep_alive = raw.keep_alive();
+                match Request::from_h1(raw) {
+                    Ok(req) => (req, is_head, keep_alive),
+                    Err(ref err) => {
+                        write_error_and_close(
+                            &mut socket,
+                            &response_buffer,
+                            resp_len,
+                            parser_error_response(err),
+                        )
+                        .await;
+                        break 'connection;
                     }
+                }
+            };
+            conn.consume(frame);
 
-                    // Batched flush: flush any queued responses before awaiting more socket reads.
-                    if resp_len > 0 {
-                        if socket
-                            .write_all(&response_buffer[..resp_len])
+            let req_wants_close = !keep_alive;
+
+            // Hybrid flush-on-Pending dispatch:
+            // If prior pipelined responses are buffered, probe the future once with the real
+            // task waker. Keep batching on Poll::Ready; flush buffered bytes immediately on
+            // Poll::Pending so a slow request cannot stall already-finished responses.
+            let mut fut = kernel.handle(req);
+            let mut response = if resp_len > 0 {
+                match poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await {
+                    Poll::Ready(resp) => resp,
+                    Poll::Pending => {
+                        if !flush_response_buffer(&mut socket, &response_buffer, &mut resp_len)
                             .await
-                            .is_err()
                         {
                             break 'connection;
                         }
-                        resp_len = 0;
-                    }
-                    if close_connection {
-                        let _ = socket.shutdown().await;
-                        break 'connection;
-                    }
-
-                    // Emit interim `100 Continue` if the in-progress request requested it.
-                    if conn.take_expect_100_continue()
-                        && socket.write_all(HTTP_100_CONTINUE).await.is_err()
-                    {
-                        break 'connection;
-                    }
-
-                    // Prepare buffer capacity for current phase and read from socket.
-                    conn.prepare_read();
-                    match conn.fill_async(&mut socket).await {
-                        Ok(0) => break 'connection, // Client closed connection
-                        Ok(_) => {}
-                        Err(_) => break 'connection, // Network error
+                        fut.await
                     }
                 }
-            });
+            } else {
+                fut.await
+            };
+
+            let res_wants_close =
+                should_close_response_connection(response.headers.get_all("Connection"));
+            if req_wants_close && !res_wants_close {
+                response.headers.set("Connection", "close");
+            }
+
+            if !write_response_buffered(
+                &mut socket,
+                &mut response_buffer,
+                &mut resp_len,
+                &response,
+                is_head,
+            )
+            .await
+            {
+                break 'connection;
+            }
+
+            if req_wants_close || res_wants_close {
+                close_connection = true;
+                break;
+            }
+        }
+
+        // Batched flush: flush any queued responses before awaiting more socket reads.
+        if !flush_response_buffer(&mut socket, &response_buffer, &mut resp_len).await {
+            break 'connection;
+        }
+        if close_connection {
+            let _ = socket.shutdown().await;
+            break 'connection;
+        }
+
+        // Emit interim `100 Continue` if the in-progress request requested it.
+        if conn.take_expect_100_continue() && socket.write_all(HTTP_100_CONTINUE).await.is_err() {
+            break 'connection;
+        }
+
+        // Prepare buffer capacity for current phase and read from socket.
+        conn.prepare_read();
+        match conn.fill_async(&mut socket).await {
+            Ok(0) => break 'connection, // Client closed connection
+            Ok(_) => {}
+            Err(_) => break 'connection, // Network error
         }
     }
 }
@@ -431,4 +409,126 @@ fn should_close_response_connection<'a>(values: impl Iterator<Item = &'a str>) -
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Context;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
+
+    struct CountingStream {
+        inner: DuplexStream,
+        write_calls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for CountingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if matches!(res, Poll::Ready(Ok(n)) if n > 0) {
+                self.write_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            res
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn run_pipelined_with_write_count(
+        kernel: Arc<Kernel>,
+        wire_bytes: &[u8],
+    ) -> (usize, String) {
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        client.write_all(wire_bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingStream {
+            inner: server_io,
+            write_calls: Arc::clone(&write_calls),
+        };
+        let task = tokio::spawn(serve_connection(counting, kernel));
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        task.await.unwrap();
+
+        (
+            write_calls.load(Ordering::SeqCst),
+            String::from_utf8(received).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn hybrid_write_strategy_coalesces_bursts_and_flushes_on_pending_or_cap() {
+        let mut router = Router::new();
+        router.get("/fast", |_req| async { Response::ok().text("ok") });
+        router.get("/medium", |_req| async {
+            Response::ok().text("x".repeat(512))
+        });
+        router.get("/slow", |_req| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Response::ok().text("slow")
+        });
+        let kernel = Arc::new(Kernel::new(Arc::new(router)));
+
+        // 1. Burst of 16 fast pipelined requests (< RESPONSE_BUFFER_SIZE) -> 1 write call.
+        let burst = "GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n".repeat(16);
+        let (writes, text) =
+            run_pipelined_with_write_count(Arc::clone(&kernel), burst.as_bytes()).await;
+        assert_eq!(text.matches("HTTP/1.1 200 OK\r\n").count(), 16);
+        assert_eq!(
+            writes, 1,
+            "16 fast pipelined responses should coalesce into a single write call"
+        );
+
+        // 2. [fast, fast, slow, fast] -> 2 write calls: [fast, fast] flushed on slow's
+        //    Poll::Pending, then [slow, fast] coalesced together.
+        let mixed = b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                      GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                      GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                      GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (writes, text) = run_pipelined_with_write_count(Arc::clone(&kernel), mixed).await;
+        assert_eq!(text.matches("HTTP/1.1 200 OK\r\n").count(), 4);
+        assert_eq!(
+            writes, 2,
+            "expected 2 writes: [fast, fast] flushed on slow Pending, then [slow, fast]"
+        );
+
+        // 3. Burst exceeding RESPONSE_BUFFER_SIZE triggers intermediate high-water flushes
+        //    while still coalescing within each chunk.
+        let medium_burst = "GET /medium HTTP/1.1\r\nHost: localhost\r\n\r\n".repeat(16);
+        let (writes, text) = run_pipelined_with_write_count(kernel, medium_burst.as_bytes()).await;
+        assert_eq!(text.matches("HTTP/1.1 200 OK\r\n").count(), 16);
+        assert!(
+            (2..16).contains(&writes),
+            "expected batched high-water flushes in 2..16 writes, got {writes}"
+        );
+    }
 }

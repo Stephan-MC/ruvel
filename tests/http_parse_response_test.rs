@@ -1127,3 +1127,71 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn test_tcp_pipelined_flush_on_pending_avoids_reverse_hol_blocking() {
+    use std::time::Instant;
+
+    let app = Application::configure("")
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/fast", |_req| async { Response::ok().text("fast") });
+                router.get("/slow", |_req| async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Response::ok().text("slow")
+                });
+            });
+        })
+        .create();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("read bound local addr");
+
+    let server = tokio::spawn(async move {
+        let _ = app.serve(listener).await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.set_nodelay(true).expect("enable TCP_NODELAY");
+    let mut resp_buf = Vec::new();
+
+    // Warm up connection so the task is already spawned and parked on socket reads.
+    stream
+        .write_all(b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("write warmup");
+    let (warmup_hdr, warmup_body) = read_http_response(&mut stream, &mut resp_buf).await;
+    assert!(warmup_hdr.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(warmup_body, b"fast");
+
+    // Send R1 (instant) and R2 (200ms sleep) pipelined in one write.
+    let pipelined = b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                      GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let start = Instant::now();
+    stream
+        .write_all(pipelined)
+        .await
+        .expect("write pipelined [R1, R2]");
+
+    let (h1, b1) = read_http_response(&mut stream, &mut resp_buf).await;
+    let r1_elapsed = start.elapsed();
+    assert!(h1.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(b1, b"fast");
+    assert!(
+        r1_elapsed < Duration::from_millis(50),
+        "R1 was blocked by R2's Pending future: arrived after {r1_elapsed:?}"
+    );
+
+    let (h2, b2) = read_http_response(&mut stream, &mut resp_buf).await;
+    let r2_elapsed = start.elapsed();
+    assert!(h2.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(b2, b"slow");
+    assert!(
+        r2_elapsed >= Duration::from_millis(180),
+        "R2 completed unexpectedly early: {r2_elapsed:?}"
+    );
+
+    server.abort();
+}
