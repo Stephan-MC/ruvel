@@ -1,4 +1,4 @@
-use super::headers::HeaderMap;
+use super::headers::Headers;
 use super::status::Status;
 use crate::http::Responsable;
 use std::borrow::Cow;
@@ -8,7 +8,7 @@ pub struct Response {
     /// The HTTP status (code + message) of the response.
     pub status: Status,
     /// Case-insensitive HTTP response headers.
-    pub headers: HeaderMap,
+    pub headers: Headers,
     pub body: Vec<u8>,
 }
 
@@ -87,7 +87,7 @@ impl Response {
     pub fn new(status: Status) -> Self {
         Self {
             status,
-            headers: HeaderMap::with_single("Content-Type", "text/html; charset=utf-8"),
+            headers: Headers::with_single("Content-Type", "text/html; charset=utf-8"),
             body: Vec::new(),
         }
     }
@@ -96,7 +96,7 @@ impl Response {
     pub(crate) fn with_body(status: Status, content_type: &'static str, body: Vec<u8>) -> Self {
         Self {
             status,
-            headers: HeaderMap::with_single("Content-Type", content_type),
+            headers: Headers::with_single("Content-Type", content_type),
             body,
         }
     }
@@ -321,6 +321,12 @@ impl Response {
         } else {
             sink.write_bytes(&self.body)
         }
+    }
+
+    // TODO: Send the response to the client
+    pub fn send(self) {
+        //TODO: Add date to be sent to every response's header
+        self.header("Date", "");
     }
 }
 

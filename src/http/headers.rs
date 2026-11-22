@@ -6,27 +6,27 @@ use std::borrow::Cow;
 /// Uses an inline/small vector structure where keys and values can be borrowed (`Cow::Borrowed`)
 /// or owned (`Cow::Owned`), avoiding unnecessary heap allocations on parse and lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HeaderMap {
+pub struct Headers {
     // Stores (original_key, value)
     entries: Vec<(Cow<'static, str>, Cow<'static, str>)>,
 }
 
-impl HeaderMap {
-    /// Create a new, empty `HeaderMap`.
+impl Headers {
+    /// Create a new, empty `Headers`.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
-    /// Create a new `HeaderMap` with pre-allocated capacity.
+    /// Create a new `Headers` with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
         }
     }
 
-    /// Create a `HeaderMap` with a single initial entry, avoiding over-allocation and
+    /// Create a `Headers` with a single initial entry, avoiding over-allocation and
     /// duplicate-key scanning when constructing standard responses.
     pub(crate) fn with_single(
         key: impl Into<Cow<'static, str>>,
@@ -153,7 +153,7 @@ impl HeaderMap {
     }
 }
 
-impl<'a> IntoIterator for &'a HeaderMap {
+impl<'a> IntoIterator for &'a Headers {
     type Item = (&'a str, &'a str);
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
@@ -167,7 +167,7 @@ impl<'a> IntoIterator for &'a HeaderMap {
     }
 }
 
-impl IntoIterator for HeaderMap {
+impl IntoIterator for Headers {
     type Item = (Cow<'static, str>, Cow<'static, str>);
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
@@ -176,9 +176,9 @@ impl IntoIterator for HeaderMap {
     }
 }
 
-impl<K: Into<Cow<'static, str>>, V: Into<Cow<'static, str>>> FromIterator<(K, V)> for HeaderMap {
+impl<K: Into<Cow<'static, str>>, V: Into<Cow<'static, str>>> FromIterator<(K, V)> for Headers {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        let mut map = HeaderMap::new();
+        let mut map = Headers::new();
         for (k, v) in iter {
             map.insert(k, v);
         }
@@ -220,5 +220,3 @@ fn is_single_value_header(name: &str) -> bool {
         _ => false,
     }
 }
-
-pub type Headers = HeaderMap;

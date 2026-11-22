@@ -1,8 +1,8 @@
+use ruvel::constants::MAX_ROUTE_PARAMS;
 use ruvel::contracts::support::Responsable;
 use ruvel::foundation::Application;
 use ruvel::http::parser::Status as ParseStatus;
-use ruvel::http::{HeaderMap, Method, Request, Response};
-use ruvel::routing::route::MAX_ROUTE_PARAMS;
+use ruvel::http::{Headers, Method, Request, Response};
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -164,7 +164,7 @@ fn test_route_params_insert_overwrite_clone_and_capacity() {
 
 #[test]
 fn test_header_map_multi_value_singleton_overwrite_and_case_preservation() {
-    let mut headers = HeaderMap::new();
+    let mut headers = Headers::new();
     headers.insert("Set-Cookie", "a=1");
     headers.insert("set-cookie", "b=2");
     headers.insert("X-Custom", "one");
@@ -854,7 +854,7 @@ Connection: close\r\n\
 
 #[tokio::test]
 async fn test_tcp_listener_spec_compliance_and_error_responses() {
-    use ruvel::http::parser::h1::Limits;
+    use ruvel::constants::REQUEST_HEADER_SIZE;
 
     let app = Application::configure("")
         .with_routing(|routing| {
@@ -1064,7 +1064,7 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
     .await;
 
     let mut oversized_headers = b"GET /spec HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
-    oversized_headers.extend(std::iter::repeat_n(b'x', Limits::DEFAULT.max_header));
+    oversized_headers.extend(std::iter::repeat_n(b'x', REQUEST_HEADER_SIZE));
     oversized_headers.extend_from_slice(b"\r\n\r\n");
     send_expect_status(
         addr,

@@ -1,3 +1,4 @@
+use crate::constants::MAX_ROUTE_PARAMS;
 use crate::http::{BoxFuture, Method, Request, Response};
 use crate::routing::pipeline::Pipeline;
 use std::borrow::Cow;
@@ -7,16 +8,6 @@ use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub type HandlerFn = Arc<dyn Fn(Request) -> BoxFuture<'static, Response> + Send + Sync + 'static>;
-
-/// Maximum number of route parameters supported per route (matches `route::Params`).
-/// Defaults to `4`; override at compile time with `RV_MAX_ROUTE_PARAMS`.
-pub const MAX_ROUTE_PARAMS: usize = match option_env!("RV_MAX_ROUTE_PARAMS") {
-    Some(val) => match usize::from_str_radix(val, 10) {
-        Ok(v) if v > 0 => v,
-        _ => 4,
-    },
-    None => 4,
-};
 
 // TODO: Optimize route params storage method
 /// Fixed-capacity, inline route parameter storage to avoid heap HashMap allocations per match.

@@ -2,7 +2,7 @@ use crate::http::Method;
 use crate::http::parser::{self, HttpVersion, Status as ParseStatus, h1};
 use crate::routing::route::Params;
 
-use super::headers::HeaderMap;
+use super::headers::Headers;
 use std::borrow::Cow;
 
 #[derive(Debug)]
@@ -14,7 +14,7 @@ pub struct Request {
     pub query: Cow<'static, str>,
     /// Wire HTTP protocol version negotiated/parsed for this request.
     pub version: HttpVersion,
-    pub headers: HeaderMap,
+    pub headers: Headers,
     pub body: Vec<u8>,
     pub params: Params,
 }
@@ -26,26 +26,18 @@ impl Request {
             path: path.into(),
             query: Cow::Borrowed(""),
             version: HttpVersion::Http1_1,
-            headers: HeaderMap::new(),
+            headers: Headers::new(),
             body: Vec::new(),
             params: Params::new(),
         }
     }
 
     /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
-    /// using [`h1::Limits::DEFAULT`].
+    /// enforcing [`crate::constants::REQUEST_HEADER_SIZE`] and
+    /// [`crate::constants::MAX_REQUEST_BODY_SIZE`].
     pub fn capture(buf: &[u8]) -> Result<ParseStatus<Self>, parser::Error> {
-        Self::capture_with_limits(buf, h1::Limits::DEFAULT)
-    }
-
-    /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
-    /// enforcing `limits`.
-    pub fn capture_with_limits(
-        buf: &[u8],
-        limits: h1::Limits,
-    ) -> Result<ParseStatus<Self>, parser::Error> {
         let mut head = h1::Head::new();
-        match h1::parse_slice_into(buf, &mut head, limits)? {
+        match h1::parse_slice_into(buf, &mut head)? {
             ParseStatus::Complete((head_len, body), consumed) => {
                 let raw = h1::Request::from_parts(&head, &buf[..head_len], &body);
                 let mut req = Self::from_h1_head_only(&raw)?;
@@ -87,7 +79,7 @@ impl Request {
             Cow::Owned(s.to_owned())
         };
 
-        let mut headers = HeaderMap::with_capacity(raw.header_count());
+        let mut headers = Headers::with_capacity(raw.header_count());
         for (name_bytes, value_bytes) in raw.headers() {
             let name_str = std::str::from_utf8(name_bytes).map_err(|_| parser::Error::Malformed)?;
             let value_str =

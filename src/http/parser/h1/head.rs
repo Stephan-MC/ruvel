@@ -2,7 +2,8 @@
 
 use std::mem::MaybeUninit;
 
-use crate::http::parser::{Error, MAX_HEADERS, semantics};
+use crate::constants::MAX_REQUEST_HEADERS;
+use crate::http::parser::{Error, semantics};
 
 pub use crate::http::Method;
 
@@ -52,7 +53,7 @@ pub struct Head {
     pub body: Body,
     pub host: Option<Span>,
     len: usize,
-    hdrs: [MaybeUninit<(Span, Span)>; MAX_HEADERS],
+    hdrs: [MaybeUninit<(Span, Span)>; MAX_REQUEST_HEADERS],
 }
 
 impl Default for Head {
@@ -77,7 +78,7 @@ impl Head {
             body: Body::None,
             host: None,
             len: 0,
-            hdrs: [const { MaybeUninit::uninit() }; MAX_HEADERS],
+            hdrs: [const { MaybeUninit::uninit() }; MAX_REQUEST_HEADERS],
         }
     }
 
@@ -89,7 +90,7 @@ impl Head {
     #[inline]
     pub(crate) fn header_spans(&self) -> &[(Span, Span)] {
         // SAFETY: `self.hdrs[..self.len]` are always initialized via `MaybeUninit::write`
-        // before `self.len` is incremented in `Head::parse`, and `self.len <= MAX_HEADERS`.
+        // before `self.len` is incremented in `Head::parse`, and `self.len <= MAX_REQUEST_HEADERS`.
         unsafe { std::slice::from_raw_parts(self.hdrs.as_ptr().cast(), self.len) }
     }
 
@@ -229,7 +230,7 @@ impl Head {
                 _ => {}
             }
 
-            if self.len == MAX_HEADERS {
+            if self.len == MAX_REQUEST_HEADERS {
                 return Err(Error::HeaderTooLarge);
             }
             self.hdrs[self.len].write((span(n0, n1), span(v0, v1)));

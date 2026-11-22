@@ -10,7 +10,7 @@ mod status;
 
 pub use crate::contracts::support::Responsable;
 pub use controllers::Controller;
-pub use headers::{HeaderMap, Headers};
+pub use headers::Headers;
 pub use kernel::Kernel;
 pub use method::Method;
 pub use middleware::{BoxFuture, HandlerFn, Middleware, Next};

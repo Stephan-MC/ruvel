@@ -3,6 +3,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::configuration::ApplicationBuilder;
+use crate::constants::RESPONSE_BUFFER_SIZE;
 use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
@@ -14,15 +15,49 @@ use crate::support::{LogServiceProvider, ServiceProvider};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-const RV_RESPONSE_BUFFER_SIZE: usize = 4 * 1024;
+const HTTP_400_RESPONSE: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_413_RESPONSE: &[u8] =
+    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_417_RESPONSE: &[u8] =
+    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_431_RESPONSE: &[u8] =
+    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_501_RESPONSE: &[u8] =
+    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_505_RESPONSE: &[u8] =
+    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
-const COMPILE_RESPONSE_BUFFER_SIZE: usize = match option_env!("RV_RESPONSE_BUFFER_SIZE") {
-    Some(s) => match usize::from_str_radix(s, 10) {
-        Ok(v) if v > 0 => v,
-        _ => RV_RESPONSE_BUFFER_SIZE,
-    },
-    None => RV_RESPONSE_BUFFER_SIZE,
-};
+#[inline]
+fn parser_error_response(err: &parser::Error) -> &'static [u8] {
+    match err.status() {
+        Some(413) => HTTP_413_RESPONSE,
+        Some(417) => HTTP_417_RESPONSE,
+        Some(431) => HTTP_431_RESPONSE,
+        Some(501) => HTTP_501_RESPONSE,
+        Some(505) => HTTP_505_RESPONSE,
+        _ => HTTP_400_RESPONSE,
+    }
+}
+
+async fn write_error_and_close(
+    socket: &mut TcpStream,
+    response_buffer: &[u8],
+    resp_len: usize,
+    error_bytes: &[u8],
+) {
+    if resp_len > 0
+        && socket
+            .write_all(&response_buffer[..resp_len])
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let _ = socket.write_all(error_bytes).await;
+    let _ = socket.shutdown().await;
+}
 
 const HTTP_400_RESPONSE: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -221,8 +256,9 @@ impl Application {
 
     /// Serve HTTP/1.x connections on an already-bound [`TcpListener`].
     ///
-    /// Each accepted connection owns an [`h1::Conn`] configured from [`h1::Limits::from_env`]
-    /// (`RV_REQUEST_BUFFER_SIZE`, `RV_MAX_HEADER_SIZE`, `RV_MAX_BODY_SIZE`) to handle keep-alive,
+    /// Each accepted connection owns an [`h1::Conn`] configured from the compile-time limits in
+    /// [`crate::constants`] (`RV_REQUEST_BUFFER_SIZE`, `RV_REQUEST_HEADER_SIZE`,
+    /// `RV_REQUEST_BODY_SIZE`, `RV_MAX_REQUEST_BODY_SIZE`) to handle keep-alive,
     /// HTTP/1.1 pipelining, in-place chunked decoding, `Expect: 100-continue`, and arbitrary TCP
     /// fragmentation:
     /// - [`h1::Conn::try_next_request`] drains all complete buffered requests (pipelining) without
@@ -244,18 +280,15 @@ impl Application {
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
-        let limits = h1::Limits::from_env();
-        let response_buf_size =
-            resolve_env_usize("RV_RESPONSE_BUFFER_SIZE", COMPILE_RESPONSE_BUFFER_SIZE);
-
+        // Initiate the listener's loop that runs indefinitely until stopped
         loop {
             let (mut socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
-                let mut conn = h1::Conn::new(limits);
-                let mut response_buffer = vec![0u8; response_buf_size];
+                let mut conn = h1::Conn::new();
+                let mut response_buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
                 let mut resp_len = 0usize;
 
                 'connection: loop {

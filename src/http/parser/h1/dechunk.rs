@@ -1,6 +1,7 @@
 //! In-place and slice-backed HTTP/1.1 `Transfer-Encoding: chunked` decoder
 //! with RFC 9112 §7.1.1 chunk-extension and §7.1.2 trailer validation.
 
+use crate::constants::MAX_REQUEST_BODY_SIZE;
 use crate::http::parser::{Error, semantics};
 
 use super::scan::{TOKEN, VALUE, at, find_lf, scan_name, skip_value};
@@ -54,11 +55,7 @@ impl Dechunker {
 
     /// `data` = raw bytes from the start of the body region.
     /// Returns `(done, new_data_len)`.
-    pub(crate) fn advance(
-        &mut self,
-        data: &mut [u8],
-        max_body: usize,
-    ) -> Result<(bool, usize), Error> {
+    pub(crate) fn advance(&mut self, data: &mut [u8]) -> Result<(bool, usize), Error> {
         let mut w = self.w;
         let mut r = w;
         let done = loop {
@@ -70,7 +67,7 @@ impl Dechunker {
                     r += consumed;
                     if n == 0 {
                         self.st = CState::Trailer;
-                    } else if n > max_body - w {
+                    } else if n > MAX_REQUEST_BODY_SIZE - w {
                         return Err(Error::BodyTooLarge);
                     } else {
                         self.st = CState::Data(n);
@@ -137,10 +134,7 @@ impl Dechunker {
 /// Returns `Ok(Some((decoded_body, wire_bytes_consumed)))` when complete.
 #[cold]
 #[inline(never)]
-pub(crate) fn decode_chunked_slice(
-    src: &[u8],
-    max_body: usize,
-) -> Result<Option<(Vec<u8>, usize)>, Error> {
+pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, Error> {
     let mut pos = 0usize;
     let mut decoded_len = 0usize;
     let mut chunk_count = 0usize;
@@ -170,7 +164,7 @@ pub(crate) fn decode_chunked_slice(
             break trailer_end;
         }
 
-        if chunk_size > max_body - decoded_len {
+        if chunk_size > MAX_REQUEST_BODY_SIZE - decoded_len {
             return Err(Error::BodyTooLarge);
         }
         let data_end = data_start

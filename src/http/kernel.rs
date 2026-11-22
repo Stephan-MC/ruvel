@@ -59,6 +59,19 @@ impl Kernel {
     pub fn handle<'a>(&'a self, req: Request) -> BoxFuture<'a, Response> {
         self.router.load().dispatch(req)
     }
+
+    pub fn send_request_to_router<'a>(&'a self, request: Request) {
+        self.bootstrap()
+        // TODO:
+        // https://github.com/laravel/framework/blob/13.x/src/Illuminate/Foundation/Http/Kernel.php#L164
+    }
+
+    fn bootstrap<'a>(&'a self) {
+        // TODO:
+        // https://github.com/laravel/framework/blob/13.x/src/Illuminate/Foundation/Http/Kernel.php#L183
+    }
+
+    fn terminate(self, request: Request, response: Response) {}
 }
 
 impl Default for Kernel {
