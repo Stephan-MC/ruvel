@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.13.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.12.1...ruvel-v0.13.0) (2026-11-22)
+
+
+### Features
+
+* Created files to hold all ruvel's constants ([a6c3c38](https://github.com/Stephan-MC/ruvel/commit/a6c3c38f2affa485e3a86e498c4925041628d3df))
+* Optimized request parser ([a989fad](https://github.com/Stephan-MC/ruvel/commit/a989fad2afbaf7bc197f63ea0fcd64cb3949ac96))
+
+
+### Bug Fixes
+
+* Minor issues ([b63060b](https://github.com/Stephan-MC/ruvel/commit/b63060b430e56d07b246799401d4c589e5b02424))
+* **parser:** Removed redudant `Limits struct` ([ea53520](https://github.com/Stephan-MC/ruvel/commit/ea53520cdd310d267fd18835c0318a298f829054))
+
+
+### Performance Improvements
+
+* **http:** optimize H1 parser hot path with MaybeUninit Head, SSE2 origin target scan, and cold-path outlining ([8c5b5ce](https://github.com/Stephan-MC/ruvel/commit/8c5b5ce62181a85b49f7f460cec6207f8f07c7e9))
+* **parser:** Reduce parcing time but ~15% ([dc9124b](https://github.com/Stephan-MC/ruvel/commit/dc9124b9380ad5cd64233115f395d7ec6e7aeec0))
+* Provided a single source of truth for system constants. ([c25bad6](https://github.com/Stephan-MC/ruvel/commit/c25bad6687085fab017999ee09ab5a73aa3fca61))
+
 ## [0.12.1](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.12.0...ruvel-v0.12.1) (2026-11-21)
 
 
