@@ -71,9 +71,7 @@ impl Kernel {
         // https://github.com/laravel/framework/blob/13.x/src/Illuminate/Foundation/Http/Kernel.php#L183
     }
 
-    fn terminate(self, request: Request, response: Response) {
-        for callback in self.terminating_callbacks {}
-    }
+    fn terminate(self, request: Request, response: Response) {}
 }
 
 impl Default for Kernel {

@@ -1,8 +1,7 @@
-//! Growable per-connection HTTP/1.x framing driver (`Conn`), runtime `Limits`,
+//! Growable per-connection HTTP/1.x framing driver (`Conn`)
 //! and zero-copy borrowed `Request<'a>` view.
 
 use std::io::{self, Read};
-use std::sync::OnceLock;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -15,64 +14,14 @@ use super::dechunk::{Dechunker, MAX_CHUNK_LINE, MAX_TRAILER};
 use super::head::{Body, Head, Method};
 use super::scan::find_head_end;
 
-const TIER_1: usize = 16 * 1024; // head buffer tier between `initial` and `max_header`
+const TIER_1: usize = 16 * 1024; // head buffer tier between `initial` and `REQUEST_HEADER_SIZE`
 const RETAIN_MAX: usize = 64 * 1024; // buffers bigger than this are shrunk when idle
 const CHUNK_SLACK: usize = MAX_CHUNK_LINE + MAX_TRAILER + 64;
-
-/// Per-connection memory and request framing limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// Initial per-connection buffer (`RV_REQUEST_BUFFER_SIZE`). Most requests fit in it.
-    pub initial_buf: usize,
-    /// Hard cap on request line + headers (`RV_REQUEST_HEADER_SIZE`), exceeding -> 431.
-    pub max_header: usize,
-    /// Initial eager buffer hint for bodies (`RV_REQUEST_BODY_SIZE`) before geometric growth.
-    pub initial_body_buf: usize,
-    /// Hard cap on the (decoded) body (`RV_MAX_REQUEST_BODY_SIZE`), exceeding -> 413.
-    pub max_body: usize,
-}
-
-impl Limits {
-    pub const DEFAULT: Limits = Limits {
-        initial_buf: REQUEST_BUFFER_SIZE,
-        max_header: REQUEST_HEADER_SIZE,
-        initial_body_buf: REQUEST_BODY_SIZE,
-        max_body: MAX_REQUEST_BODY_SIZE,
-    };
-
-    /// Resolve limits from runtime environment variables (`RV_REQUEST_BUFFER_SIZE`,
-    /// `RV_REQUEST_HEADER_SIZE`, `RV_REQUEST_BODY_SIZE`, `RV_MAX_REQUEST_BODY_SIZE`),
-    /// falling back to [`Limits::DEFAULT`].
-    ///
-    /// Reads process environment variables on each call; prefer calling once at startup
-    /// or using [`Limits::cached`] on hot paths.
-    pub fn new() -> Limits {
-        fn var(key: &str, default: usize) -> usize {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(default)
-        }
-        let d = Limits::DEFAULT;
-        let max_header = var("RV_REQUEST_HEADER_SIZE", d.max_header).min(u32::MAX as usize);
-        let max_body = var("RV_MAX_REQUEST_BODY_SIZE", d.max_body);
-        Limits {
-            initial_buf: var("RV_REQUEST_BUFFER_SIZE", d.initial_buf)
-                .clamp(256, max_header.max(256)),
-            max_header,
-            initial_body_buf: var("RV_REQUEST_BODY_SIZE", d.initial_body_buf).min(max_body.max(1)),
-            max_body,
-        }
-    }
-
-    /// Return cached process-wide limits initialized once from [`Limits::new`].
-    #[inline]
-    pub fn cached() -> Limits {
-        static CACHED: OnceLock<Limits> = OnceLock::new();
-        *CACHED.get_or_init(Self::new)
-    }
-}
+const SHRINK_THRESHOLD: usize = if REQUEST_BUFFER_SIZE > RETAIN_MAX {
+    REQUEST_BUFFER_SIZE
+} else {
+    RETAIN_MAX
+};
 
 #[derive(Clone, Copy, Debug)]
 enum Phase {
@@ -97,24 +46,37 @@ pub struct Frame {
 
 /// Per-connection growable buffer and resumable HTTP/1.x request state machine.
 pub struct Conn {
-    buf: Vec<u8>,   // always fully initialized; reads fill buf[filled..]
-    pos: usize,     // first unconsumed byte
-    filled: usize,  // end of valid bytes
-    scanned: usize, // bytes of buf[pos..] already searched for the head terminator
-    lim: Limits,
+    // always fully initialized; reads fill buf[filled..]
+    buf: Vec<u8>,
+
+    /// first unconsumed byte
+    pos: usize,
+
+    /// end of valid bytes
+    filled: usize,
+
+    // bytes of buf[pos..] already searched for the head terminator
+    scanned: usize,
+
     phase: Phase,
     pending_100_continue: bool,
     pub head: Head,
 }
 
+impl Default for Conn {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Conn {
-    pub fn new(lim: Limits) -> Conn {
+    pub fn new() -> Conn {
         Conn {
-            buf: vec![0u8; lim.initial_buf.max(1)], // calloc: pages are not touched until used
+            buf: vec![0u8; REQUEST_BUFFER_SIZE], // calloc: pages are not touched until used
             pos: 0,
             filled: 0,
             scanned: 0,
-            lim,
             phase: Phase::Head,
             pending_100_continue: false,
             head: Head::new(),
@@ -170,8 +132,7 @@ impl Conn {
                 }
                 Phase::Chunked { head_len, mut dec } => {
                     let b0 = self.pos + head_len;
-                    let (done, new_len) =
-                        dec.advance(&mut self.buf[b0..self.filled], self.lim.max_body)?;
+                    let (done, new_len) = dec.advance(&mut self.buf[b0..self.filled])?;
                     self.filled = b0 + new_len;
                     self.phase = Phase::Chunked { head_len, dec };
                     if done {
@@ -193,19 +154,19 @@ impl Conn {
             Phase::Head => {
                 if self.filled == self.buf.len() {
                     // Out of room. If a consumed prefix exists, compacting is enough;
-                    // otherwise climb a tier (initial -> 16 KiB -> max_header).
+                    // otherwise climb a tier (initial -> 16 KiB -> REQUEST_HEADER_SIZE).
                     let want = if self.pos > 0 {
                         self.buf.len()
                     } else {
-                        next_tier(self.buf.len(), self.lim.max_header)
+                        next_tier(self.buf.len())
                     };
                     self.reserve(want);
                 }
             }
             Phase::Body { head_len, need } => {
                 let unread = self.filled - self.pos;
-                let eager_body = head_len.saturating_add(self.lim.initial_body_buf.max(1));
-                // Exact allocation for ordinary bodies up to `initial_body_buf`. For larger ones
+                let eager_body = head_len.saturating_add(REQUEST_BODY_SIZE);
+                // Exact allocation for ordinary bodies up to `REQUEST_BODY_SIZE`. For larger ones
                 // grow geometrically with the bytes that really arrived, so a lying Content-Length
                 // cannot force megabytes to be reserved up front.
                 let want = if need <= eager_body {
@@ -217,9 +178,9 @@ impl Conn {
             }
             Phase::Chunked { head_len, .. } => {
                 let unread = self.filled - self.pos;
-                let eager_body = head_len.saturating_add(self.lim.initial_body_buf.max(1));
+                let eager_body = head_len.saturating_add(REQUEST_BODY_SIZE);
                 let cap = head_len
-                    .saturating_add(self.lim.max_body)
+                    .saturating_add(MAX_REQUEST_BODY_SIZE)
                     .saturating_add(CHUNK_SLACK);
                 let want = unread
                     .saturating_mul(2)
@@ -293,18 +254,18 @@ impl Conn {
     /// switches phase. Returns whether the phase changed.
     fn try_head(&mut self) -> Result<bool, Error> {
         let data = &self.buf[self.pos..self.filled];
-        let scan_limit = data.len().min(self.lim.max_header);
+        let scan_limit = data.len().min(REQUEST_HEADER_SIZE);
         match find_head_end(&data[..scan_limit], self.scanned) {
             Err(()) => Err(Error::Malformed),
             Ok(None) => {
                 self.scanned = scan_limit;
-                if data.len() >= self.lim.max_header {
+                if data.len() >= REQUEST_HEADER_SIZE {
                     return Err(Error::HeaderTooLarge);
                 }
                 Ok(false)
             }
             Ok(Some(head_len)) => {
-                if head_len > self.lim.max_header {
+                if head_len > REQUEST_HEADER_SIZE {
                     return Err(Error::HeaderTooLarge);
                 }
                 self.head.parse(&data[..head_len])?;
@@ -319,7 +280,7 @@ impl Conn {
                     ),
                     Body::Length(n) => {
                         // Rejected from the header alone, before any body byte is buffered.
-                        if n > self.lim.max_body {
+                        if n > MAX_REQUEST_BODY_SIZE {
                             return Err(Error::BodyTooLarge);
                         }
                         let need = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
@@ -397,8 +358,8 @@ impl Conn {
             self.filled = 0;
         }
         // A one-off big upload must not pin its buffer for the life of the connection.
-        if self.buf.len() > self.lim.initial_buf.max(RETAIN_MAX) && unread <= self.lim.initial_buf {
-            let mut nb = vec![0u8; self.lim.initial_buf.max(1)];
+        if self.buf.len() > SHRINK_THRESHOLD && unread <= REQUEST_BUFFER_SIZE {
+            let mut nb = vec![0u8; REQUEST_BUFFER_SIZE];
             nb[..unread].copy_from_slice(&self.buf[self.pos..self.filled]);
             self.buf = nb;
             self.pos = 0;
@@ -407,11 +368,11 @@ impl Conn {
     }
 }
 
-fn next_tier(len: usize, max_header: usize) -> usize {
+fn next_tier(len: usize) -> usize {
     let t = if len < TIER_1 {
-        TIER_1.min(max_header)
+        TIER_1.min(REQUEST_HEADER_SIZE)
     } else {
-        max_header
+        REQUEST_HEADER_SIZE
     };
     t.max(len + 1)
 }
@@ -489,11 +450,5 @@ impl<'a> Request<'a> {
         self.headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
-    }
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self::DEFAULT
     }
 }

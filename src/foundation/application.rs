@@ -202,9 +202,9 @@ impl Application {
 
     /// Serve HTTP/1.x connections on an already-bound [`TcpListener`].
     ///
-    /// Each accepted connection owns an [`h1::Conn`] configured from [`h1::Limits::new`]
-    /// (`RV_REQUEST_BUFFER_SIZE`, `RV_REQUEST_HEADER_SIZE`, `RV_REQUEST_BODY_SIZE`,
-    /// `RV_MAX_REQUEST_BODY_SIZE`) to handle keep-alive,
+    /// Each accepted connection owns an [`h1::Conn`] configured from the compile-time limits in
+    /// [`crate::constants`] (`RV_REQUEST_BUFFER_SIZE`, `RV_REQUEST_HEADER_SIZE`,
+    /// `RV_REQUEST_BODY_SIZE`, `RV_MAX_REQUEST_BODY_SIZE`) to handle keep-alive,
     /// HTTP/1.1 pipelining, in-place chunked decoding, `Expect: 100-continue`, and arbitrary TCP
     /// fragmentation:
     /// - [`h1::Conn::try_next_request`] drains all complete buffered requests (pipelining) without
@@ -226,8 +226,6 @@ impl Application {
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
-        let limits = h1::Limits::new();
-
         // Initiate the listener's loop that runs indefinitely until stopped
         loop {
             let (mut socket, _) = listener.accept().await?;
@@ -235,7 +233,7 @@ impl Application {
             let kernel_clone = Arc::clone(&kernel);
 
             tokio::spawn(async move {
-                let mut conn = h1::Conn::new(limits);
+                let mut conn = h1::Conn::new();
                 let mut response_buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
                 let mut resp_len = 0usize;
 

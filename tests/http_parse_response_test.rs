@@ -854,7 +854,7 @@ Connection: close\r\n\
 
 #[tokio::test]
 async fn test_tcp_listener_spec_compliance_and_error_responses() {
-    use ruvel::http::parser::h1::Limits;
+    use ruvel::constants::REQUEST_HEADER_SIZE;
 
     let app = Application::configure("")
         .with_routing(|routing| {
@@ -1064,7 +1064,7 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
     .await;
 
     let mut oversized_headers = b"GET /spec HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
-    oversized_headers.extend(std::iter::repeat_n(b'x', Limits::DEFAULT.max_header));
+    oversized_headers.extend(std::iter::repeat_n(b'x', REQUEST_HEADER_SIZE));
     oversized_headers.extend_from_slice(b"\r\n\r\n");
     send_expect_status(
         addr,

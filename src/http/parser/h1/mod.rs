@@ -16,9 +16,10 @@ mod scan;
 
 use std::borrow::Cow;
 
+use crate::constants::{MAX_REQUEST_BODY_SIZE, REQUEST_HEADER_SIZE};
 use crate::http::parser::{Error, Status};
 
-pub use conn::{Conn, Frame, Limits, Request};
+pub use conn::{Conn, Frame, Request};
 pub use head::{Body, Head, Method, Span};
 pub use scan::{
     find_head_end, find_head_end_scalar, find_lf, find_lf_swar, scan_name, scan_name_scalar,
@@ -45,7 +46,8 @@ impl<'a> SliceRequest<'a> {
 pub type SliceParts<'a> = (usize, Cow<'a, [u8]>);
 
 /// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
-/// writing the parsed head into caller-provided `head` and enforcing `limits`.
+/// writing the parsed head into caller-provided `head` and enforcing compile-time limits
+/// from [`crate::constants`] (`REQUEST_HEADER_SIZE`, `MAX_REQUEST_BODY_SIZE`).
 ///
 /// Returns `Ok(Status::Complete((head_len, body), bytes_consumed))`, `Ok(Status::Incomplete)` on
 /// partial input, or `Err(Error)` on malformed syntax or exceeded limits.
@@ -53,19 +55,17 @@ pub type SliceParts<'a> = (usize, Cow<'a, [u8]>);
 pub fn parse_slice_into<'a>(
     buf: &'a [u8],
     head: &mut Head,
-    limits: Limits,
 ) -> Result<Status<SliceParts<'a>>, Error> {
-    let max_header = limits.max_header.min(u32::MAX as usize);
-    let scan_limit = buf.len().min(max_header);
+    let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
     let head_len = match head.parse_prefix(&buf[..scan_limit]) {
         Ok(len) => len,
-        Err(err) => return classify_head_error(buf, max_header, err),
+        Err(err) => return classify_head_error(buf, err),
     };
 
     let (body, consumed) = match head.body {
         Body::None => (Cow::Borrowed(&[][..]), head_len),
         Body::Length(n) => {
-            if n > limits.max_body {
+            if n > MAX_REQUEST_BODY_SIZE {
                 return Err(Error::BodyTooLarge);
             }
             let total = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
@@ -75,8 +75,7 @@ pub fn parse_slice_into<'a>(
             (Cow::Borrowed(&buf[head_len..total]), total)
         }
         Body::Chunked => {
-            let Some((decoded, wire_consumed)) =
-                dechunk::decode_chunked_slice(&buf[head_len..], limits.max_body)?
+            let Some((decoded, wire_consumed)) = dechunk::decode_chunked_slice(&buf[head_len..])?
             else {
                 return Ok(Status::Incomplete);
             };
@@ -92,23 +91,19 @@ pub fn parse_slice_into<'a>(
 
 #[cold]
 #[inline(never)]
-fn classify_head_error<'a>(
-    buf: &[u8],
-    max_header: usize,
-    err: Error,
-) -> Result<Status<SliceParts<'a>>, Error> {
-    let scan_limit = buf.len().min(max_header);
+fn classify_head_error<'a>(buf: &[u8], err: Error) -> Result<Status<SliceParts<'a>>, Error> {
+    let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
     match find_head_end(&buf[..scan_limit], 0) {
         Err(()) => Err(Error::Malformed),
         Ok(None) => {
-            if buf.len() >= max_header {
+            if buf.len() >= REQUEST_HEADER_SIZE {
                 Err(Error::HeaderTooLarge)
             } else {
                 Ok(Status::Incomplete)
             }
         }
         Ok(Some(len)) => {
-            if len > max_header {
+            if len > REQUEST_HEADER_SIZE {
                 Err(Error::HeaderTooLarge)
             } else {
                 Err(err)
@@ -118,14 +113,14 @@ fn classify_head_error<'a>(
 }
 
 /// Parse one complete HTTP/1.x request from the leading bytes of an immutable slice `buf`,
-/// enforcing `limits`.
+/// enforcing compile-time limits from [`crate::constants`].
 ///
 /// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
 /// input, or `Err(Error)` on malformed syntax or exceeded limits.
 #[inline]
-pub fn parse_slice(buf: &[u8], limits: Limits) -> Result<Status<SliceRequest<'_>>, Error> {
+pub fn parse_slice(buf: &[u8]) -> Result<Status<SliceRequest<'_>>, Error> {
     let mut head = Head::new();
-    match parse_slice_into(buf, &mut head, limits)? {
+    match parse_slice_into(buf, &mut head)? {
         Status::Complete((head_len, body), consumed) => Ok(Status::Complete(
             SliceRequest {
                 head,
@@ -144,7 +139,10 @@ mod tests {
 
     use super::scan::VALUE;
     use super::*;
-    use crate::constants::MAX_REQUEST_HEADERS;
+    use crate::constants::{
+        MAX_REQUEST_BODY_SIZE, MAX_REQUEST_HEADERS, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE,
+        REQUEST_HEADER_SIZE,
+    };
 
     /// Hands out at most `step` bytes per read(): worst-case TCP fragmentation.
     struct Dribble<'a> {
@@ -173,8 +171,8 @@ mod tests {
         host: Vec<u8>,
     }
 
-    fn run(stream: &[u8], step: usize, lim: Limits) -> Result<Vec<Got>, Error> {
-        let mut conn = Conn::new(lim);
+    fn run(stream: &[u8], step: usize) -> Result<Vec<Got>, Error> {
+        let mut conn = Conn::new();
         let mut src = Dribble {
             data: stream,
             pos: 0,
@@ -197,15 +195,6 @@ mod tests {
             conn.consume(f);
         }
         Ok(out)
-    }
-
-    fn lim() -> Limits {
-        Limits {
-            initial_buf: 256,
-            max_header: 8 * 1024,
-            max_body: 1 << 20,
-            ..Limits::DEFAULT
-        }
     }
 
     const GET: &[u8] =
@@ -233,8 +222,8 @@ mod tests {
         v
     }
 
-    fn status(stream: &[u8], l: Limits) -> Option<u16> {
-        match run(stream, 7, l) {
+    fn status(stream: &[u8]) -> Option<u16> {
+        match run(stream, 7) {
             Err(e) => e.status(),
             Ok(_) => Some(200),
         }
@@ -267,7 +256,7 @@ mod tests {
         stream
             .extend_from_slice(b"GET /last HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n");
 
-        let whole = run(&stream, usize::MAX, lim()).unwrap();
+        let whole = run(&stream, usize::MAX).unwrap();
         assert_eq!(whole.len(), 7);
         assert_eq!(whole[0].path, b"/a");
         assert_eq!(whole[0].query, b"b=1");
@@ -278,41 +267,33 @@ mod tests {
         let mut steps: Vec<usize> = (1..=64).collect();
         steps.extend([97, 255, 256, 257, 1000, 4096, 8191]);
         for step in steps {
-            let got = run(&stream, step, lim()).unwrap();
+            let got = run(&stream, step).unwrap();
             assert_eq!(got, whole, "step={step}");
         }
     }
 
     #[test]
     fn small_initial_buffer_grows_for_headers_and_bodies() {
-        let mut req = b"GET /big HTTP/1.1\r\nHost: x.test\r\n".to_vec();
-        req.extend_from_slice(b"X-Big: ");
-        req.extend_from_slice(&vec![b'a'; 6000]);
-        req.extend_from_slice(b"\r\n\r\n");
-        let l = Limits {
-            initial_buf: 256,
-            max_header: 8192,
-            max_body: 4 << 20,
-            ..Limits::DEFAULT
-        };
-        assert_eq!(run(&req, 100, l).unwrap().len(), 1);
+        let prefix = b"GET /big HTTP/1.1\r\nHost: x.test\r\nX-Big: ";
+        let suffix = b"\r\n\r\n";
+        let pad =
+            (REQUEST_HEADER_SIZE - prefix.len() - suffix.len()).min(REQUEST_BUFFER_SIZE.max(6000));
+        let mut req = Vec::with_capacity(prefix.len() + pad + suffix.len());
+        req.extend_from_slice(prefix);
+        req.extend(std::iter::repeat_n(b'a', pad));
+        req.extend_from_slice(suffix);
+        assert_eq!(run(&req, 100).unwrap().len(), 1);
 
-        let body = vec![b'x'; 1 << 20]; // lazy (geometric) growth path
-        let got = run(&post(&body), 8192, l).unwrap();
+        let body = vec![b'x'; (MAX_REQUEST_BODY_SIZE / 2).min(1 << 20)]; // lazy (geometric) growth path
+        let got = run(&post(&body), 8192).unwrap();
         assert_eq!(got[0].body.len(), body.len());
     }
 
     #[test]
     fn buffer_shrinks_after_big_request() {
-        let l = Limits {
-            initial_buf: 1024,
-            max_header: 8192,
-            max_body: 4 << 20,
-            ..Limits::DEFAULT
-        };
         let mut stream = post(&vec![b'x'; 300_000]);
         stream.extend_from_slice(GET);
-        let mut conn = Conn::new(l);
+        let mut conn = Conn::new();
         let mut src = Dribble {
             data: &stream,
             pos: 0,
@@ -321,33 +302,42 @@ mod tests {
         let f = conn.read_request(&mut src).unwrap().unwrap();
         assert!(conn.buffer_capacity() >= 300_000);
         conn.consume(f);
-        assert_eq!(conn.buffer_capacity(), 1024);
+        assert_eq!(conn.buffer_capacity(), REQUEST_BUFFER_SIZE);
         let f = conn.read_request(&mut src).unwrap().unwrap(); // pipelined leftover survives
         assert_eq!(conn.request(f).target(), b"/a?b=1");
     }
 
     #[test]
     fn rejections() {
-        let l = lim();
         // limits
         let mut big = b"GET / HTTP/1.1\r\nHost: x\r\nX: ".to_vec();
-        big.extend_from_slice(&vec![b'a'; 9000]);
+        big.extend(std::iter::repeat_n(b'a', REQUEST_HEADER_SIZE + 1));
         big.extend_from_slice(b"\r\n\r\n");
-        assert_eq!(status(&big, l), Some(431));
+        assert_eq!(status(&big), Some(431));
 
-        let cl = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n";
-        assert_eq!(status(cl, l), Some(413));
+        let cl = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_SIZE + 1
+        );
+        assert_eq!(status(cl.as_bytes()), Some(413));
 
         let mut many = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
         for i in 0..MAX_REQUEST_HEADERS {
             many.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
         }
         many.extend_from_slice(b"\r\n");
-        assert_eq!(status(&many, l), Some(431));
+        assert_eq!(status(&many), Some(431));
 
-        // chunked body over the limit
-        let small = Limits { max_body: 10, ..l };
-        assert_eq!(status(&chunked(&[b"0123456", b"789abc"]), small), Some(413));
+        // chunked body over the limit (cumulative: 5 + MAX_REQUEST_BODY_SIZE > MAX_REQUEST_BODY_SIZE)
+        let oversized_chunked = format!(
+            "POST /c HTTP/1.1\r\nHost: x.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n{:x}\r\n",
+            MAX_REQUEST_BODY_SIZE
+        );
+        assert_eq!(status(oversized_chunked.as_bytes()), Some(413));
+        assert!(matches!(
+            parse_slice(oversized_chunked.as_bytes()),
+            Err(Error::BodyTooLarge)
+        ));
 
         // smuggling / malformed
         let cases: &[&[u8]] = &[
@@ -373,19 +363,16 @@ mod tests {
         ];
         for (i, c) in cases.iter().enumerate() {
             assert_eq!(
-                status(c, l),
+                status(c),
                 Some(400),
                 "case {i}: {}",
                 String::from_utf8_lossy(c)
             );
         }
-        assert_eq!(status(b"GET / HTTP/2.0\r\nHost: x\r\n\r\n", l), Some(505));
-        assert_eq!(status(b"GET / HTTP/2\r\nHost: x\r\n\r\n", l), Some(505));
+        assert_eq!(status(b"GET / HTTP/2.0\r\nHost: x\r\n\r\n"), Some(505));
+        assert_eq!(status(b"GET / HTTP/2\r\nHost: x\r\n\r\n"), Some(505));
         assert_eq!(
-            status(
-                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
-                l
-            ),
+            status(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
             Some(501)
         );
     }
@@ -394,7 +381,7 @@ mod tests {
     fn rfc9112_target_forms_host_and_expect_compliance() {
         // Valid target forms
         let Status::Complete(opt, _) =
-            parse_slice(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n", lim()).unwrap()
+            parse_slice(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap()
         else {
             panic!("expected complete");
         };
@@ -402,29 +389,27 @@ mod tests {
         assert_eq!(opt.as_request().path(), b"*");
         assert_eq!(opt.as_request().query(), b"");
 
-        let Status::Complete(conn_req, _) = parse_slice(
-            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
-            lim(),
-        )
-        .unwrap() else {
+        let Status::Complete(conn_req, _) =
+            parse_slice(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .unwrap()
+        else {
             panic!("expected complete");
         };
         assert_eq!(conn_req.as_request().method(), Method::Connect);
         assert_eq!(conn_req.as_request().path(), b"example.com:443");
 
         let Status::Complete(abs, _) =
-            parse_slice(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n", lim()).unwrap()
+            parse_slice(b"GET http://example.com/v1?x=1%202 HTTP/1.0\r\n\r\n").unwrap()
         else {
             panic!("expected complete");
         };
         assert_eq!(abs.as_request().path(), b"/v1");
         assert_eq!(abs.as_request().query(), b"x=1%202");
 
-        let Status::Complete(root_abs, _) = parse_slice(
-            b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            lim(),
-        )
-        .unwrap() else {
+        let Status::Complete(root_abs, _) =
+            parse_slice(b"GET http://example.com?a=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap()
+        else {
             panic!("expected complete");
         };
         assert_eq!(root_abs.as_request().path(), b"/");
@@ -445,12 +430,7 @@ mod tests {
             &b"GET / http/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET / GARBAGE\r\nHost: a\r\n\r\n"[..],
         ] {
-            assert_eq!(
-                status(bad, lim()),
-                Some(400),
-                "{}",
-                String::from_utf8_lossy(bad)
-            );
+            assert_eq!(status(bad), Some(400), "{}", String::from_utf8_lossy(bad));
         }
 
         // Expect: 100-continue and 417 Expectation Failed
@@ -459,12 +439,12 @@ mod tests {
                 [..],
             &b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect:\r\nContent-Length: 5\r\n\r\n"[..],
         ] {
-            assert_eq!(status(bad_expect, lim()), Some(417));
+            assert_eq!(status(bad_expect), Some(417));
         }
 
         // Expect: 100-continue triggers only when headers arrive without body bytes on HTTP/1.1
         let head_only = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
-        let mut conn = Conn::new(lim());
+        let mut conn = Conn::new();
         let mut rdr = io::Cursor::new(head_only);
         assert!(conn.fill(&mut rdr).unwrap() == head_only.len());
         assert!(conn.try_next_request().unwrap().is_none());
@@ -472,7 +452,7 @@ mod tests {
         assert!(!conn.take_expect_100_continue());
 
         let partial_body = b"POST /up HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhe";
-        let mut conn2 = Conn::new(lim());
+        let mut conn2 = Conn::new();
         let mut rdr2 = io::Cursor::new(partial_body);
         assert!(conn2.fill(&mut rdr2).unwrap() == partial_body.len());
         assert!(conn2.try_next_request().unwrap().is_none());
@@ -482,14 +462,14 @@ mod tests {
     #[test]
     fn transfer_encoding_chunk_ext_and_trailer_compliance() {
         let ok_ordered = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_slice(ok_ordered, lim()).unwrap() else {
+        let Status::Complete(req, consumed) = parse_slice(ok_ordered).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(req.as_request().body(), b"hello");
         assert_eq!(consumed, ok_ordered.len());
 
         let quoted_ext = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=\"a\\\"b\";flag\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n";
-        let Status::Complete(req, consumed) = parse_slice(quoted_ext, lim()).unwrap() else {
+        let Status::Complete(req, consumed) = parse_slice(quoted_ext).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(req.as_request().body(), b"hello");
@@ -501,7 +481,7 @@ mod tests {
             many.extend_from_slice(b"1\r\nx\r\n");
         }
         many.extend_from_slice(b"0\r\n\r\n");
-        let Status::Complete(many_req, many_consumed) = parse_slice(&many, lim()).unwrap() else {
+        let Status::Complete(many_req, many_consumed) = parse_slice(&many).unwrap() else {
             panic!("expected complete");
         };
         assert_eq!(many_req.as_request().body(), &[b'x'; 20]);
@@ -523,7 +503,7 @@ mod tests {
             &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBadTrailer\r\n\r\n"[..],
         ] {
             assert_eq!(
-                status(bad, lim()),
+                status(bad),
                 Some(400),
                 "{}",
                 String::from_utf8_lossy(bad)
@@ -532,10 +512,7 @@ mod tests {
 
         // Unknown transfer-encoding -> 501
         assert_eq!(
-            status(
-                b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n",
-                lim()
-            ),
+            status(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n"),
             Some(501)
         );
 
@@ -543,54 +520,45 @@ mod tests {
             b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
         oversized_ext.extend_from_slice(&[b'a'; 1025]);
         oversized_ext.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
-        assert_eq!(status(&oversized_ext, lim()), Some(400));
+        assert_eq!(status(&oversized_ext), Some(400));
     }
 
     #[test]
     fn enforces_max_header_exact_boundary() {
-        let l = Limits {
-            initial_buf: 256,
-            max_header: 512,
-            max_body: 1024,
-            ..Limits::DEFAULT
-        };
         let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
         let suffix = b"\r\n\r\n";
 
-        let exact_pad_len = l.max_header - prefix.len() - suffix.len();
-        let mut exact = Vec::with_capacity(l.max_header);
+        let exact_pad_len = REQUEST_HEADER_SIZE - prefix.len() - suffix.len();
+        let mut exact = Vec::with_capacity(REQUEST_HEADER_SIZE);
         exact.extend_from_slice(prefix);
         exact.extend(std::iter::repeat_n(b'a', exact_pad_len));
         exact.extend_from_slice(suffix);
-        assert_eq!(exact.len(), l.max_header);
+        assert_eq!(exact.len(), REQUEST_HEADER_SIZE);
 
-        let Status::Complete(_, consumed) = parse_slice(&exact, l).unwrap() else {
+        let Status::Complete(_, consumed) = parse_slice(&exact).unwrap() else {
             panic!("expected complete");
         };
-        assert_eq!(consumed, l.max_header);
-        assert_eq!(run(&exact, 13, l).unwrap().len(), 1);
+        assert_eq!(consumed, REQUEST_HEADER_SIZE);
+        assert_eq!(run(&exact, 13).unwrap().len(), 1);
 
-        let mut too_large = Vec::with_capacity(l.max_header + 1);
+        let mut too_large = Vec::with_capacity(REQUEST_HEADER_SIZE + 1);
         too_large.extend_from_slice(prefix);
         too_large.extend(std::iter::repeat_n(b'a', exact_pad_len + 1));
         too_large.extend_from_slice(suffix);
-        assert_eq!(too_large.len(), l.max_header + 1);
+        assert_eq!(too_large.len(), REQUEST_HEADER_SIZE + 1);
         assert!(matches!(
-            parse_slice(&too_large, l),
+            parse_slice(&too_large),
             Err(Error::HeaderTooLarge)
         ));
-        assert_eq!(status(&too_large, l), Some(431));
+        assert_eq!(status(&too_large), Some(431));
     }
 
     #[test]
     fn eof_handling() {
-        assert!(run(b"", 1, lim()).unwrap().is_empty()); // clean close
-        assert!(matches!(
-            run(&GET[..GET.len() - 1], 5, lim()),
-            Err(Error::Eof)
-        ));
+        assert!(run(b"", 1).unwrap().is_empty()); // clean close
+        assert!(matches!(run(&GET[..GET.len() - 1], 5), Err(Error::Eof)));
         let p = post(b"0123456789");
-        assert!(matches!(run(&p[..p.len() - 1], 5, lim()), Err(Error::Eof)));
+        assert!(matches!(run(&p[..p.len() - 1], 5), Err(Error::Eof)));
     }
 
     #[tokio::test]
@@ -600,7 +568,7 @@ mod tests {
         stream.extend_from_slice(&post(b"async body"));
         stream.extend_from_slice(&chunked(&[b"hello ", b"async"]));
 
-        let mut conn = Conn::new(lim());
+        let mut conn = Conn::new();
         let mut cursor = io::Cursor::new(stream);
 
         let f1 = conn.read_request_async(&mut cursor).await.unwrap().unwrap();
@@ -836,67 +804,61 @@ mod tests {
 
     #[test]
     fn single_pass_parse_slice_matches_cold_error_and_boundary_cases() {
-        // 1. Exact max_header boundary WITH trailing Content-Length body bytes after max_header.
-        let l = Limits {
-            initial_buf: 256,
-            max_header: 128,
-            max_body: 1024,
-            ..Limits::DEFAULT
-        };
+        // 1. Exact REQUEST_HEADER_SIZE boundary WITH trailing Content-Length body bytes after it.
         let prefix = b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nX-Pad: ";
         let suffix = b"\r\n\r\n";
-        let pad_len = l.max_header - prefix.len() - suffix.len();
-        let mut exact_with_body = Vec::with_capacity(l.max_header + 5);
+        let pad_len = REQUEST_HEADER_SIZE - prefix.len() - suffix.len();
+        let mut exact_with_body = Vec::with_capacity(REQUEST_HEADER_SIZE + 5);
         exact_with_body.extend_from_slice(prefix);
         exact_with_body.extend(std::iter::repeat_n(b'a', pad_len));
         exact_with_body.extend_from_slice(suffix);
-        assert_eq!(exact_with_body.len(), l.max_header);
+        assert_eq!(exact_with_body.len(), REQUEST_HEADER_SIZE);
         exact_with_body.extend_from_slice(b"he\nlo");
 
         // 2. Body containing bare `\n` after valid `\r\n\r\n` succeeds without error.
-        let Status::Complete(req, consumed) = parse_slice(&exact_with_body, l).unwrap() else {
-            panic!("expected complete request at exact max_header + body");
+        let Status::Complete(req, consumed) = parse_slice(&exact_with_body).unwrap() else {
+            panic!("expected complete request at exact REQUEST_HEADER_SIZE + body");
         };
-        assert_eq!(req.raw_head.len(), l.max_header);
+        assert_eq!(req.raw_head.len(), REQUEST_HEADER_SIZE);
         assert_eq!(req.as_request().body(), b"he\nlo");
         assert_eq!(consumed, exact_with_body.len());
 
         // 3. Byte-by-byte truncation (0..raw.len()) returns Ok(Status::Incomplete).
         for split in 0..GET.len() {
             assert!(
-                matches!(parse_slice(&GET[..split], lim()), Ok(Status::Incomplete)),
+                matches!(parse_slice(&GET[..split]), Ok(Status::Incomplete)),
                 "split at {split} must be incomplete"
             );
         }
 
         // 4. Incomplete vs complete HTTP/2.0 and bare LF before terminator.
         assert!(matches!(
-            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n", lim()),
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n"),
             Ok(Status::Incomplete)
         ));
         assert!(matches!(
-            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n\r\n", lim()),
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n\r\n"),
             Err(Error::VersionNotSupported)
         ));
         assert!(matches!(
-            parse_slice(b"GET / HTTP/2.0\r\nHost: a\n\r\n\r\n", lim()),
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\n\r\n\r\n"),
             Err(Error::Malformed)
         ));
 
-        // 5. Incomplete MAX_REQUEST_HEADERS + 1 vs complete MAX_REQUEST_HEADERS + 1 (< max_header).
+        // 5. Incomplete MAX_REQUEST_HEADERS + 1 vs complete MAX_REQUEST_HEADERS + 1 (< REQUEST_HEADER_SIZE).
         let mut many_incomplete = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
         for i in 0..MAX_REQUEST_HEADERS {
             many_incomplete.extend_from_slice(format!("H{i}: v\r\n").as_bytes());
         }
-        assert!(many_incomplete.len() + 2 <= lim().max_header);
+        assert!(many_incomplete.len() + 2 <= REQUEST_HEADER_SIZE);
         assert!(matches!(
-            parse_slice(&many_incomplete, lim()),
+            parse_slice(&many_incomplete),
             Ok(Status::Incomplete)
         ));
         let mut many_complete = many_incomplete;
         many_complete.extend_from_slice(b"\r\n");
         assert!(matches!(
-            parse_slice(&many_complete, lim()),
+            parse_slice(&many_complete),
             Err(Error::HeaderTooLarge)
         ));
 
@@ -904,8 +866,7 @@ mod tests {
         let mut pipelined = post(b"first");
         pipelined.extend_from_slice(GET);
         let mut head = Head::new();
-        let Status::Complete((h1_len, b1), c1) =
-            parse_slice_into(&pipelined, &mut head, lim()).unwrap()
+        let Status::Complete((h1_len, b1), c1) = parse_slice_into(&pipelined, &mut head).unwrap()
         else {
             panic!("expected first pipelined request");
         };
@@ -914,7 +875,7 @@ mod tests {
         assert_eq!(head.method, Method::Post);
 
         let Status::Complete((h2_len, b2), c2) =
-            parse_slice_into(&pipelined[c1..], &mut head, lim()).unwrap()
+            parse_slice_into(&pipelined[c1..], &mut head).unwrap()
         else {
             panic!("expected second pipelined request");
         };
@@ -929,7 +890,7 @@ mod tests {
         let ok_token = "X".repeat(23);
         let ok_req = format!("{ok_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let Status::Complete(parsed, consumed) =
-            parse_slice(ok_req.as_bytes(), lim()).expect("23-byte custom method must succeed")
+            parse_slice(ok_req.as_bytes()).expect("23-byte custom method must succeed")
         else {
             panic!("expected complete request");
         };
@@ -940,28 +901,21 @@ mod tests {
 
         let too_long_token = "X".repeat(24);
         let bad_req = format!("{too_long_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let err = parse_slice(bad_req.as_bytes(), lim()).err().unwrap();
+        let err = parse_slice(bad_req.as_bytes()).err().unwrap();
         assert_eq!(err.status(), Some(400));
     }
 
     #[test]
-    fn limits_default_uses_system_constants_and_grows_past_initial_body_buf() {
-        use crate::constants::{
-            MAX_REQUEST_BODY_SIZE, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE, REQUEST_HEADER_SIZE,
-        };
-
-        assert_eq!(Limits::DEFAULT.initial_buf, REQUEST_BUFFER_SIZE);
-        assert_eq!(Limits::DEFAULT.max_header, REQUEST_HEADER_SIZE);
-        assert_eq!(Limits::DEFAULT.initial_body_buf, REQUEST_BODY_SIZE);
-        assert_eq!(Limits::DEFAULT.max_body, MAX_REQUEST_BODY_SIZE);
+    fn conn_uses_system_constants_and_grows_past_initial_body_buf() {
+        assert_eq!(Conn::new().buffer_capacity(), REQUEST_BUFFER_SIZE);
 
         let large_cl = vec![b'b'; REQUEST_BODY_SIZE * 4];
-        let cl_got = run(&post(&large_cl), 1024, Limits::DEFAULT).unwrap();
+        let cl_got = run(&post(&large_cl), 1024).unwrap();
         assert_eq!(cl_got.len(), 1);
         assert_eq!(cl_got[0].body, large_cl);
 
         let part = vec![b'c'; REQUEST_BODY_SIZE + 512];
-        let chunked_got = run(&chunked(&[&part, &part]), 768, Limits::DEFAULT).unwrap();
+        let chunked_got = run(&chunked(&[&part, &part]), 768).unwrap();
         assert_eq!(chunked_got.len(), 1);
         assert_eq!(chunked_got[0].body.len(), part.len() * 2);
     }
@@ -972,7 +926,6 @@ mod tests {
         seed.extend_from_slice(GET);
         seed.extend_from_slice(&post(b"hello"));
         seed.extend_from_slice(&chunked(&[b"ab", b"cdef"]));
-        let l = lim();
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
         for _ in 0..15_000 {
             let mut s = seed.clone();
@@ -987,8 +940,8 @@ mod tests {
                     _ => s.insert(i, b"\r\n: ,;0aZ"[rng.below(9)]),
                 }
             }
-            let whole = run(&s, usize::MAX, l);
-            let drib = run(&s, 1 + rng.below(9), l);
+            let whole = run(&s, usize::MAX);
+            let drib = run(&s, 1 + rng.below(9));
             match (whole, drib) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
                 (Err(a), Err(b)) => {

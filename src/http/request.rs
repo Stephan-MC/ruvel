@@ -33,19 +33,11 @@ impl Request {
     }
 
     /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
-    /// using [`h1::Limits::DEFAULT`].
+    /// enforcing [`crate::constants::REQUEST_HEADER_SIZE`] and
+    /// [`crate::constants::MAX_REQUEST_BODY_SIZE`].
     pub fn capture(buf: &[u8]) -> Result<ParseStatus<Self>, parser::Error> {
-        Self::capture_with_limits(buf, h1::Limits::DEFAULT)
-    }
-
-    /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
-    /// enforcing `limits`.
-    pub fn capture_with_limits(
-        buf: &[u8],
-        limits: h1::Limits,
-    ) -> Result<ParseStatus<Self>, parser::Error> {
         let mut head = h1::Head::new();
-        match h1::parse_slice_into(buf, &mut head, limits)? {
+        match h1::parse_slice_into(buf, &mut head)? {
             ParseStatus::Complete((head_len, body), consumed) => {
                 let raw = h1::Request::from_parts(&head, &buf[..head_len], &body);
                 let mut req = Self::from_h1_head_only(&raw)?;

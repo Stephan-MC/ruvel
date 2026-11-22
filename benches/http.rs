@@ -106,7 +106,7 @@ Transfer-Encoding: chunked\r\n\
 
     let mut conn_group = c.benchmark_group("conn_parse");
     conn_group.bench_function("get_10_headers", |b| {
-        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        let mut conn = h1::Conn::new();
         b.iter(|| {
             let mut src = Cursor::new(black_box(GET_10_HEADERS));
             let frame = conn.read_request(&mut src).unwrap().unwrap();
@@ -116,7 +116,7 @@ Transfer-Encoding: chunked\r\n\
         })
     });
     conn_group.bench_function("get_root_minimal", |b| {
-        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        let mut conn = h1::Conn::new();
         b.iter(|| {
             let mut src = Cursor::new(black_box(GET_ROOT_MINIMAL));
             let frame = conn.read_request(&mut src).unwrap().unwrap();
@@ -126,7 +126,7 @@ Transfer-Encoding: chunked\r\n\
         })
     });
     conn_group.bench_function("post_json", |b| {
-        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        let mut conn = h1::Conn::new();
         b.iter(|| {
             let mut src = Cursor::new(black_box(POST_JSON));
             let frame = conn.read_request(&mut src).unwrap().unwrap();
@@ -136,7 +136,7 @@ Transfer-Encoding: chunked\r\n\
         })
     });
     conn_group.bench_function("chunked_in_place", |b| {
-        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        let mut conn = h1::Conn::new();
         b.iter(|| {
             let mut src = Cursor::new(black_box(chunked_post));
             let frame = conn.read_request(&mut src).unwrap().unwrap();
@@ -146,7 +146,7 @@ Transfer-Encoding: chunked\r\n\
         })
     });
     conn_group.bench_function("pipelined_8_requests", |b| {
-        let mut conn = h1::Conn::new(h1::Limits::DEFAULT);
+        let mut conn = h1::Conn::new();
         b.iter(|| {
             let mut src = Cursor::new(black_box(pipelined.as_slice()));
             let mut count = 0usize;
