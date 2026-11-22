@@ -244,10 +244,11 @@ impl Application {
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
 
-        let limits = h1::Limits::from_env();
+        let limits = h1::Limits::new();
         let response_buf_size =
             resolve_env_usize("RV_RESPONSE_BUFFER_SIZE", COMPILE_RESPONSE_BUFFER_SIZE);
 
+        // Initiate the listener's loop that runs indefinitely until stopped
         loop {
             let (mut socket, _) = listener.accept().await?;
             let _ = socket.set_nodelay(true);
