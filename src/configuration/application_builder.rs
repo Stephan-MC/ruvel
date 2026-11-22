@@ -36,6 +36,12 @@ impl ApplicationBuilder {
         self
     }
 
+    pub fn tcp_no_delay(mut self, delay: bool) -> Self {
+        self.app.set_tcp_no_delay(delay);
+
+        self
+    }
+
     /// Register routes on the router using the [`Routing`](crate::configuration::Routing) configuration builder.
     pub fn with_routing<F>(mut self, callback: F) -> Self
     where
