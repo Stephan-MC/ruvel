@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.14.0...ruvel-v0.15.0) (2026-11-24)
+
+
+### Features
+
+* **http:** emit lock-free cached RFC 9110 Date header on responses ([97dcd65](https://github.com/Stephan-MC/ruvel/commit/97dcd6579aab1007db0eb7939fa2e3c52741d88e))
+
+
+### Performance Improvements
+
+* **http:** replace HTTP/1.x parser with SIMD/SWAR engine and optimize request capture ([d57d4cd](https://github.com/Stephan-MC/ruvel/commit/d57d4cdbfa767e85c3ece429a3248d663cf7d019))
+
 ## [0.14.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.13.0...ruvel-v0.14.0) (2026-11-22)
 
 
