@@ -2,7 +2,7 @@ use ruvel::constants::MAX_ROUTE_PARAMS;
 use ruvel::contracts::support::Responsable;
 use ruvel::foundation::Application;
 use ruvel::http::parser::Status as ParseStatus;
-use ruvel::http::{Headers, Method, Request, Response};
+use ruvel::http::{Headers, Method, Request, Response, Status};
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1192,6 +1192,209 @@ async fn test_tcp_pipelined_flush_on_pending_avoids_reverse_hol_blocking() {
         r2_elapsed >= Duration::from_millis(180),
         "R2 completed unexpectedly early: {r2_elapsed:?}"
     );
+
+    server.abort();
+}
+
+fn is_valid_imf_fixdate(val: &str) -> bool {
+    let b = val.as_bytes();
+    if b.len() != 29 {
+        return false;
+    }
+    let valid_day = matches!(
+        &b[..3],
+        b"Sun" | b"Mon" | b"Tue" | b"Wed" | b"Thu" | b"Fri" | b"Sat"
+    );
+    let valid_month = matches!(
+        &b[8..11],
+        b"Jan"
+            | b"Feb"
+            | b"Mar"
+            | b"Apr"
+            | b"May"
+            | b"Jun"
+            | b"Jul"
+            | b"Aug"
+            | b"Sep"
+            | b"Oct"
+            | b"Nov"
+            | b"Dec"
+    );
+    valid_day
+        && &b[3..5] == b", "
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && matches!(
+            std::str::from_utf8(&b[5..7])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok()),
+            Some(1..=31)
+        )
+        && b[7] == b' '
+        && valid_month
+        && b[11] == b' '
+        && b[12..16].iter().all(u8::is_ascii_digit)
+        && b[16] == b' '
+        && matches!(
+            std::str::from_utf8(&b[17..19])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok()),
+            Some(0..=23)
+        )
+        && b[19] == b':'
+        && matches!(
+            std::str::from_utf8(&b[20..22])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok()),
+            Some(0..=59)
+        )
+        && b[22] == b':'
+        && matches!(
+            std::str::from_utf8(&b[23..25])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok()),
+            Some(0..=60)
+        )
+        && &b[25..29] == b" GMT"
+}
+
+fn extract_header_values(raw_headers: &str, name: &str) -> Vec<String> {
+    raw_headers
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn test_response_date_header_serialization_and_overrides() {
+    for wire in [
+        Response::ok().text("hi").to_bytes(),
+        Response::no_content().to_bytes(),
+        Response::status(Status::NotModified).to_bytes(),
+    ] {
+        let text = String::from_utf8(wire).unwrap();
+        let (head, _) = text.split_once("\r\n\r\n").unwrap();
+        let dates = extract_header_values(head, "Date");
+        assert_eq!(dates.len(), 1, "expected 1 Date header in {head:?}");
+        assert!(
+            is_valid_imf_fixdate(&dates[0]),
+            "invalid IMF-fixdate: {:?}",
+            dates[0]
+        );
+    }
+
+    for status in [Status::Continue, Status::EarlyHints] {
+        let text = String::from_utf8(Response::status(status).to_bytes()).unwrap();
+        let (head, _) = text.split_once("\r\n\r\n").unwrap();
+        let dates = extract_header_values(head, "Date");
+        assert!(
+            dates.is_empty(),
+            "1xx response must not emit Date header automatically: {head:?}"
+        );
+    }
+
+    let custom = "Wed, 21 Oct 2015 07:28:00 GMT";
+    for header_name in ["Date", "date"] {
+        let text =
+            String::from_utf8(Response::ok().header(header_name, custom).to_bytes()).unwrap();
+        let (head, _) = text.split_once("\r\n\r\n").unwrap();
+        let dates = extract_header_values(head, "Date");
+        assert_eq!(dates, vec![custom.to_string()], "head: {head:?}");
+        assert!(head.contains(&format!("{header_name}: {custom}")));
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_server_emits_imf_fixdate_date_header() {
+    let app = Application::configure("")
+        .with_routing(|routing| {
+            routing.web(|router| {
+                router.get("/ok", |_req| async { Response::ok().text("ok") });
+                router.post("/echo", |req| async move { Response::ok().bytes(req.body) });
+            });
+        })
+        .create();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("read bound local addr");
+
+    let server = tokio::spawn(async move {
+        let _ = app.serve(listener).await;
+    });
+
+    {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.set_nodelay(true).expect("enable TCP_NODELAY");
+        let mut resp_buf = Vec::new();
+
+        // 200 OK
+        stream
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let (h200, b200) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h200.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(b200, b"ok");
+        let dates = extract_header_values(&h200, "Date");
+        assert_eq!(dates.len(), 1);
+        assert!(is_valid_imf_fixdate(&dates[0]));
+
+        // 404 Not Found
+        stream
+            .write_all(b"GET /does-not-exist HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let (h404, _) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h404.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        let dates = extract_header_values(&h404, "Date");
+        assert_eq!(dates.len(), 1);
+        assert!(is_valid_imf_fixdate(&dates[0]));
+
+        // Interim 100 Continue omits Date, while subsequent 200 OK includes Date
+        stream
+            .write_all(
+                b"POST /echo HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut interim = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut interim))
+            .await
+            .expect("timed out waiting for 100 Continue")
+            .unwrap();
+        assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        stream.write_all(b"hi").await.unwrap();
+        let (h_after_100, b_after_100) = read_http_response(&mut stream, &mut resp_buf).await;
+        assert!(h_after_100.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(b_after_100, b"hi");
+        assert_eq!(extract_header_values(&h_after_100, "Date").len(), 1);
+    }
+
+    // Early parser 400 Bad Request includes valid IMF-fixdate Date header
+    {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut resp))
+            .await
+            .expect("timed out waiting for 400 response")
+            .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let (head, _) = text.split_once("\r\n\r\n").unwrap();
+        let dates = extract_header_values(head, "Date");
+        assert_eq!(dates.len(), 1, "head: {head:?}");
+        assert!(is_valid_imf_fixdate(&dates[0]));
+    }
 
     server.abort();
 }

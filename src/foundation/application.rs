@@ -17,29 +17,29 @@ use crate::support::{LogServiceProvider, ServiceProvider};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const HTTP_400_RESPONSE: &[u8] =
-    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_413_RESPONSE: &[u8] =
-    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_417_RESPONSE: &[u8] =
-    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_431_RESPONSE: &[u8] =
-    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_501_RESPONSE: &[u8] =
-    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_505_RESPONSE: &[u8] =
-    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_400_HEAD: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n";
+const HTTP_413_HEAD: &[u8] =
+    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n";
+const HTTP_417_HEAD: &[u8] =
+    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n";
+const HTTP_431_HEAD: &[u8] =
+    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n";
+const HTTP_501_HEAD: &[u8] =
+    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n";
+const HTTP_505_HEAD: &[u8] =
+    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n";
 const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 #[inline]
 fn parser_error_response(err: &parser::Error) -> &'static [u8] {
     match err.status() {
-        Some(413) => HTTP_413_RESPONSE,
-        Some(417) => HTTP_417_RESPONSE,
-        Some(431) => HTTP_431_RESPONSE,
-        Some(501) => HTTP_501_RESPONSE,
-        Some(505) => HTTP_505_RESPONSE,
-        _ => HTTP_400_RESPONSE,
+        Some(413) => HTTP_413_HEAD,
+        Some(417) => HTTP_417_HEAD,
+        Some(431) => HTTP_431_HEAD,
+        Some(501) => HTTP_501_HEAD,
+        Some(505) => HTTP_505_HEAD,
+        _ => HTTP_400_HEAD,
     }
 }
 
@@ -60,13 +60,22 @@ async fn write_error_and_close<S: AsyncWrite + Unpin>(
     socket: &mut S,
     response_buffer: &[u8],
     resp_len: usize,
-    error_bytes: &[u8],
+    error_head: &[u8],
 ) {
     let mut pending = resp_len;
     if !flush_response_buffer(socket, response_buffer, &mut pending).await {
         return;
     }
-    let _ = socket.write_all(error_bytes).await;
+    let mut frame = [0u8; 160];
+    let head_len = error_head.len();
+    let date_end = head_len + crate::http::date::DATE_HEADER_LEN;
+    debug_assert!(date_end + 2 <= frame.len());
+    frame[..head_len].copy_from_slice(error_head);
+    crate::http::date::with_current_date_header(|line| {
+        frame[head_len..date_end].copy_from_slice(line);
+    });
+    frame[date_end..date_end + 2].copy_from_slice(b"\r\n");
+    let _ = socket.write_all(&frame[..date_end + 2]).await;
     let _ = socket.shutdown().await;
 }
 
@@ -272,6 +281,8 @@ impl Application {
             Ok(k) => k,
             Err(e) => panic!("Failed to resolve Kernel from container: {}", e),
         };
+
+        let _date_ticker = crate::http::date::start_server_ticker();
 
         // Initiate the listener's loop that runs indefinitely until stopped
         loop {

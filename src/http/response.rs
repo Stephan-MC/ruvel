@@ -210,7 +210,7 @@ impl Response {
 
     /// Serialize this response into a new buffer, suppressing body bytes for `HEAD` requests.
     pub(crate) fn to_bytes_for(&self, is_head: bool) -> Vec<u8> {
-        let cap = if is_head { 128 } else { 128 + self.body.len() };
+        let cap = if is_head { 160 } else { 160 + self.body.len() };
         let mut buffer = Vec::with_capacity(cap);
         self.write_to_for(&mut buffer, is_head);
         buffer
@@ -225,7 +225,7 @@ impl Response {
     /// Fast response serialization supporting `HEAD` body suppression.
     pub(crate) fn write_to_for(&self, buffer: &mut Vec<u8>, is_head: bool) {
         // Reserve enough space up front to avoid multiple growth reallocations on fresh buffers.
-        let extra = if is_head { 96 } else { 96 + self.body.len() };
+        let extra = if is_head { 160 } else { 160 + self.body.len() };
         buffer.reserve(extra);
         let _ = self.write_to_sink(buffer, is_head);
     }
@@ -281,7 +281,8 @@ impl Response {
         }
 
         let code = self.status_code();
-        let forbid_content_length = (100..200).contains(&code) || code == 204;
+        let is_informational = (100..200).contains(&code);
+        let forbid_content_length = is_informational || code == 204;
         let suppress_body = is_head || forbid_content_length || code == 304;
         let preserve_manual_cl = !forbid_content_length && (is_head || code == 304);
         let has_manual_cl = preserve_manual_cl && self.headers.contains_key("Content-Length");
@@ -297,12 +298,15 @@ impl Response {
 
         let skip_header_cl = forbid_content_length || !has_manual_cl;
         let mut emitted_manual_cl = false;
+        let mut has_manual_date = false;
         for (k, v) in self.headers.iter() {
             if k.eq_ignore_ascii_case("content-length") {
                 if skip_header_cl || emitted_manual_cl {
                     continue;
                 }
                 emitted_manual_cl = true;
+            } else if !is_informational && k.len() == 4 && k.eq_ignore_ascii_case("date") {
+                has_manual_date = true;
             }
             if !sink.write_bytes(k.as_bytes())
                 || !sink.write_bytes(b": ")
@@ -311,6 +315,13 @@ impl Response {
             {
                 return false;
             }
+        }
+
+        if !is_informational
+            && !has_manual_date
+            && !super::date::with_current_date_header(|line| sink.write_bytes(line))
+        {
+            return false;
         }
 
         if !sink.write_bytes(b"\r\n") {
