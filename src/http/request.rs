@@ -80,13 +80,33 @@ impl Request {
         };
 
         let mut headers = Headers::with_capacity(raw.header_count());
+        let mut seen_singletons: u16 = 0;
+        let mut saw_unknown_singleton = false;
         for (name_bytes, value_bytes) in raw.headers() {
             let name_str = std::str::from_utf8(name_bytes).map_err(|_| parser::Error::Malformed)?;
             let value_str =
                 std::str::from_utf8(value_bytes).map_err(|_| parser::Error::Malformed)?;
-            let name = intern_header_name(name_str);
+            let (name, kind) = intern_header_name(name_str);
             let value = intern_common_header_value(value_str);
-            headers.insert(name, value);
+            match kind {
+                HeaderKind::Multi => headers.push_direct(name, value),
+                HeaderKind::Single(bit) => {
+                    if !saw_unknown_singleton && (seen_singletons & bit) == 0 {
+                        seen_singletons |= bit;
+                        headers.push_direct(name, value);
+                    } else {
+                        headers.insert(name, value);
+                    }
+                }
+                HeaderKind::Unknown => {
+                    if Headers::is_single_value(&name) {
+                        saw_unknown_singleton = true;
+                        headers.insert(name, value);
+                    } else {
+                        headers.push_direct(name, value);
+                    }
+                }
+            }
         }
 
         Ok(Self {
@@ -277,99 +297,165 @@ impl Request {
     }
 }
 
-/// Intern common exact-cased HTTP request header names to `'static` slices without
-/// altering wire casing.
-#[inline]
-fn intern_header_name(name: &str) -> Cow<'static, str> {
-    let static_name: Option<&'static str> = match name {
-        "TE" => Some("TE"),
-        "te" => Some("te"),
-        "Host" => Some("Host"),
-        "host" => Some("host"),
-        "Date" => Some("Date"),
-        "date" => Some("date"),
-        "From" => Some("From"),
-        "from" => Some("from"),
-        "Range" => Some("Range"),
-        "range" => Some("range"),
-        "Accept" => Some("Accept"),
-        "accept" => Some("accept"),
-        "Cookie" => Some("Cookie"),
-        "cookie" => Some("cookie"),
-        "Origin" => Some("Origin"),
-        "origin" => Some("origin"),
-        "Expect" => Some("Expect"),
-        "expect" => Some("expect"),
-        "Pragma" => Some("Pragma"),
-        "pragma" => Some("pragma"),
-        "Referer" => Some("Referer"),
-        "referer" => Some("referer"),
-        "Upgrade" => Some("Upgrade"),
-        "upgrade" => Some("upgrade"),
-        "If-Match" => Some("If-Match"),
-        "if-match" => Some("if-match"),
-        "If-Range" => Some("If-Range"),
-        "if-range" => Some("if-range"),
-        "X-Real-IP" => Some("X-Real-IP"),
-        "x-real-ip" => Some("x-real-ip"),
-        "Forwarded" => Some("Forwarded"),
-        "forwarded" => Some("forwarded"),
-        "User-Agent" => Some("User-Agent"),
-        "user-agent" => Some("user-agent"),
-        "Connection" => Some("Connection"),
-        "connection" => Some("connection"),
-        "Keep-Alive" => Some("Keep-Alive"),
-        "keep-alive" => Some("keep-alive"),
-        "Content-Type" => Some("Content-Type"),
-        "content-type" => Some("content-type"),
-        "X-Request-Id" => Some("X-Request-Id"),
-        "x-request-id" => Some("x-request-id"),
-        "Max-Forwards" => Some("Max-Forwards"),
-        "max-forwards" => Some("max-forwards"),
-        "Authorization" => Some("Authorization"),
-        "authorization" => Some("authorization"),
-        "Cache-Control" => Some("Cache-Control"),
-        "cache-control" => Some("cache-control"),
-        "If-None-Match" => Some("If-None-Match"),
-        "if-none-match" => Some("if-none-match"),
-        "Content-Length" => Some("Content-Length"),
-        "content-length" => Some("content-length"),
-        "Sec-Fetch-Mode" => Some("Sec-Fetch-Mode"),
-        "sec-fetch-mode" => Some("sec-fetch-mode"),
-        "Sec-Fetch-Site" => Some("Sec-Fetch-Site"),
-        "sec-fetch-site" => Some("sec-fetch-site"),
-        "Sec-Fetch-Dest" => Some("Sec-Fetch-Dest"),
-        "sec-fetch-dest" => Some("sec-fetch-dest"),
-        "Sec-Fetch-User" => Some("Sec-Fetch-User"),
-        "sec-fetch-user" => Some("sec-fetch-user"),
-        "Accept-Encoding" => Some("Accept-Encoding"),
-        "accept-encoding" => Some("accept-encoding"),
-        "Accept-Language" => Some("Accept-Language"),
-        "accept-language" => Some("accept-language"),
-        "X-Forwarded-For" => Some("X-Forwarded-For"),
-        "x-forwarded-for" => Some("x-forwarded-for"),
-        "X-Requested-With" => Some("X-Requested-With"),
-        "x-requested-with" => Some("x-requested-with"),
-        "X-Forwarded-Host" => Some("X-Forwarded-Host"),
-        "x-forwarded-host" => Some("x-forwarded-host"),
-        "Content-Encoding" => Some("Content-Encoding"),
-        "content-encoding" => Some("content-encoding"),
-        "Proxy-Connection" => Some("Proxy-Connection"),
-        "proxy-connection" => Some("proxy-connection"),
-        "If-Modified-Since" => Some("If-Modified-Since"),
-        "if-modified-since" => Some("if-modified-since"),
-        "Transfer-Encoding" => Some("Transfer-Encoding"),
-        "transfer-encoding" => Some("transfer-encoding"),
-        "X-Forwarded-Proto" => Some("X-Forwarded-Proto"),
-        "x-forwarded-proto" => Some("x-forwarded-proto"),
-        "If-Unmodified-Since" => Some("If-Unmodified-Since"),
-        "if-unmodified-since" => Some("if-unmodified-since"),
-        _ => None,
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderKind {
+    Multi,
+    Single(u16),
+    Unknown,
+}
 
-    match static_name {
-        Some(s) => Cow::Borrowed(s),
-        None => Cow::Owned(name.to_owned()),
+const SINGLE_HOST: u16 = 1 << 0;
+const SINGLE_DATE: u16 = 1 << 1;
+const SINGLE_FROM: u16 = 1 << 2;
+const SINGLE_RANGE: u16 = 1 << 3;
+const SINGLE_ORIGIN: u16 = 1 << 4;
+const SINGLE_REFERER: u16 = 1 << 5;
+const SINGLE_IF_RANGE: u16 = 1 << 6;
+const SINGLE_USER_AGENT: u16 = 1 << 7;
+const SINGLE_CONTENT_TYPE: u16 = 1 << 8;
+const SINGLE_MAX_FORWARDS: u16 = 1 << 9;
+const SINGLE_AUTHORIZATION: u16 = 1 << 10;
+const SINGLE_CONTENT_LENGTH: u16 = 1 << 11;
+const SINGLE_IF_MODIFIED_SINCE: u16 = 1 << 12;
+const SINGLE_IF_UNMODIFIED_SINCE: u16 = 1 << 13;
+
+/// Intern common exact-cased HTTP request header names to `'static` slices without
+/// altering wire casing, also returning pre-classified singleton metadata so
+/// `from_h1_head_only` avoids redundant linear duplicate scans on common headers.
+#[inline]
+fn intern_header_name(name: &str) -> (Cow<'static, str>, HeaderKind) {
+    match name {
+        "TE" => (Cow::Borrowed("TE"), HeaderKind::Multi),
+        "te" => (Cow::Borrowed("te"), HeaderKind::Multi),
+        "Host" => (Cow::Borrowed("Host"), HeaderKind::Single(SINGLE_HOST)),
+        "host" => (Cow::Borrowed("host"), HeaderKind::Single(SINGLE_HOST)),
+        "Date" => (Cow::Borrowed("Date"), HeaderKind::Single(SINGLE_DATE)),
+        "date" => (Cow::Borrowed("date"), HeaderKind::Single(SINGLE_DATE)),
+        "From" => (Cow::Borrowed("From"), HeaderKind::Single(SINGLE_FROM)),
+        "from" => (Cow::Borrowed("from"), HeaderKind::Single(SINGLE_FROM)),
+        "Range" => (Cow::Borrowed("Range"), HeaderKind::Single(SINGLE_RANGE)),
+        "range" => (Cow::Borrowed("range"), HeaderKind::Single(SINGLE_RANGE)),
+        "Accept" => (Cow::Borrowed("Accept"), HeaderKind::Multi),
+        "accept" => (Cow::Borrowed("accept"), HeaderKind::Multi),
+        "Cookie" => (Cow::Borrowed("Cookie"), HeaderKind::Multi),
+        "cookie" => (Cow::Borrowed("cookie"), HeaderKind::Multi),
+        "Origin" => (Cow::Borrowed("Origin"), HeaderKind::Single(SINGLE_ORIGIN)),
+        "origin" => (Cow::Borrowed("origin"), HeaderKind::Single(SINGLE_ORIGIN)),
+        "Expect" => (Cow::Borrowed("Expect"), HeaderKind::Multi),
+        "expect" => (Cow::Borrowed("expect"), HeaderKind::Multi),
+        "Pragma" => (Cow::Borrowed("Pragma"), HeaderKind::Multi),
+        "pragma" => (Cow::Borrowed("pragma"), HeaderKind::Multi),
+        "Referer" => (Cow::Borrowed("Referer"), HeaderKind::Single(SINGLE_REFERER)),
+        "referer" => (Cow::Borrowed("referer"), HeaderKind::Single(SINGLE_REFERER)),
+        "Upgrade" => (Cow::Borrowed("Upgrade"), HeaderKind::Multi),
+        "upgrade" => (Cow::Borrowed("upgrade"), HeaderKind::Multi),
+        "If-Match" => (Cow::Borrowed("If-Match"), HeaderKind::Multi),
+        "if-match" => (Cow::Borrowed("if-match"), HeaderKind::Multi),
+        "If-Range" => (
+            Cow::Borrowed("If-Range"),
+            HeaderKind::Single(SINGLE_IF_RANGE),
+        ),
+        "if-range" => (
+            Cow::Borrowed("if-range"),
+            HeaderKind::Single(SINGLE_IF_RANGE),
+        ),
+        "X-Real-IP" => (Cow::Borrowed("X-Real-IP"), HeaderKind::Multi),
+        "x-real-ip" => (Cow::Borrowed("x-real-ip"), HeaderKind::Multi),
+        "Forwarded" => (Cow::Borrowed("Forwarded"), HeaderKind::Multi),
+        "forwarded" => (Cow::Borrowed("forwarded"), HeaderKind::Multi),
+        "User-Agent" => (
+            Cow::Borrowed("User-Agent"),
+            HeaderKind::Single(SINGLE_USER_AGENT),
+        ),
+        "user-agent" => (
+            Cow::Borrowed("user-agent"),
+            HeaderKind::Single(SINGLE_USER_AGENT),
+        ),
+        "Connection" => (Cow::Borrowed("Connection"), HeaderKind::Multi),
+        "connection" => (Cow::Borrowed("connection"), HeaderKind::Multi),
+        "Keep-Alive" => (Cow::Borrowed("Keep-Alive"), HeaderKind::Multi),
+        "keep-alive" => (Cow::Borrowed("keep-alive"), HeaderKind::Multi),
+        "Content-Type" => (
+            Cow::Borrowed("Content-Type"),
+            HeaderKind::Single(SINGLE_CONTENT_TYPE),
+        ),
+        "content-type" => (
+            Cow::Borrowed("content-type"),
+            HeaderKind::Single(SINGLE_CONTENT_TYPE),
+        ),
+        "X-Request-Id" => (Cow::Borrowed("X-Request-Id"), HeaderKind::Multi),
+        "x-request-id" => (Cow::Borrowed("x-request-id"), HeaderKind::Multi),
+        "Max-Forwards" => (
+            Cow::Borrowed("Max-Forwards"),
+            HeaderKind::Single(SINGLE_MAX_FORWARDS),
+        ),
+        "max-forwards" => (
+            Cow::Borrowed("max-forwards"),
+            HeaderKind::Single(SINGLE_MAX_FORWARDS),
+        ),
+        "Authorization" => (
+            Cow::Borrowed("Authorization"),
+            HeaderKind::Single(SINGLE_AUTHORIZATION),
+        ),
+        "authorization" => (
+            Cow::Borrowed("authorization"),
+            HeaderKind::Single(SINGLE_AUTHORIZATION),
+        ),
+        "Cache-Control" => (Cow::Borrowed("Cache-Control"), HeaderKind::Multi),
+        "cache-control" => (Cow::Borrowed("cache-control"), HeaderKind::Multi),
+        "If-None-Match" => (Cow::Borrowed("If-None-Match"), HeaderKind::Multi),
+        "if-none-match" => (Cow::Borrowed("if-none-match"), HeaderKind::Multi),
+        "Content-Length" => (
+            Cow::Borrowed("Content-Length"),
+            HeaderKind::Single(SINGLE_CONTENT_LENGTH),
+        ),
+        "content-length" => (
+            Cow::Borrowed("content-length"),
+            HeaderKind::Single(SINGLE_CONTENT_LENGTH),
+        ),
+        "Sec-Fetch-Mode" => (Cow::Borrowed("Sec-Fetch-Mode"), HeaderKind::Multi),
+        "sec-fetch-mode" => (Cow::Borrowed("sec-fetch-mode"), HeaderKind::Multi),
+        "Sec-Fetch-Site" => (Cow::Borrowed("Sec-Fetch-Site"), HeaderKind::Multi),
+        "sec-fetch-site" => (Cow::Borrowed("sec-fetch-site"), HeaderKind::Multi),
+        "Sec-Fetch-Dest" => (Cow::Borrowed("Sec-Fetch-Dest"), HeaderKind::Multi),
+        "sec-fetch-dest" => (Cow::Borrowed("sec-fetch-dest"), HeaderKind::Multi),
+        "Sec-Fetch-User" => (Cow::Borrowed("Sec-Fetch-User"), HeaderKind::Multi),
+        "sec-fetch-user" => (Cow::Borrowed("sec-fetch-user"), HeaderKind::Multi),
+        "Accept-Encoding" => (Cow::Borrowed("Accept-Encoding"), HeaderKind::Multi),
+        "accept-encoding" => (Cow::Borrowed("accept-encoding"), HeaderKind::Multi),
+        "Accept-Language" => (Cow::Borrowed("Accept-Language"), HeaderKind::Multi),
+        "accept-language" => (Cow::Borrowed("accept-language"), HeaderKind::Multi),
+        "X-Forwarded-For" => (Cow::Borrowed("X-Forwarded-For"), HeaderKind::Multi),
+        "x-forwarded-for" => (Cow::Borrowed("x-forwarded-for"), HeaderKind::Multi),
+        "X-Requested-With" => (Cow::Borrowed("X-Requested-With"), HeaderKind::Multi),
+        "x-requested-with" => (Cow::Borrowed("x-requested-with"), HeaderKind::Multi),
+        "X-Forwarded-Host" => (Cow::Borrowed("X-Forwarded-Host"), HeaderKind::Multi),
+        "x-forwarded-host" => (Cow::Borrowed("x-forwarded-host"), HeaderKind::Multi),
+        "Content-Encoding" => (Cow::Borrowed("Content-Encoding"), HeaderKind::Multi),
+        "content-encoding" => (Cow::Borrowed("content-encoding"), HeaderKind::Multi),
+        "Proxy-Connection" => (Cow::Borrowed("Proxy-Connection"), HeaderKind::Multi),
+        "proxy-connection" => (Cow::Borrowed("proxy-connection"), HeaderKind::Multi),
+        "If-Modified-Since" => (
+            Cow::Borrowed("If-Modified-Since"),
+            HeaderKind::Single(SINGLE_IF_MODIFIED_SINCE),
+        ),
+        "if-modified-since" => (
+            Cow::Borrowed("if-modified-since"),
+            HeaderKind::Single(SINGLE_IF_MODIFIED_SINCE),
+        ),
+        "Transfer-Encoding" => (Cow::Borrowed("Transfer-Encoding"), HeaderKind::Multi),
+        "transfer-encoding" => (Cow::Borrowed("transfer-encoding"), HeaderKind::Multi),
+        "X-Forwarded-Proto" => (Cow::Borrowed("X-Forwarded-Proto"), HeaderKind::Multi),
+        "x-forwarded-proto" => (Cow::Borrowed("x-forwarded-proto"), HeaderKind::Multi),
+        "If-Unmodified-Since" => (
+            Cow::Borrowed("If-Unmodified-Since"),
+            HeaderKind::Single(SINGLE_IF_UNMODIFIED_SINCE),
+        ),
+        "if-unmodified-since" => (
+            Cow::Borrowed("if-unmodified-since"),
+            HeaderKind::Single(SINGLE_IF_UNMODIFIED_SINCE),
+        ),
+        _ => (Cow::Owned(name.to_owned()), HeaderKind::Unknown),
     }
 }
 
@@ -471,4 +557,110 @@ fn percent_decode(input: &str) -> String {
     }
 
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interned_header_kinds_match_single_value_rules_and_have_unique_bits() {
+        let interned_names = [
+            ("TE", "te"),
+            ("Host", "host"),
+            ("Date", "date"),
+            ("From", "from"),
+            ("Range", "range"),
+            ("Accept", "accept"),
+            ("Cookie", "cookie"),
+            ("Origin", "origin"),
+            ("Expect", "expect"),
+            ("Pragma", "pragma"),
+            ("Referer", "referer"),
+            ("Upgrade", "upgrade"),
+            ("If-Match", "if-match"),
+            ("If-Range", "if-range"),
+            ("X-Real-IP", "x-real-ip"),
+            ("Forwarded", "forwarded"),
+            ("User-Agent", "user-agent"),
+            ("Connection", "connection"),
+            ("Keep-Alive", "keep-alive"),
+            ("Content-Type", "content-type"),
+            ("X-Request-Id", "x-request-id"),
+            ("Max-Forwards", "max-forwards"),
+            ("Authorization", "authorization"),
+            ("Cache-Control", "cache-control"),
+            ("If-None-Match", "if-none-match"),
+            ("Content-Length", "content-length"),
+            ("Sec-Fetch-Mode", "sec-fetch-mode"),
+            ("Sec-Fetch-Site", "sec-fetch-site"),
+            ("Sec-Fetch-Dest", "sec-fetch-dest"),
+            ("Sec-Fetch-User", "sec-fetch-user"),
+            ("Accept-Encoding", "accept-encoding"),
+            ("Accept-Language", "accept-language"),
+            ("X-Forwarded-For", "x-forwarded-for"),
+            ("X-Requested-With", "x-requested-with"),
+            ("X-Forwarded-Host", "x-forwarded-host"),
+            ("Content-Encoding", "content-encoding"),
+            ("Proxy-Connection", "proxy-connection"),
+            ("If-Modified-Since", "if-modified-since"),
+            ("Transfer-Encoding", "transfer-encoding"),
+            ("X-Forwarded-Proto", "x-forwarded-proto"),
+            ("If-Unmodified-Since", "if-unmodified-since"),
+        ];
+
+        let mut seen_bits = 0u16;
+        let mut singleton_count = 0usize;
+
+        for (title, lower) in interned_names {
+            let (cow_t, kind_t) = intern_header_name(title);
+            let (cow_l, kind_l) = intern_header_name(lower);
+            assert!(
+                matches!(cow_t, Cow::Borrowed(_)),
+                "{title} must be borrowed"
+            );
+            assert!(
+                matches!(cow_l, Cow::Borrowed(_)),
+                "{lower} must be borrowed"
+            );
+            assert_eq!(kind_t, kind_l, "pair ({title}, {lower}) kind mismatch");
+            assert_ne!(kind_t, HeaderKind::Unknown, "{title} must not be Unknown");
+
+            let is_single = Headers::is_single_value(title);
+            assert_eq!(is_single, Headers::is_single_value(lower));
+            match kind_t {
+                HeaderKind::Multi => assert!(!is_single, "{title} should be Single"),
+                HeaderKind::Single(bit) => {
+                    assert!(is_single, "{title} should be Multi");
+                    assert_eq!(bit.count_ones(), 1, "{title} bit {bit:#x} not single-bit");
+                    assert_eq!(
+                        seen_bits & bit,
+                        0,
+                        "{title} collides with an existing singleton bit {bit:#x}"
+                    );
+                    seen_bits |= bit;
+                    singleton_count += 1;
+                }
+                HeaderKind::Unknown => unreachable!(),
+            }
+        }
+
+        assert_eq!(singleton_count, 14);
+        assert_eq!(intern_header_name("X-Unlisted").1, HeaderKind::Unknown);
+    }
+
+    #[test]
+    fn duplicate_singleton_headers_in_request_overwrite_in_place() {
+        for raw in [
+            &b"GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: first\r\nuser-agent: second\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: localhost\r\nUSER-AGENT: first\r\nUser-Agent: second\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: first\r\nUSER-AGENT: second\r\n\r\n"[..],
+        ] {
+            let ParseStatus::Complete(req, _) = Request::capture(raw).unwrap() else {
+                panic!("expected complete");
+            };
+            assert_eq!(req.headers.get_all("user-agent").collect::<Vec<_>>(), vec!["second"]);
+            assert_eq!(req.headers().len(), 2);
+        }
+    }
 }

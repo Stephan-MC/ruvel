@@ -1,18 +1,19 @@
-//! Std-only SIMD/SWAR HTTP/1.x request framing and head parser.
+//! Runtime-dispatched SIMD/SWAR (`AVX-512BW+VL` / `AVX2` / `SSE2` / scalar)
+//! HTTP/1.x request framing and head parser.
 //!
 //! Architecture summary:
 //! - One growable, always-initialized `Vec<u8>` per connection ([`Conn`]). Reads go straight
 //!   into its spare room without per-read copies or zeroing on the hot path.
-//! - The head is located first (`find_head_end`), then parsed once over a complete slice
-//!   into `(u32, u32)` [`Span`]s inside a reused [`Head`].
+//! - Complete initial reads parse in a single pass directly into 16-byte `(u32, u32)` [`Span`]s
+//!   inside a reused [`Head`] (avoiding both head-end pre-scans and heap allocation).
 //! - Content-Length bodies are sized from the header; chunked bodies are decoded *in place*
-//!   inside [`Conn`], keeping body bytes contiguous without per-request allocation.
+//!   inside [`Conn`] via a `HEX_LUT` + 16-hex-digit + SWAR decoder.
 //! - Every state is resumable across arbitrary TCP fragmentation.
 
 mod conn;
 mod dechunk;
 mod head;
-mod scan;
+mod simd;
 
 use std::borrow::Cow;
 
@@ -21,11 +22,6 @@ use crate::http::parser::{Error, Status};
 
 pub use conn::{Conn, Frame, Request};
 pub use head::{Body, Head, Method, Span};
-pub use scan::{
-    find_head_end, find_head_end_scalar, find_lf, find_lf_swar, scan_name, scan_name_scalar,
-    scan_origin_target, scan_origin_target_scalar, scan_uri, scan_uri_scalar, skip_value,
-    skip_value_swar,
-};
 
 /// One complete HTTP/1.x request parsed from an immutable byte slice via [`parse_slice`].
 pub struct SliceRequest<'a> {
@@ -57,8 +53,15 @@ pub fn parse_slice_into<'a>(
     head: &mut Head,
 ) -> Result<Status<SliceParts<'a>>, Error> {
     let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
-    let head_len = match head.parse_prefix(&buf[..scan_limit]) {
-        Ok(len) => len,
+    let head_len = match head.parse_prefix_status(&buf[..scan_limit]) {
+        Ok(Some(len)) => len,
+        Ok(None) => {
+            return if buf.len() >= REQUEST_HEADER_SIZE {
+                Err(Error::HeaderTooLarge)
+            } else {
+                Ok(Status::Incomplete)
+            };
+        }
         Err(err) => return classify_head_error(buf, err),
     };
 
@@ -93,7 +96,7 @@ pub fn parse_slice_into<'a>(
 #[inline(never)]
 fn classify_head_error<'a>(buf: &[u8], err: Error) -> Result<Status<SliceParts<'a>>, Error> {
     let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
-    match find_head_end(&buf[..scan_limit], 0) {
+    match head::find_head_end(&buf[..scan_limit], 0) {
         Err(()) => Err(Error::Malformed),
         Ok(None) => {
             if buf.len() >= REQUEST_HEADER_SIZE {
@@ -137,7 +140,7 @@ pub fn parse_slice(buf: &[u8]) -> Result<Status<SliceRequest<'_>>, Error> {
 mod tests {
     use std::io::{self, Read};
 
-    use super::scan::VALUE;
+    use super::head::{TestBackend, find_head_end};
     use super::*;
     use crate::constants::{
         MAX_REQUEST_BODY_SIZE, MAX_REQUEST_HEADERS, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE,
@@ -606,57 +609,98 @@ mod tests {
         }
     }
 
-    #[test]
-    fn find_lf_matches_naive() {
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        for _ in 0..50_000 {
-            let len = rng.below(80);
-            let buf: Vec<u8> = (0..len)
-                .map(|_| match rng.below(6) {
-                    0 => b'\n',
-                    1 => b'\r',
-                    2 => 0x8A, // 0x0A with the high bit set: classic SWAR trap
-                    3 => 0x0B,
-                    4 => 0x09,
-                    _ => rng.next() as u8,
-                })
-                .collect();
-            let want = buf.iter().position(|&b| b == b'\n');
-            assert_eq!(find_lf(&buf), want, "{buf:?}");
-            assert_eq!(find_lf_swar(&buf), want, "{buf:?}");
-        }
-    }
-
-    #[test]
-    fn skip_value_matches_naive() {
-        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
-        for _ in 0..50_000 {
-            let len = rng.below(70);
-            let buf: Vec<u8> = (0..len)
-                .map(|_| match rng.below(8) {
-                    0 => b'\t',
-                    1 => 0x7F,
-                    2 => 0xFF,
-                    3 => 0x80,
-                    4 => b'\r',
-                    5 => rng.below(0x20) as u8,
-                    _ => 0x20 + rng.below(0x5F) as u8,
-                })
-                .collect();
-            let start = rng.below(len + 1);
-            let mut want = start;
-            while want < buf.len() && VALUE[buf[want] as usize] {
-                want += 1;
+    fn parse_head_with(
+        buf: &[u8],
+        backend: TestBackend,
+    ) -> Result<Option<(usize, Vec<u8>)>, Error> {
+        let mut h = Head::new();
+        match h.parse_with_backend_for_test(buf, backend) {
+            Ok(Some(len)) => {
+                let mut summary = format!(
+                    "{:?}:{}:{}:{}:{}:{}:{:?}:{:?}",
+                    h.method,
+                    h.minor,
+                    h.keep_alive,
+                    h.expect_100_continue,
+                    len,
+                    h.header_count(),
+                    h.body,
+                    h.host
+                )
+                .into_bytes();
+                for (n, v) in h.header_spans() {
+                    summary.extend_from_slice(n.of(buf));
+                    summary.push(b':');
+                    summary.extend_from_slice(v.of(buf));
+                    summary.push(b'\n');
+                }
+                summary.extend_from_slice(h.path.of(buf));
+                summary.push(b'?');
+                summary.extend_from_slice(h.query.of(buf));
+                Ok(Some((len, summary)))
             }
-            assert_eq!(skip_value(&buf, start), want, "{buf:?} from {start}");
-            assert_eq!(skip_value_swar(&buf, start), want, "{buf:?} from {start}");
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn assert_all_backends_agree(buf: &[u8]) {
+        let scalar = parse_head_with(buf, TestBackend::Scalar);
+        #[allow(unused_mut)]
+        let mut backends = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            backends.push(("sse2", TestBackend::Sse2));
+            if std::is_x86_feature_detected!("avx2") {
+                backends.push(("avx2", TestBackend::Avx2));
+            }
+            if std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512vl")
+            {
+                backends.push(("avx512", TestBackend::Avx512));
+            }
+        }
+        for (label, backend) in backends {
+            let got = parse_head_with(buf, backend);
+            match (&scalar, &got) {
+                (Ok(a), Ok(b)) => assert_eq!(
+                    a,
+                    b,
+                    "backend={label} mismatch on {:?}",
+                    String::from_utf8_lossy(buf)
+                ),
+                (Err(a), Err(b)) => assert_eq!(
+                    std::mem::discriminant(a),
+                    std::mem::discriminant(b),
+                    "backend={label} error mismatch: {a:?} vs {b:?}"
+                ),
+                (a, b) => panic!("backend={label} outcome mismatch: {a:?} vs {b:?}"),
+            }
         }
     }
 
     #[test]
-    fn find_head_end_block_matches_scalar() {
+    fn find_head_end_matches_reference() {
+        fn ref_find_head_end(data: &[u8], from: usize) -> Result<Option<usize>, ()> {
+            let mut i = from;
+            while i < data.len() {
+                let Some(off) = data[i..].iter().position(|&b| b == b'\n') else {
+                    return Ok(None);
+                };
+                let lf = i + off;
+                if lf == 0 || data[lf - 1] != b'\r' {
+                    return Err(());
+                }
+                if lf >= 3 && data[lf - 3] == b'\r' && data[lf - 2] == b'\n' {
+                    return Ok(Some(lf + 1));
+                }
+                i = lf + 1;
+            }
+            Ok(None)
+        }
+
         let mut rng = Rng(0x0BAD_C0DE_F00D_1234);
-        for round in 0..80_000 {
+        for round in 0..40_000 {
             let len = rng.below(300);
             let mut buf: Vec<u8> = (0..len)
                 .map(|_| match rng.below(10) {
@@ -678,128 +722,109 @@ mod tests {
                 }
             }
             let from = rng.below(len + 1);
-            let prefix_ok = find_head_end_scalar(&buf[..from], 0)
-                .map(|r| r.is_none())
-                .unwrap_or(false);
-            if !prefix_ok {
+            if ref_find_head_end(&buf[..from], 0) != Ok(None) {
                 continue;
             }
-            let a = find_head_end(&buf, from);
-            let b = find_head_end_scalar(&buf, from);
-            assert_eq!(a, b, "from={from} buf={:?}", String::from_utf8_lossy(&buf));
+            assert_eq!(
+                find_head_end(&buf, from),
+                ref_find_head_end(&buf, from),
+                "from={from}"
+            );
         }
     }
 
     #[test]
-    fn scan_name_and_uri_match_table_loops() {
-        let mut rng = Rng(0x5EED_5EED_1357_9BDF);
-        for _ in 0..80_000 {
-            let len = rng.below(60);
-            let buf: Vec<u8> = (0..len)
-                .map(|_| match rng.below(12) {
-                    0 => b':',
-                    1 => b' ',
-                    2 => b'_',
-                    3 => b'.',
-                    4 => b'-',
-                    5 => 0x80 + rng.below(0x80) as u8,
-                    6 => rng.below(0x21) as u8,
-                    7 => b"@[`{}/;<>?\\\"()=,"[rng.below(16)],
-                    8 => b'0' + rng.below(10) as u8,
-                    9 => b"!#$%&'*+^|~"[rng.below(11)],
-                    _ => {
-                        if rng.below(2) == 0 {
-                            b'a' + rng.below(26) as u8
-                        } else {
-                            b'A' + rng.below(26) as u8
-                        }
-                    }
-                })
-                .collect();
-            let start = rng.below(len + 1);
-            assert_eq!(
-                scan_name(&buf, start),
-                scan_name_scalar(&buf, start),
-                "name {buf:?} from {start}"
-            );
-            assert_eq!(
-                scan_uri(&buf, start),
-                scan_uri_scalar(&buf, start),
-                "uri {buf:?} from {start}"
-            );
+    fn all_simd_backends_match_scalar_across_payloads_prefixes_and_bytes() {
+        let minimal = b"GET / HTTP/1.0\r\n\r\n".to_vec();
+        let short_api = b"GET /api/v2/users/42?fields=id,name HTTP/1.1\r\nHost: api.example.com\r\nAccept: application/json\r\n\r\n".to_vec();
+        let browser = b"\
+GET /wp-content/uploads/2010/03/hello-kitty-darth-vader-pink.jpg HTTP/1.1\r\n\
+Host: www.kittyhell.com\r\n\
+User-Agent: Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.6; ja-JP-mac; rv:1.9.2.3) Gecko/20100401 Firefox/3.6.3\r\n\
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
+Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n\r\n"
+            .to_vec();
+        let big_cookie = format!(
+            "GET /big HTTP/1.1\r\nHost: x.test\r\nCookie: c={}\r\nAfter:  \t ok \t \r\n\r\n",
+            "k".repeat(3000)
+        )
+        .into_bytes();
+        let mut many_headers = b"POST /many HTTP/1.1\r\nHost: x.test\r\n".to_vec();
+        for i in 0..42 {
+            many_headers.extend_from_slice(format!("X-Hdr-{i}: value-{i}\r\n").as_bytes());
         }
-        // Exhaustive over every single byte value in every lane of a 16-byte block.
+        many_headers.extend_from_slice(b"\r\n");
+
+        for payload in [
+            minimal.as_slice(),
+            GET,
+            short_api.as_slice(),
+            browser.as_slice(),
+            big_cookie.as_slice(),
+            many_headers.as_slice(),
+            b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            b"GET /bad\nHTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            assert_all_backends_agree(payload);
+            for cut in 0..=payload.len().min(200) {
+                assert_all_backends_agree(&payload[..cut]);
+            }
+        }
+
+        // Sweep every byte 0x00..=0xFF across 0..66 byte lane offsets in URI, header name, and value.
         for v in 0..=255u8 {
-            for lane in 0..20 {
-                let mut buf = vec![b'a'; 20];
-                buf[lane] = v;
-                assert_eq!(
-                    scan_name(&buf, 0),
-                    scan_name_scalar(&buf, 0),
-                    "byte {v:#x} lane {lane}"
-                );
-                assert_eq!(
-                    scan_uri(&buf, 0),
-                    scan_uri_scalar(&buf, 0),
-                    "byte {v:#x} lane {lane}"
-                );
+            for lane in 0..66 {
+                let mut uri_buf =
+                    format!("GET /{} HTTP/1.1\r\nHost: a\r\n\r\n", "a".repeat(70)).into_bytes();
+                uri_buf[5 + lane] = v;
+                assert_all_backends_agree(&uri_buf);
+
+                let mut name_buf =
+                    format!("GET / HTTP/1.1\r\nHost: a\r\n{}: v\r\n\r\n", "X".repeat(70))
+                        .into_bytes();
+                name_buf[24 + lane] = v;
+                assert_all_backends_agree(&name_buf);
+
+                let mut val_buf =
+                    format!("GET / HTTP/1.1\r\nHost: a\r\nX: {}\r\n\r\n", "v".repeat(70))
+                        .into_bytes();
+                val_buf[27 + lane] = v;
+                assert_all_backends_agree(&val_buf);
             }
         }
     }
 
     #[test]
-    fn scan_origin_target_matches_scalar_and_exhaustive_lanes() {
-        let mut rng = Rng(0x7363_616E_5F75_7269);
-        for _ in 0..80_000 {
-            let len = 1 + rng.below(72);
-            let mut buf = Vec::with_capacity(len + 1);
-            buf.push(b'/');
-            for _ in 1..len {
-                let b = match rng.below(14) {
-                    0 => b'/',
-                    1 => b'?',
-                    2 => b'%',
-                    3 => b' ',
-                    4 => b'&',
-                    5 => b'=',
-                    6 => b'_',
-                    7 => b'-',
-                    8 => b'.',
-                    9 => 0x80 + rng.below(0x80) as u8,
-                    10 => rng.below(0x21) as u8,
-                    11 => b"#<>\"{}\\|^`"[rng.below(10)],
-                    12 => b'0' + rng.below(16) as u8,
-                    _ => {
-                        if rng.below(2) == 0 {
-                            b'a' + rng.below(26) as u8
-                        } else {
-                            b'A' + rng.below(26) as u8
-                        }
-                    }
-                };
-                buf.push(b);
-            }
-            let start = rng.below(buf.len());
-            assert_eq!(
-                scan_origin_target(&buf, start).map_err(|_| ()),
-                scan_origin_target_scalar(&buf, start).map_err(|_| ()),
-                "origin target {buf:?} from {start}"
+    fn chunked_u64_max_overflow_and_limits_regressions() {
+        for hex in ["ffffffffffffffff", "fffffffffffffffe", "10000000000000000"] {
+            let wire = format!(
+                "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{hex}\r\nhello"
             );
+            assert_eq!(status(wire.as_bytes()), Some(413), "hex={hex}");
+            assert!(matches!(
+                parse_slice(wire.as_bytes()),
+                Err(Error::BodyTooLarge)
+            ));
         }
 
-        // Exhaustive over every byte 0..=255 in every lane 0..20 inside a 21-byte slice ending with ' '.
-        for v in 0..=255u8 {
-            for lane in 0..20 {
-                let mut buf = vec![b'a'; 21];
-                buf[20] = b' ';
-                buf[lane] = v;
-                assert_eq!(
-                    scan_origin_target(&buf, 0).map_err(|_| ()),
-                    scan_origin_target_scalar(&buf, 0).map_err(|_| ()),
-                    "origin target byte {v:#x} lane {lane}"
-                );
-            }
+        // Leading-zero > 16 hex digit DoS -> 400
+        let lz = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n00000000000000001\r\na\r\n0\r\n\r\n";
+        assert_eq!(status(lz), Some(400));
+        assert!(matches!(parse_slice(lz), Err(Error::Malformed)));
+
+        // Oversized trailer section (> 8 KiB) -> 431
+        let mut big_trailers =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        for i in 0..120 {
+            big_trailers.extend_from_slice(format!("X-T{i}: {}\r\n", "v".repeat(80)).as_bytes());
         }
+        big_trailers.extend_from_slice(b"\r\n");
+        assert_eq!(status(&big_trailers), Some(431));
+        assert!(matches!(
+            parse_slice(&big_trailers),
+            Err(Error::HeaderTooLarge)
+        ));
     }
 
     #[test]

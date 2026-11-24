@@ -11,8 +11,7 @@ use crate::constants::{
 use crate::http::parser::Error;
 
 use super::dechunk::{Dechunker, MAX_CHUNK_LINE, MAX_TRAILER};
-use super::head::{Body, Head, Method};
-use super::scan::find_head_end;
+use super::head::{Body, Head, Method, find_head_end};
 
 const TIER_1: usize = 16 * 1024; // head buffer tier between `initial` and `REQUEST_HEADER_SIZE`
 const RETAIN_MAX: usize = 64 * 1024; // buffers bigger than this are shrunk when idle
@@ -250,56 +249,99 @@ impl Conn {
         }
     }
 
-    /// Scans buffered bytes for the head terminator; on success parses the head and
-    /// switches phase. Returns whether the phase changed.
+    /// Parses or scans buffered bytes for the head terminator; on success switches phase.
+    /// Returns whether the phase changed.
+    ///
+    /// On the first read (`scanned == 0`), executes a single-pass SIMD/scalar parse directly
+    /// via [`Head::parse_prefix_status`]. Only if the head spans multiple reads or errors
+    /// does it use incremental [`find_head_end`] scanning / error classification.
     fn try_head(&mut self) -> Result<bool, Error> {
         let data = &self.buf[self.pos..self.filled];
-        let scan_limit = data.len().min(REQUEST_HEADER_SIZE);
-        match find_head_end(&data[..scan_limit], self.scanned) {
-            Err(()) => Err(Error::Malformed),
-            Ok(None) => {
-                self.scanned = scan_limit;
-                if data.len() >= REQUEST_HEADER_SIZE {
-                    return Err(Error::HeaderTooLarge);
-                }
-                Ok(false)
-            }
-            Ok(Some(head_len)) => {
-                if head_len > REQUEST_HEADER_SIZE {
-                    return Err(Error::HeaderTooLarge);
-                }
-                self.head.parse(&data[..head_len])?;
-                let no_body_buffered_yet = head_len == data.len();
-                let (phase, expects_body) = match self.head.body {
-                    Body::None => (
-                        Phase::Body {
-                            head_len,
-                            need: head_len,
-                        },
-                        false,
-                    ),
-                    Body::Length(n) => {
-                        // Rejected from the header alone, before any body byte is buffered.
-                        if n > MAX_REQUEST_BODY_SIZE {
-                            return Err(Error::BodyTooLarge);
-                        }
-                        let need = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
-                        (Phase::Body { head_len, need }, n > 0)
-                    }
-                    Body::Chunked => (
-                        Phase::Chunked {
-                            head_len,
-                            dec: Dechunker::new(),
-                        },
-                        true,
-                    ),
-                };
-                self.pending_100_continue =
-                    self.head.expect_100_continue && no_body_buffered_yet && expects_body;
-                self.phase = phase;
-                Ok(true)
-            }
+        if data.is_empty() {
+            return Ok(false);
         }
+        let scan_limit = data.len().min(REQUEST_HEADER_SIZE);
+
+        let head_len = if self.scanned == 0 {
+            match self.head.parse_prefix_status(&data[..scan_limit]) {
+                Ok(Some(len)) => len,
+                Ok(None) => {
+                    if data.len() >= REQUEST_HEADER_SIZE {
+                        return Err(Error::HeaderTooLarge);
+                    }
+                    self.scanned = scan_limit;
+                    return Ok(false);
+                }
+                Err(err) => {
+                    return match find_head_end(&data[..scan_limit], 0) {
+                        Err(()) => Err(Error::Malformed),
+                        Ok(None) => {
+                            if data.len() >= REQUEST_HEADER_SIZE {
+                                Err(Error::HeaderTooLarge)
+                            } else {
+                                self.scanned = scan_limit;
+                                Ok(false)
+                            }
+                        }
+                        Ok(Some(len)) => {
+                            if len > REQUEST_HEADER_SIZE {
+                                Err(Error::HeaderTooLarge)
+                            } else {
+                                Err(err)
+                            }
+                        }
+                    };
+                }
+            }
+        } else {
+            match find_head_end(&data[..scan_limit], self.scanned) {
+                Err(()) => return Err(Error::Malformed),
+                Ok(None) => {
+                    if data.len() >= REQUEST_HEADER_SIZE {
+                        return Err(Error::HeaderTooLarge);
+                    }
+                    self.scanned = scan_limit;
+                    return Ok(false);
+                }
+                Ok(Some(len)) => {
+                    if len > REQUEST_HEADER_SIZE {
+                        return Err(Error::HeaderTooLarge);
+                    }
+                    self.head.parse(&data[..len])?;
+                    len
+                }
+            }
+        };
+
+        let no_body_buffered_yet = head_len == data.len();
+        let (phase, expects_body) = match self.head.body {
+            Body::None => (
+                Phase::Body {
+                    head_len,
+                    need: head_len,
+                },
+                false,
+            ),
+            Body::Length(n) => {
+                // Rejected from the header alone, before any body byte is buffered.
+                if n > MAX_REQUEST_BODY_SIZE {
+                    return Err(Error::BodyTooLarge);
+                }
+                let need = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
+                (Phase::Body { head_len, need }, n > 0)
+            }
+            Body::Chunked => (
+                Phase::Chunked {
+                    head_len,
+                    dec: Dechunker::new(),
+                },
+                true,
+            ),
+        };
+        self.pending_100_continue =
+            self.head.expect_100_continue && no_body_buffered_yet && expects_body;
+        self.phase = phase;
+        Ok(true)
     }
 
     /// Guarantees `buf.len() - pos >= want`, compacting and/or growing in one copy.

@@ -64,6 +64,18 @@ impl Headers {
         self.entries.push((key, value));
     }
 
+    /// Push a header pair directly without duplicate scanning.
+    #[inline]
+    pub(crate) fn push_direct(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
+        self.entries.push((key, value));
+    }
+
+    /// Returns `true` if `name` is treated as a singleton header on insert.
+    #[inline]
+    pub(crate) fn is_single_value(name: &str) -> bool {
+        is_single_value_header(name)
+    }
+
     /// Replace all existing entries for `key` (case-insensitive) with a single `(key, value)` entry
     /// while preserving `key`'s exact casing.
     pub fn set(&mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) {
