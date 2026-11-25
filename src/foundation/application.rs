@@ -9,39 +9,15 @@ use crate::constants::RESPONSE_BUFFER_SIZE;
 use crate::container::Container;
 use crate::database::{DatabaseManager, DatabaseServiceProvider};
 use crate::events::EventServiceProvider;
-use crate::http::parser::{self, h1};
-use crate::http::{Kernel, Request, Response};
+use crate::http::parser::h1;
+use crate::http::{Kernel, Request, Response, Status};
 use crate::routing::{Router, RoutingServiceProvider};
 use crate::support::{LogServiceProvider, ServiceProvider};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const HTTP_400_HEAD: &[u8] =
-    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n";
-const HTTP_413_HEAD: &[u8] =
-    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n";
-const HTTP_417_HEAD: &[u8] =
-    b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n";
-const HTTP_431_HEAD: &[u8] =
-    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n";
-const HTTP_501_HEAD: &[u8] =
-    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n";
-const HTTP_505_HEAD: &[u8] =
-    b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n";
 const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
-
-#[inline]
-fn parser_error_response(err: &parser::Error) -> &'static [u8] {
-    match err.status() {
-        Some(413) => HTTP_413_HEAD,
-        Some(417) => HTTP_417_HEAD,
-        Some(431) => HTTP_431_HEAD,
-        Some(501) => HTTP_501_HEAD,
-        Some(505) => HTTP_505_HEAD,
-        _ => HTTP_400_HEAD,
-    }
-}
 
 async fn flush_response_buffer<S: AsyncWrite + Unpin>(
     socket: &mut S,
@@ -60,22 +36,41 @@ async fn write_error_and_close<S: AsyncWrite + Unpin>(
     socket: &mut S,
     response_buffer: &[u8],
     resp_len: usize,
-    error_head: &[u8],
+    status: Status,
 ) {
     let mut pending = resp_len;
     if !flush_response_buffer(socket, response_buffer, &mut pending).await {
         return;
     }
-    let mut frame = [0u8; 160];
-    let head_len = error_head.len();
-    let date_end = head_len + crate::http::date::DATE_HEADER_LEN;
-    debug_assert!(date_end + 2 <= frame.len());
-    frame[..head_len].copy_from_slice(error_head);
+
+    let code = status.code();
+    let code_bytes = [
+        b'0' + ((code / 100) % 10) as u8,
+        b'0' + ((code / 10) % 10) as u8,
+        b'0' + (code % 10) as u8,
+    ];
+    let reason = status.message().as_bytes();
+
+    let mut frame = [0u8; 192];
+    let mut pos = 0usize;
+    for part in [
+        b"HTTP/1.1 " as &[u8],
+        &code_bytes,
+        b" ",
+        reason,
+        b"\r\nContent-Length: 0\r\nConnection: close\r\n",
+    ] {
+        frame[pos..pos + part.len()].copy_from_slice(part);
+        pos += part.len();
+    }
     crate::http::date::with_current_date_header(|line| {
-        frame[head_len..date_end].copy_from_slice(line);
+        frame[pos..pos + line.len()].copy_from_slice(line);
+        pos += line.len();
     });
-    frame[date_end..date_end + 2].copy_from_slice(b"\r\n");
-    let _ = socket.write_all(&frame[..date_end + 2]).await;
+    frame[pos..pos + 2].copy_from_slice(b"\r\n");
+    pos += 2;
+
+    let _ = socket.write_all(&frame[..pos]).await;
     let _ = socket.shutdown().await;
 }
 
@@ -308,14 +303,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, kern
             let frame = match conn.try_next_request() {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(ref err) => {
-                    write_error_and_close(
-                        &mut socket,
-                        &response_buffer,
-                        resp_len,
-                        parser_error_response(err),
-                    )
-                    .await;
+                Err(status) => {
+                    write_error_and_close(&mut socket, &response_buffer, resp_len, status).await;
                     break 'connection;
                 }
             };
@@ -326,14 +315,9 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, kern
                 let keep_alive = raw.keep_alive();
                 match Request::from_h1(raw) {
                     Ok(req) => (req, is_head, keep_alive),
-                    Err(ref err) => {
-                        write_error_and_close(
-                            &mut socket,
-                            &response_buffer,
-                            resp_len,
-                            parser_error_response(err),
-                        )
-                        .await;
+                    Err(status) => {
+                        write_error_and_close(&mut socket, &response_buffer, resp_len, status)
+                            .await;
                         break 'connection;
                     }
                 }

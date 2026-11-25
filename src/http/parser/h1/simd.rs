@@ -6,9 +6,11 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use crate::http::Status as HttpStatus;
+
 use super::head::{
-    HEADER_VALUE_MAP, HeaderSink, ParseError, ParseStatus, ParsedHead, TOKEN_MAP, URI_MAP,
-    parse_method, parse_version,
+    HEADER_VALUE_MAP, HeaderSink, ParseStatus, ParsedHead, TOKEN_MAP, URI_MAP, parse_method,
+    parse_version,
 };
 
 /// Nibble lookup tables for RFC 9110 `tchar` validation via `vpshufb`.
@@ -78,7 +80,7 @@ const TCHAR_HI_LUT_64: Align64 = const {
 pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<ParsedHead>, ParseError> {
+) -> Result<ParseStatus<ParsedHead>, HttpStatus> {
     use core::arch::x86_64::*;
 
     let base = buf.as_ptr();
@@ -135,12 +137,12 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
                 if unsafe { *ptr } == b' ' {
                     break;
                 }
-                return Err(ParseError::Token);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(64) };
         }
         if ptr == path_start {
-            return Err(ParseError::Token);
+            return Err(HttpStatus::BadRequest);
         }
         path_start_off = unsafe { path_start.offset_from(base) as usize };
         path_end_off = unsafe { ptr.offset_from(base) as usize };
@@ -255,16 +257,16 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
                     ptr = unsafe { ptr.add(2) };
                     break;
                 }
-                return Err(ParseError::NewLine);
+                return Err(HttpStatus::BadRequest);
             }
-            return Err(ParseError::HeaderName);
+            return Err(HttpStatus::BadRequest);
         }
 
         let mut abs_idx = off + idx;
         if abs_idx < win_len {
             ptr = unsafe { win_base.add(abs_idx) };
             if unsafe { *ptr } != b':' {
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
         } else {
             if win_len < 64 {
@@ -279,7 +281,7 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
                     if unsafe { *ptr } == b':' {
                         break;
                     }
-                    return Err(ParseError::HeaderName);
+                    return Err(HttpStatus::BadRequest);
                 }
                 if win_len < 64 {
                     return Ok(ParseStatus::Partial);
@@ -326,13 +328,8 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
             abs_idx = off + v_idx;
             if abs_idx < win_len {
                 ptr = unsafe { win_base.add(abs_idx) };
-                let b = unsafe { *ptr };
-                if b != b'\r' {
-                    return if b == b'\n' {
-                        Err(ParseError::NewLine)
-                    } else {
-                        Err(ParseError::HeaderValue)
-                    };
+                if unsafe { *ptr } != b'\r' {
+                    return Err(HttpStatus::BadRequest);
                 }
             } else {
                 if win_len < 64 {
@@ -344,15 +341,10 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
                     let v_idx2 = stop_val.trailing_zeros() as usize;
                     if v_idx2 < win_len {
                         ptr = unsafe { win_base.add(v_idx2) };
-                        let b = unsafe { *ptr };
-                        if b == b'\r' {
+                        if unsafe { *ptr } == b'\r' {
                             break;
                         }
-                        return if b == b'\n' {
-                            Err(ParseError::NewLine)
-                        } else {
-                            Err(ParseError::HeaderValue)
-                        };
+                        return Err(HttpStatus::BadRequest);
                     }
                     if win_len < 64 {
                         return Ok(ParseStatus::Partial);
@@ -366,15 +358,10 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
                 let v_idx2 = stop_val.trailing_zeros() as usize;
                 if v_idx2 < win_len {
                     ptr = unsafe { win_base.add(v_idx2) };
-                    let b = unsafe { *ptr };
-                    if b == b'\r' {
+                    if unsafe { *ptr } == b'\r' {
                         break;
                     }
-                    return if b == b'\n' {
-                        Err(ParseError::NewLine)
-                    } else {
-                        Err(ParseError::HeaderValue)
-                    };
+                    return Err(HttpStatus::BadRequest);
                 }
                 if win_len < 64 {
                     return Ok(ParseStatus::Partial);
@@ -408,13 +395,13 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
             if unsafe { ptr.add(1) } >= end {
                 return Ok(ParseStatus::Partial);
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         } else {
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         if count >= cap {
-            return Err(ParseError::TooManyHeaders);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         unsafe { sink.write_header(count, base, name_start, name_end, val_start, val_end) };
         count += 1;
@@ -437,7 +424,7 @@ pub(crate) unsafe fn parse_request_avx512<'buf, S: HeaderSink<'buf>>(
 pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<ParsedHead>, ParseError> {
+) -> Result<ParseStatus<ParsedHead>, HttpStatus> {
     use core::arch::x86_64::*;
 
     let base = buf.as_ptr();
@@ -484,7 +471,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                 if unsafe { *ptr } == b' ' {
                     break;
                 }
-                return Err(ParseError::Token);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(32) };
         }
@@ -495,7 +482,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                     if b == b' ' {
                         break;
                     }
-                    return Err(ParseError::Token);
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { ptr.add(1) };
             }
@@ -504,7 +491,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
             return Ok(ParseStatus::Partial);
         }
         if ptr == path_start {
-            return Err(ParseError::Token);
+            return Err(HttpStatus::BadRequest);
         }
         path_start_off = unsafe { path_start.offset_from(base) as usize };
         path_end_off = unsafe { ptr.offset_from(base) as usize };
@@ -624,16 +611,16 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                         ptr = unsafe { ptr.add(2) };
                         break;
                     }
-                    return Err(ParseError::NewLine);
+                    return Err(HttpStatus::BadRequest);
                 }
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
 
             let abs_idx = off + idx;
             if abs_idx < win_len {
                 ptr = unsafe { win_base.add(abs_idx) };
                 if unsafe { *ptr } != b':' {
-                    return Err(ParseError::HeaderName);
+                    return Err(HttpStatus::BadRequest);
                 }
             } else {
                 ptr = unsafe { win_base.add(32) };
@@ -645,7 +632,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                                 if b == b':' {
                                     break;
                                 }
-                                return Err(ParseError::HeaderName);
+                                return Err(HttpStatus::BadRequest);
                             }
                             ptr = unsafe { ptr.add(1) };
                         }
@@ -660,7 +647,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                         if unsafe { *ptr } == b':' {
                             break;
                         }
-                        return Err(ParseError::HeaderName);
+                        return Err(HttpStatus::BadRequest);
                     }
                     ptr = unsafe { win_base.add(32) };
                 }
@@ -676,7 +663,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                     ptr = unsafe { ptr.add(2) };
                     break;
                 }
-                return Err(ParseError::NewLine);
+                return Err(HttpStatus::BadRequest);
             }
             while ptr < end {
                 let b = unsafe { *ptr };
@@ -684,7 +671,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                     if b == b':' {
                         break;
                     }
-                    return Err(ParseError::HeaderName);
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { ptr.add(1) };
             }
@@ -692,7 +679,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                 return Ok(ParseStatus::Partial);
             }
             if ptr == name_start {
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
         }
         let name_end = ptr;
@@ -734,13 +721,8 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
             let abs_idx = off + v_idx;
             if abs_idx < win_len {
                 ptr = unsafe { win_base.add(abs_idx) };
-                let b = unsafe { *ptr };
-                if b != b'\r' {
-                    return if b == b'\n' {
-                        Err(ParseError::NewLine)
-                    } else {
-                        Err(ParseError::HeaderValue)
-                    };
+                if unsafe { *ptr } != b'\r' {
+                    return Err(HttpStatus::BadRequest);
                 }
             } else {
                 ptr = unsafe { win_base.add(32) };
@@ -752,10 +734,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                                 if b == b'\r' {
                                     break;
                                 }
-                                if b == b'\n' {
-                                    return Err(ParseError::NewLine);
-                                }
-                                return Err(ParseError::HeaderValue);
+                                return Err(HttpStatus::BadRequest);
                             }
                             ptr = unsafe { ptr.add(1) };
                         }
@@ -767,15 +746,10 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                     let v_idx2 = stop_val.trailing_zeros() as usize;
                     if v_idx2 < 32 {
                         ptr = unsafe { win_base.add(v_idx2) };
-                        let b = unsafe { *ptr };
-                        if b == b'\r' {
+                        if unsafe { *ptr } == b'\r' {
                             break;
                         }
-                        return if b == b'\n' {
-                            Err(ParseError::NewLine)
-                        } else {
-                            Err(ParseError::HeaderValue)
-                        };
+                        return Err(HttpStatus::BadRequest);
                     }
                     ptr = unsafe { win_base.add(32) };
                 }
@@ -789,10 +763,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                             if b == b'\r' {
                                 break;
                             }
-                            if b == b'\n' {
-                                return Err(ParseError::NewLine);
-                            }
-                            return Err(ParseError::HeaderValue);
+                            return Err(HttpStatus::BadRequest);
                         }
                         ptr = unsafe { ptr.add(1) };
                     }
@@ -804,15 +775,10 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
                 let v_idx2 = stop_val.trailing_zeros() as usize;
                 if v_idx2 < 32 {
                     ptr = unsafe { win_base.add(v_idx2) };
-                    let b = unsafe { *ptr };
-                    if b == b'\r' {
+                    if unsafe { *ptr } == b'\r' {
                         break;
                     }
-                    return if b == b'\n' {
-                        Err(ParseError::NewLine)
-                    } else {
-                        Err(ParseError::HeaderValue)
-                    };
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { win_base.add(32) };
             }
@@ -843,13 +809,13 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
             if unsafe { ptr.add(1) } >= end {
                 return Ok(ParseStatus::Partial);
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         } else {
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         if count >= cap {
-            return Err(ParseError::TooManyHeaders);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         unsafe { sink.write_header(count, base, name_start, name_end, val_start, val_end) };
         count += 1;
@@ -871,7 +837,7 @@ pub(crate) unsafe fn parse_request_avx2<'buf, S: HeaderSink<'buf>>(
 pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<ParsedHead>, ParseError> {
+) -> Result<ParseStatus<ParsedHead>, HttpStatus> {
     use core::arch::x86_64::*;
 
     let base = buf.as_ptr();
@@ -910,7 +876,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
                 if unsafe { *ptr } == b' ' {
                     break;
                 }
-                return Err(ParseError::Token);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(16) };
         }
@@ -921,7 +887,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
                     if b == b' ' {
                         break;
                     }
-                    return Err(ParseError::Token);
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { ptr.add(1) };
             }
@@ -930,7 +896,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
             return Ok(ParseStatus::Partial);
         }
         if ptr == path_start {
-            return Err(ParseError::Token);
+            return Err(HttpStatus::BadRequest);
         }
         path_start_off = unsafe { path_start.offset_from(base) as usize };
         path_end_off = unsafe { ptr.offset_from(base) as usize };
@@ -962,7 +928,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
                 ptr = unsafe { ptr.add(2) };
                 break;
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         let name_start = ptr;
@@ -972,7 +938,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
                 if b == b':' {
                     break;
                 }
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(1) };
         }
@@ -980,7 +946,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
             return Ok(ParseStatus::Partial);
         }
         if ptr == name_start {
-            return Err(ParseError::HeaderName);
+            return Err(HttpStatus::BadRequest);
         }
         let name_end = ptr;
 
@@ -1019,16 +985,11 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
             let stop_mask = (!(_mm_movemask_epi8(valid) as u32)) & 0xFFFF;
             if stop_mask != 0 {
                 ptr = unsafe { ptr.add(stop_mask.trailing_zeros() as usize) };
-                let b = unsafe { *ptr };
-                if b == b'\r' {
+                if unsafe { *ptr } == b'\r' {
                     found_cr = true;
                     break;
                 }
-                return if b == b'\n' {
-                    Err(ParseError::NewLine)
-                } else {
-                    Err(ParseError::HeaderValue)
-                };
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(16) };
         }
@@ -1039,10 +1000,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
                     if b == b'\r' {
                         break;
                     }
-                    if b == b'\n' {
-                        return Err(ParseError::NewLine);
-                    }
-                    return Err(ParseError::HeaderValue);
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { ptr.add(1) };
             }
@@ -1069,13 +1027,13 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
             if unsafe { ptr.add(1) } >= end {
                 return Ok(ParseStatus::Partial);
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         } else {
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         if count >= cap {
-            return Err(ParseError::TooManyHeaders);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         unsafe { sink.write_header(count, base, name_start, name_end, val_start, val_end) };
         count += 1;
@@ -1097,7 +1055,7 @@ pub(crate) unsafe fn parse_request_sse2<'buf, S: HeaderSink<'buf>>(
 pub(crate) unsafe fn parse_headers_avx512<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<(usize, usize)>, ParseError> {
+) -> Result<ParseStatus<(usize, usize)>, HttpStatus> {
     use core::arch::x86_64::*;
 
     let base = buf.as_ptr();
@@ -1165,15 +1123,15 @@ pub(crate) unsafe fn parse_headers_avx512<'buf, S: HeaderSink<'buf>>(
                     ptr = unsafe { ptr.add(2) };
                     break;
                 }
-                return Err(ParseError::NewLine);
+                return Err(HttpStatus::BadRequest);
             }
-            return Err(ParseError::HeaderName);
+            return Err(HttpStatus::BadRequest);
         }
         let mut abs_idx = off + idx;
         if abs_idx < win_len {
             ptr = unsafe { win_base.add(abs_idx) };
             if unsafe { *ptr } != b':' {
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
         } else {
             if win_len < 64 {
@@ -1188,7 +1146,7 @@ pub(crate) unsafe fn parse_headers_avx512<'buf, S: HeaderSink<'buf>>(
                     if unsafe { *ptr } == b':' {
                         break;
                     }
-                    return Err(ParseError::HeaderName);
+                    return Err(HttpStatus::BadRequest);
                 }
                 if win_len < 64 {
                     return Ok(ParseStatus::Partial);
@@ -1231,15 +1189,10 @@ pub(crate) unsafe fn parse_headers_avx512<'buf, S: HeaderSink<'buf>>(
             abs_idx = off + v_idx;
             if abs_idx < win_len {
                 ptr = unsafe { win_base.add(abs_idx) };
-                let b = unsafe { *ptr };
-                if b == b'\r' {
+                if unsafe { *ptr } == b'\r' {
                     break;
                 }
-                return if b == b'\n' {
-                    Err(ParseError::NewLine)
-                } else {
-                    Err(ParseError::HeaderValue)
-                };
+                return Err(HttpStatus::BadRequest);
             }
             if win_len < 64 {
                 return Ok(ParseStatus::Partial);
@@ -1264,13 +1217,13 @@ pub(crate) unsafe fn parse_headers_avx512<'buf, S: HeaderSink<'buf>>(
             if unsafe { ptr.add(1) } >= end {
                 return Ok(ParseStatus::Partial);
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         } else {
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         if count >= cap {
-            return Err(ParseError::TooManyHeaders);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         unsafe { sink.write_header(count, base, name_start, name_end, val_start, val_end) };
         count += 1;

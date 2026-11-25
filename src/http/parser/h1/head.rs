@@ -8,7 +8,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::constants::MAX_REQUEST_HEADERS;
-use crate::http::parser::{Error, semantics};
+use crate::http::Status as HttpStatus;
+use crate::http::parser::semantics;
 
 pub use crate::http::Method;
 
@@ -114,33 +115,6 @@ pub enum Body {
 pub(crate) enum ParseStatus<T> {
     Complete(T),
     Partial,
-}
-
-/// Low-level syntax errors emitted by the SIMD/scalar scanners.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParseError {
-    HeaderName,
-    HeaderValue,
-    NewLine,
-    Token,
-    TooManyHeaders,
-    Version,
-    VersionNotSupported,
-}
-
-impl ParseError {
-    #[inline]
-    const fn into_parser_error(self) -> Error {
-        match self {
-            ParseError::TooManyHeaders => Error::HeaderTooLarge,
-            ParseError::VersionNotSupported => Error::VersionNotSupported,
-            ParseError::HeaderName
-            | ParseError::HeaderValue
-            | ParseError::NewLine
-            | ParseError::Token
-            | ParseError::Version => Error::Malformed,
-        }
-    }
 }
 
 /// Monomorphized header sink writing 16-byte `(Span, Span)` offsets into caller storage.
@@ -270,7 +244,7 @@ const ORIGIN_CLASS: [u8; 256] = const {
 pub(crate) unsafe fn parse_method(
     mut ptr: *const u8,
     end: *const u8,
-) -> Result<Option<(Method, *const u8)>, ParseError> {
+) -> Result<Option<(Method, *const u8)>, HttpStatus> {
     #[cfg(target_endian = "little")]
     {
         let rem = unsafe { end.offset_from(ptr) as usize };
@@ -320,15 +294,15 @@ pub(crate) unsafe fn parse_method(
         let b = unsafe { *ptr };
         if b == b' ' {
             if ptr == start {
-                return Err(ParseError::Token);
+                return Err(HttpStatus::BadRequest);
             }
             let slice =
                 unsafe { core::slice::from_raw_parts(start, ptr.offset_from(start) as usize) };
-            let method = Method::from_bytes(slice).ok_or(ParseError::Token)?;
+            let method = Method::from_bytes(slice).ok_or(HttpStatus::NotImplemented)?;
             return Ok(Some((method, unsafe { ptr.add(1) })));
         }
         if TOKEN_MAP[b as usize] == 0 {
-            return Err(ParseError::Token);
+            return Err(HttpStatus::BadRequest);
         }
         ptr = unsafe { ptr.add(1) };
     }
@@ -376,7 +350,7 @@ fn is_valid_version_prefix(s: &[u8]) -> bool {
 pub(crate) unsafe fn parse_version(
     ptr: *const u8,
     end: *const u8,
-) -> Result<Option<(u8, *const u8)>, ParseError> {
+) -> Result<Option<(u8, *const u8)>, HttpStatus> {
     const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
     let rem = unsafe { end.offset_from(ptr) as usize };
     if rem >= 10 {
@@ -399,7 +373,7 @@ pub(crate) unsafe fn parse_version(
 unsafe fn parse_version_cold(
     ptr: *const u8,
     rem: usize,
-) -> Result<Option<(u8, *const u8)>, ParseError> {
+) -> Result<Option<(u8, *const u8)>, HttpStatus> {
     let s = unsafe { core::slice::from_raw_parts(ptr, rem) };
 
     if matches!(
@@ -418,21 +392,21 @@ unsafe fn parse_version_cold(
         ])
     ) || matches!(s.get(..8), Some(b"HTTP/2\r\n" | b"HTTP/3\r\n"))
     {
-        return Err(ParseError::VersionNotSupported);
+        return Err(HttpStatus::HttpVersionNotSupported);
     }
 
     if matches!(s.get(..8), Some(b"HTTP/1.1" | b"HTTP/1.0")) && rem >= 9 && s[8] != b'\r' {
-        return Err(ParseError::NewLine);
+        return Err(HttpStatus::BadRequest);
     }
     if matches!(s.get(..9), Some(b"HTTP/1.1\r" | b"HTTP/1.0\r")) && rem >= 10 && s[9] != b'\n' {
-        return Err(ParseError::NewLine);
+        return Err(HttpStatus::BadRequest);
     }
 
     if rem < 10 && is_valid_version_prefix(s) {
         return Ok(None);
     }
 
-    Err(ParseError::Version)
+    Err(HttpStatus::BadRequest)
 }
 
 /// Parses standalone HTTP headers (chunked trailers) into 16-byte `(Span, Span)` offsets
@@ -441,7 +415,7 @@ unsafe fn parse_version_cold(
 pub(crate) unsafe fn parse_headers_only(
     buf: &[u8],
     headers: &mut [MaybeUninit<(Span, Span)>],
-) -> Result<ParseStatus<(usize, usize)>, ParseError> {
+) -> Result<ParseStatus<(usize, usize)>, HttpStatus> {
     let mut sink = SpanHeaderSink {
         ptr: headers.as_mut_ptr(),
         cap: headers.len(),
@@ -468,7 +442,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
     mut ptr: *const u8,
     end: *const u8,
     sink: &mut S,
-) -> Result<ParseStatus<(usize, *const u8)>, ParseError> {
+) -> Result<ParseStatus<(usize, *const u8)>, HttpStatus> {
     const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
     let cap = sink.capacity();
     let mut count = 0usize;
@@ -486,7 +460,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
                 ptr = unsafe { ptr.add(2) };
                 break;
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         let name_start = ptr;
@@ -496,7 +470,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
                 if b == b':' {
                     break;
                 }
-                return Err(ParseError::HeaderName);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(1) };
         }
@@ -504,7 +478,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
             return Ok(ParseStatus::Partial);
         }
         if ptr == name_start {
-            return Err(ParseError::HeaderName);
+            return Err(HttpStatus::BadRequest);
         }
         let name_end = ptr;
         ptr = unsafe { ptr.add(1) }; // skip ':'
@@ -525,10 +499,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
                 if b == b'\r' {
                     break;
                 }
-                if b == b'\n' {
-                    return Err(ParseError::NewLine);
-                }
-                return Err(ParseError::HeaderValue);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(1) };
         }
@@ -554,13 +525,13 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
             if unsafe { ptr.add(1) } >= end {
                 return Ok(ParseStatus::Partial);
             }
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         } else {
-            return Err(ParseError::NewLine);
+            return Err(HttpStatus::BadRequest);
         }
 
         if count >= cap {
-            return Err(ParseError::TooManyHeaders);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         unsafe { sink.write_header(count, base, name_start, name_end, val_start, val_end) };
         count += 1;
@@ -574,7 +545,7 @@ unsafe fn parse_headers_scalar<'buf, S: HeaderSink<'buf>>(
 unsafe fn parse_request_scalar<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<ParsedHead>, ParseError> {
+) -> Result<ParseStatus<ParsedHead>, HttpStatus> {
     const SLASH_SPACE: u16 = u16::from_ne_bytes(*b"/ ");
     let base = buf.as_ptr();
     let end = unsafe { base.add(buf.len()) };
@@ -600,7 +571,7 @@ unsafe fn parse_request_scalar<'buf, S: HeaderSink<'buf>>(
                 if b == b' ' {
                     break;
                 }
-                return Err(ParseError::Token);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(1) };
         }
@@ -608,7 +579,7 @@ unsafe fn parse_request_scalar<'buf, S: HeaderSink<'buf>>(
             return Ok(ParseStatus::Partial);
         }
         if ptr == path_start {
-            return Err(ParseError::Token);
+            return Err(HttpStatus::BadRequest);
         }
         path_start_off = unsafe { path_start.offset_from(base) as usize };
         path_end_off = unsafe { ptr.offset_from(base) as usize };
@@ -640,7 +611,7 @@ unsafe fn parse_request_scalar<'buf, S: HeaderSink<'buf>>(
 unsafe fn dispatch_parse<'buf, S: HeaderSink<'buf>>(
     buf: &'buf [u8],
     sink: &mut S,
-) -> Result<ParseStatus<ParsedHead>, ParseError> {
+) -> Result<ParseStatus<ParsedHead>, HttpStatus> {
     #[cfg(target_arch = "x86_64")]
     {
         if buf.len() >= 32 {
@@ -757,10 +728,10 @@ impl Head {
     ///
     /// `b` must be exactly the head, including the final `\r\n\r\n`.
     #[inline]
-    pub fn parse(&mut self, b: &[u8]) -> Result<(), Error> {
+    pub fn parse(&mut self, b: &[u8]) -> Result<(), HttpStatus> {
         match self.parse_inner::<true>(b)? {
             Some(_) => Ok(()),
-            None => Err(Error::Malformed),
+            None => Err(HttpStatus::BadRequest),
         }
     }
 
@@ -769,34 +740,33 @@ impl Head {
     /// Stops at the terminating `\r\n\r\n` and returns the head length in bytes,
     /// leaving any trailing body or pipelined bytes untouched.
     #[inline]
-    pub fn parse_prefix(&mut self, b: &[u8]) -> Result<usize, Error> {
+    pub fn parse_prefix(&mut self, b: &[u8]) -> Result<usize, HttpStatus> {
         match self.parse_inner::<false>(b)? {
             Some(len) => Ok(len),
-            None => Err(Error::Malformed),
+            None => Err(HttpStatus::BadRequest),
         }
     }
 
     /// Parse a request head from the leading prefix of `b`, returning `Ok(None)` when
-    /// `b` is a valid incomplete prefix, `Ok(Some(consumed))` on completion, or `Err(Error)`
+    /// `b` is a valid incomplete prefix, `Ok(Some(consumed))` on completion, or `Err(HttpStatus)`
     /// on syntax/limit violations.
     #[inline]
-    pub(crate) fn parse_prefix_status(&mut self, b: &[u8]) -> Result<Option<usize>, Error> {
+    pub(crate) fn parse_prefix_status(&mut self, b: &[u8]) -> Result<Option<usize>, HttpStatus> {
         self.parse_inner::<false>(b)
     }
 
     #[inline]
-    fn parse_inner<const EXACT: bool>(&mut self, b: &[u8]) -> Result<Option<usize>, Error> {
+    fn parse_inner<const EXACT: bool>(&mut self, b: &[u8]) -> Result<Option<usize>, HttpStatus> {
         if b.len() > u32::MAX as usize {
-            return Err(Error::HeaderTooLarge);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         let mut sink = SpanHeaderSink {
             ptr: self.hdrs.as_mut_ptr(),
             cap: MAX_REQUEST_HEADERS,
         };
-        let parsed = match unsafe { dispatch_parse(b, &mut sink) } {
-            Ok(ParseStatus::Complete(p)) => p,
-            Ok(ParseStatus::Partial) => return Ok(None),
-            Err(e) => return Err(e.into_parser_error()),
+        let parsed = match unsafe { dispatch_parse(b, &mut sink)? } {
+            ParseStatus::Complete(p) => p,
+            ParseStatus::Partial => return Ok(None),
         };
         self.finalize_parsed::<EXACT>(b, parsed).map(Some)
     }
@@ -806,9 +776,9 @@ impl Head {
         &mut self,
         b: &[u8],
         parsed: ParsedHead,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, HttpStatus> {
         if EXACT && parsed.consumed != b.len() {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         // SAFETY: `dispatch_parse` guarantees `parsed.headers_len <= MAX_REQUEST_HEADERS` and
@@ -846,7 +816,7 @@ impl Head {
                 4 if unsafe { n_span.of_unchecked(b) }.eq_ignore_ascii_case(b"host") => {
                     let val = unsafe { v_span.of_unchecked(b) };
                     if host.is_some() || !semantics::is_valid_host_bytes(val) {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                     host = Some(v_span);
                 }
@@ -866,9 +836,9 @@ impl Head {
                 }
                 14 if unsafe { n_span.of_unchecked(b) }.eq_ignore_ascii_case(b"content-length") => {
                     let val = unsafe { v_span.of_unchecked(b) };
-                    let n = parse_decimal(val).ok_or(Error::Malformed)?;
+                    let n = parse_decimal(val).ok_or(HttpStatus::BadRequest)?;
                     if content_length.is_some_and(|prev| prev != n) {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                     content_length = Some(n);
                 }
@@ -889,10 +859,10 @@ impl Head {
 
         // ── request-smuggling guards and framing ──
         if saw_te && (content_length.is_some() || minor == 0) {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         if minor == 1 && host.is_none() {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         self.host = host;
         self.expect_100_continue = expect_100_continue;
@@ -913,9 +883,9 @@ impl Head {
         &mut self,
         b: &[u8],
         backend: TestBackend,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<usize>, HttpStatus> {
         if b.len() > u32::MAX as usize {
-            return Err(Error::HeaderTooLarge);
+            return Err(HttpStatus::RequestHeaderFieldsTooLarge);
         }
         let mut sink = SpanHeaderSink {
             ptr: self.hdrs.as_mut_ptr(),
@@ -930,10 +900,9 @@ impl Head {
             #[cfg(target_arch = "x86_64")]
             TestBackend::Avx512 => unsafe { super::simd::parse_request_avx512(b, &mut sink) },
         };
-        let parsed = match res {
-            Ok(ParseStatus::Complete(p)) => p,
-            Ok(ParseStatus::Partial) => return Ok(None),
-            Err(e) => return Err(e.into_parser_error()),
+        let parsed = match res? {
+            ParseStatus::Complete(p) => p,
+            ParseStatus::Partial => return Ok(None),
         };
         self.finalize_parsed::<false>(b, parsed).map(Some)
     }
@@ -952,7 +921,7 @@ pub(crate) enum TestBackend {
 }
 
 #[inline]
-fn validate_origin_target(b: &[u8], t0: usize, t1: usize) -> Result<(Span, Span), Error> {
+fn validate_origin_target(b: &[u8], t0: usize, t1: usize) -> Result<(Span, Span), HttpStatus> {
     debug_assert!(t0 < t1 && t1 <= b.len() && b[t0] == b'/');
     if t1 - t0 == 1 {
         return Ok((span(t0, t1), Span::default()));
@@ -975,11 +944,11 @@ fn validate_origin_target(b: &[u8], t0: usize, t1: usize) -> Result<(Span, Span)
                     || !target[i + 1].is_ascii_hexdigit()
                     || !target[i + 2].is_ascii_hexdigit()
                 {
-                    return Err(Error::Malformed);
+                    return Err(HttpStatus::BadRequest);
                 }
                 i += 3;
             }
-            _ => return Err(Error::Malformed),
+            _ => return Err(HttpStatus::BadRequest),
         }
     }
     Ok(match question_pos {
@@ -997,14 +966,14 @@ fn validate_non_origin_target(
     t0: usize,
     t1: usize,
     method: Method,
-) -> Result<(Span, Span), Error> {
+) -> Result<(Span, Span), HttpStatus> {
     let target = &b[t0..t1];
 
     if target == b"*" {
         return if method == Method::Options {
             Ok((span(t0, t1), Span::default()))
         } else {
-            Err(Error::Malformed)
+            Err(HttpStatus::BadRequest)
         };
     }
 
@@ -1015,14 +984,14 @@ fn validate_non_origin_target(
     while i < target.len() {
         let c = target[i];
         if !semantics::is_valid_uri_byte(c) {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         if c == b'%' {
             if i + 2 >= target.len()
                 || !target[i + 1].is_ascii_hexdigit()
                 || !target[i + 2].is_ascii_hexdigit()
             {
-                return Err(Error::Malformed);
+                return Err(HttpStatus::BadRequest);
             }
             i += 3;
             continue;
@@ -1048,19 +1017,19 @@ fn validate_non_origin_target(
         {
             Ok((span(t0, t1), Span::default()))
         } else {
-            Err(Error::Malformed)
+            Err(HttpStatus::BadRequest)
         };
     }
 
     if let Some(colon) = scheme_sep {
         if !semantics::is_valid_scheme(&target[..colon]) {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         let after_scheme_start = colon + 3;
         let query_end = question_pos.unwrap_or(target.len());
         if after_scheme_start >= query_end {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         let after_scheme = &target[after_scheme_start..query_end];
@@ -1077,7 +1046,7 @@ fn validate_non_origin_target(
         };
 
         if !semantics::is_valid_host_bytes(authority) {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         let query_span = match question_pos {
@@ -1087,19 +1056,19 @@ fn validate_non_origin_target(
         return Ok((path_span, query_span));
     }
 
-    Err(Error::Malformed)
+    Err(HttpStatus::BadRequest)
 }
 
 #[cold]
 #[inline(never)]
-fn parse_expect(minor: u8, val: &[u8], expect_100_continue: &mut bool) -> Result<(), Error> {
+fn parse_expect(minor: u8, val: &[u8], expect_100_continue: &mut bool) -> Result<(), HttpStatus> {
     if val.eq_ignore_ascii_case(b"100-continue") {
         if minor == 1 {
             *expect_100_continue = true;
         }
         Ok(())
     } else {
-        Err(Error::ExpectationFailed)
+        Err(HttpStatus::ExpectationFailed)
     }
 }
 
@@ -1123,22 +1092,22 @@ fn parse_transfer_encoding_slow(
     val: &[u8],
     saw_te: &mut bool,
     chunked: &mut bool,
-) -> Result<(), Error> {
+) -> Result<(), HttpStatus> {
     if minor == 0 || val.is_empty() {
-        return Err(Error::Malformed);
+        return Err(HttpStatus::BadRequest);
     }
     for part in val.split(|&c| c == b',') {
         let coding = trim_ows(part);
         if coding.is_empty() || !coding.iter().all(|&c| TOKEN_MAP[c as usize] != 0) {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         if *chunked {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         if coding.eq_ignore_ascii_case(b"chunked") {
             *chunked = true;
         } else if !coding.eq_ignore_ascii_case(b"identity") {
-            return Err(Error::UnsupportedEncoding);
+            return Err(HttpStatus::NotImplemented);
         }
     }
     *saw_te = true;

@@ -6,9 +6,10 @@ use core::hint::assert_unchecked;
 use core::mem::MaybeUninit;
 
 use crate::constants::MAX_REQUEST_BODY_SIZE;
-use crate::http::parser::{Error, semantics};
+use crate::http::Status as HttpStatus;
+use crate::http::parser::semantics;
 
-use super::head::{ParseError, ParseStatus, Span, TOKEN_MAP, parse_headers_only};
+use super::head::{ParseStatus, Span, TOKEN_MAP, parse_headers_only};
 
 pub(crate) const MAX_CHUNK_LINE: usize = 1024;
 pub(crate) const MAX_CHUNK_EXT_BYTES: usize = 1024;
@@ -70,7 +71,7 @@ impl Dechunker {
     /// decoded payload; `data[self.w..]` is unconsumed wire data).
     /// Returns `(done, new_data_len)`.
     #[inline]
-    pub(crate) fn advance(&mut self, data: &mut [u8]) -> Result<(bool, usize), Error> {
+    pub(crate) fn advance(&mut self, data: &mut [u8]) -> Result<(bool, usize), HttpStatus> {
         const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
         let total = data.len();
         let mut w = self.w;
@@ -94,7 +95,7 @@ impl Dechunker {
                     }
                     ParseStatus::Complete((consumed, chunk_len)) => {
                         if chunk_len > self.remaining_body_budget {
-                            return Err(Error::BodyTooLarge);
+                            return Err(HttpStatus::PayloadTooLarge);
                         }
                         self.remaining_body_budget -= chunk_len;
                         r += consumed;
@@ -114,7 +115,7 @@ impl Dechunker {
                                 r = data_end + 2;
                                 continue;
                             }
-                            return Err(Error::Malformed);
+                            return Err(HttpStatus::BadRequest);
                         }
                         self.st = CState::Data(chunk_len as usize);
                     }
@@ -139,7 +140,7 @@ impl Dechunker {
                                 r += 2;
                                 self.st = CState::Size;
                             } else {
-                                return Err(Error::Malformed);
+                                return Err(HttpStatus::BadRequest);
                             }
                         } else {
                             self.st = CState::DataCr;
@@ -154,7 +155,7 @@ impl Dechunker {
                         break false;
                     }
                     if data[r] != b'\r' {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                     r += 1;
                     self.st = CState::DataLf;
@@ -164,7 +165,7 @@ impl Dechunker {
                         break false;
                     }
                     if data[r] != b'\n' {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                     r += 1;
                     self.st = CState::Size;
@@ -179,7 +180,7 @@ impl Dechunker {
                             break false;
                         }
                         if data[r + 1] != b'\n' {
-                            return Err(Error::Malformed);
+                            return Err(HttpStatus::BadRequest);
                         }
                         r += 2;
                         self.st = CState::Done;
@@ -189,21 +190,19 @@ impl Dechunker {
                     let cap_slice = &trailer_slice[..trailer_slice.len().min(MAX_TRAILER)];
                     let mut trailers =
                         [const { MaybeUninit::<(Span, Span)>::uninit() }; MAX_TRAILER_HEADERS];
-                    match unsafe { parse_headers_only(cap_slice, &mut trailers) } {
-                        Ok(ParseStatus::Complete((trailers_count, consumed))) => {
+                    match unsafe { parse_headers_only(cap_slice, &mut trailers)? } {
+                        ParseStatus::Complete((trailers_count, consumed)) => {
                             validate_trailers(cap_slice, &trailers[..trailers_count])?;
                             r += consumed;
                             self.st = CState::Done;
                             break true;
                         }
-                        Ok(ParseStatus::Partial) => {
+                        ParseStatus::Partial => {
                             if trailer_slice.len() >= MAX_TRAILER {
-                                return Err(Error::HeaderTooLarge);
+                                return Err(HttpStatus::RequestHeaderFieldsTooLarge);
                             }
                             break false;
                         }
-                        Err(ParseError::TooManyHeaders) => return Err(Error::HeaderTooLarge),
-                        Err(_) => return Err(Error::Malformed),
                     }
                 }
                 CState::Done => break true,
@@ -224,7 +223,7 @@ impl Dechunker {
 /// Returns `Ok(Some((decoded_body, wire_bytes_consumed)))` when complete.
 #[cold]
 #[inline(never)]
-pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, Error> {
+pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, HttpStatus> {
     const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
 
     let mut pos = 0usize;
@@ -255,29 +254,27 @@ pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)
                 if trailer_slice.len() < 2 {
                     return Ok(None);
                 }
-                return Err(Error::Malformed);
+                return Err(HttpStatus::BadRequest);
             }
             let cap_slice = &trailer_slice[..trailer_slice.len().min(MAX_TRAILER)];
             let mut trailers =
                 [const { MaybeUninit::<(Span, Span)>::uninit() }; MAX_TRAILER_HEADERS];
-            match unsafe { parse_headers_only(cap_slice, &mut trailers) } {
-                Ok(ParseStatus::Complete((trailers_count, consumed))) => {
+            match unsafe { parse_headers_only(cap_slice, &mut trailers)? } {
+                ParseStatus::Complete((trailers_count, consumed)) => {
                     validate_trailers(cap_slice, &trailers[..trailers_count])?;
                     break data_start + consumed;
                 }
-                Ok(ParseStatus::Partial) => {
+                ParseStatus::Partial => {
                     if trailer_slice.len() >= MAX_TRAILER {
-                        return Err(Error::HeaderTooLarge);
+                        return Err(HttpStatus::RequestHeaderFieldsTooLarge);
                     }
                     return Ok(None);
                 }
-                Err(ParseError::TooManyHeaders) => return Err(Error::HeaderTooLarge),
-                Err(_) => return Err(Error::Malformed),
             }
         }
 
         if chunk_len > remaining_budget {
-            return Err(Error::BodyTooLarge);
+            return Err(HttpStatus::PayloadTooLarge);
         }
         remaining_budget -= chunk_len;
 
@@ -286,13 +283,13 @@ pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)
         if avail < 2 || avail - 2 < clen {
             // Reject missing/corrupt `\r` early if payload already ended before `\r\n`
             if avail > clen && src[data_start + clen] != b'\r' {
-                return Err(Error::Malformed);
+                return Err(HttpStatus::BadRequest);
             }
             return Ok(None);
         }
         let data_end = data_start + clen;
         if unsafe { (src.as_ptr().add(data_end) as *const u16).read_unaligned() } != CRLF {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         if chunk_count < INLINE_CHUNK_SPANS {
@@ -331,13 +328,13 @@ pub(crate) fn decode_chunked_slice(src: &[u8]) -> Result<Option<(Vec<u8>, usize)
 }
 
 #[inline]
-fn validate_trailers(buf: &[u8], trailers: &[MaybeUninit<(Span, Span)>]) -> Result<(), Error> {
+fn validate_trailers(buf: &[u8], trailers: &[MaybeUninit<(Span, Span)>]) -> Result<(), HttpStatus> {
     for slot in trailers {
         let (n_span, v_span) = unsafe { slot.assume_init() };
         if semantics::is_forbidden_trailer(n_span.of(buf))
             || std::str::from_utf8(v_span.of(buf)).is_err()
         {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
     }
     Ok(())
@@ -346,7 +343,7 @@ fn validate_trailers(buf: &[u8], trailers: &[MaybeUninit<(Span, Span)>]) -> Resu
 /// Parses one `<1*HEXDIG> [ chunk-ext ] \r\n` chunk-size line using `HEX_LUT` and a 16-digit
 /// bound, delegating BWS / extensions / incomplete checks to [`finish_chunk_size_line`].
 #[inline]
-fn parse_chunk_size(buf: &[u8]) -> Result<ParseStatus<(usize, u64)>, Error> {
+fn parse_chunk_size(buf: &[u8]) -> Result<ParseStatus<(usize, u64)>, HttpStatus> {
     let len = buf.len();
     if len == 0 {
         return Ok(ParseStatus::Partial);
@@ -358,7 +355,7 @@ fn parse_chunk_size(buf: &[u8]) -> Result<ParseStatus<(usize, u64)>, Error> {
 
     let d0 = HEX_LUT[unsafe { *ptr } as usize];
     if d0 == 0xFF {
-        return Err(Error::Malformed);
+        return Err(HttpStatus::BadRequest);
     }
     let mut size: u64 = u64::from(d0);
     ptr = unsafe { ptr.add(1) };
@@ -405,7 +402,7 @@ unsafe fn finish_chunk_size_line(
     mut ptr: *const u8,
     end: *const u8,
     size: u64,
-) -> Result<ParseStatus<(usize, u64)>, Error> {
+) -> Result<ParseStatus<(usize, u64)>, HttpStatus> {
     const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
 
     let max_end = {
@@ -422,9 +419,9 @@ unsafe fn finish_chunk_size_line(
     // A 17th hex digit exceeds 64 bits (413 on non-zero overflow, 400 on leading-zero DoS).
     if unsafe { ptr.offset_from(base) } == 16 && HEX_LUT[b as usize] < 16 {
         return Err(if size > 0 {
-            Error::BodyTooLarge
+            HttpStatus::PayloadTooLarge
         } else {
-            Error::Malformed
+            HttpStatus::BadRequest
         });
     }
 
@@ -440,7 +437,7 @@ unsafe fn finish_chunk_size_line(
         }
         if ptr == max_end {
             return if max_end < end {
-                Err(Error::Malformed)
+                Err(HttpStatus::BadRequest)
             } else {
                 Ok(ParseStatus::Partial)
             };
@@ -465,13 +462,13 @@ unsafe fn finish_chunk_size_line(
                 if has_cr != 0 {
                     let cr_pos = (has_cr.trailing_zeros() >> 3) as usize;
                     if has_lf != 0 && ((has_lf.trailing_zeros() >> 3) as usize) < cr_pos {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                     ptr = unsafe { ptr.add(cr_pos) };
                     break;
                 }
                 if has_lf != 0 {
-                    return Err(Error::Malformed);
+                    return Err(HttpStatus::BadRequest);
                 }
                 ptr = unsafe { ptr.add(8) };
             }
@@ -483,13 +480,13 @@ unsafe fn finish_chunk_size_line(
                 break;
             }
             if b == b'\n' {
-                return Err(Error::Malformed);
+                return Err(HttpStatus::BadRequest);
             }
             ptr = unsafe { ptr.add(1) };
         }
         if ptr == max_end {
             return if max_end < end {
-                Err(Error::Malformed)
+                Err(HttpStatus::BadRequest)
             } else {
                 Ok(ParseStatus::Partial)
             };
@@ -507,24 +504,24 @@ unsafe fn finish_chunk_size_line(
             return Ok(ParseStatus::Partial);
         }
         if unsafe { ptr.add(2).offset_from(base) as usize } > MAX_CHUNK_LINE {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         if unsafe { (ptr as *const u16).read_unaligned() } == CRLF {
             let consumed = unsafe { ptr.add(2).offset_from(base) as usize };
             return Ok(ParseStatus::Complete((consumed, size)));
         }
-        return Err(Error::Malformed);
+        return Err(HttpStatus::BadRequest);
     }
 
-    Err(Error::Malformed)
+    Err(HttpStatus::BadRequest)
 }
 
 /// Enforce `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS ( token / quoted-string ) ] )`
 /// per RFC 9112 §7.1.1 and cap extension bytes at [`MAX_CHUNK_EXT_BYTES`].
 #[inline]
-fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
+fn validate_chunk_extensions(ext: &[u8]) -> Result<(), HttpStatus> {
     if ext.len() > MAX_CHUNK_EXT_BYTES {
-        return Err(Error::Malformed);
+        return Err(HttpStatus::BadRequest);
     }
     let mut i = 0usize;
     let n = ext.len();
@@ -537,7 +534,7 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
             break;
         }
         if ext[i] != b';' {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
         i += 1;
 
@@ -550,7 +547,7 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
             i += 1;
         }
         if i == name_start {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
 
         let before_bws = i;
@@ -564,7 +561,7 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
                 i += 1;
             }
             if i == n {
-                return Err(Error::Malformed);
+                return Err(HttpStatus::BadRequest);
             }
             if ext[i] == b'"' {
                 i += 1;
@@ -578,11 +575,11 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
                     } else if c == b'\\' {
                         i += 1;
                         if i == n {
-                            return Err(Error::Malformed);
+                            return Err(HttpStatus::BadRequest);
                         }
                         let esc = ext[i];
                         if !(esc == b'\t' || (0x20..=0x7E).contains(&esc) || esc >= 0x80) {
-                            return Err(Error::Malformed);
+                            return Err(HttpStatus::BadRequest);
                         }
                         i += 1;
                     } else if c == b'\t'
@@ -594,11 +591,11 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
                     {
                         i += 1;
                     } else {
-                        return Err(Error::Malformed);
+                        return Err(HttpStatus::BadRequest);
                     }
                 }
                 if !closed {
-                    return Err(Error::Malformed);
+                    return Err(HttpStatus::BadRequest);
                 }
             } else {
                 let val_start = i;
@@ -606,11 +603,11 @@ fn validate_chunk_extensions(ext: &[u8]) -> Result<(), Error> {
                     i += 1;
                 }
                 if i == val_start {
-                    return Err(Error::Malformed);
+                    return Err(HttpStatus::BadRequest);
                 }
             }
         } else if i == n && i > before_bws {
-            return Err(Error::Malformed);
+            return Err(HttpStatus::BadRequest);
         }
     }
 

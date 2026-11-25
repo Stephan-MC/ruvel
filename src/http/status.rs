@@ -381,5 +381,6 @@ impl std::fmt::Display for Status {
     }
 }
 
-pub type StatusCode = Status;
+impl std::error::Error for Status {}
 
+pub type StatusCode = Status;
