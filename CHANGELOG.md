@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.15.0...ruvel-v0.16.0) (2026-11-25)
+
+
+### Miscellaneous Chores
+
+* release 0.16.0 ([cd6e743](https://github.com/Stephan-MC/ruvel/commit/cd6e7436ca669bfc8adb78e320187da8d4be2003))
+
 ## [0.15.0](https://github.com/Stephan-MC/ruvel/compare/ruvel-v0.14.0...ruvel-v0.15.0) (2026-11-24)
 
 
