@@ -18,7 +18,8 @@ mod simd;
 use std::borrow::Cow;
 
 use crate::constants::{MAX_REQUEST_BODY_SIZE, REQUEST_HEADER_SIZE};
-use crate::http::parser::{Error, Status};
+use crate::http::Status as HttpStatus;
+use crate::http::parser::Status;
 
 pub use conn::{Conn, Frame, Request};
 pub use head::{Body, Head, Method, Span};
@@ -46,32 +47,32 @@ pub type SliceParts<'a> = (usize, Cow<'a, [u8]>);
 /// from [`crate::constants`] (`REQUEST_HEADER_SIZE`, `MAX_REQUEST_BODY_SIZE`).
 ///
 /// Returns `Ok(Status::Complete((head_len, body), bytes_consumed))`, `Ok(Status::Incomplete)` on
-/// partial input, or `Err(Error)` on malformed syntax or exceeded limits.
+/// partial input, or `Err(HttpStatus)` on malformed syntax or exceeded limits.
 #[inline]
 pub fn parse_slice_into<'a>(
     buf: &'a [u8],
     head: &mut Head,
-) -> Result<Status<SliceParts<'a>>, Error> {
+) -> Result<Status<SliceParts<'a>>, HttpStatus> {
     let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
     let head_len = match head.parse_prefix_status(&buf[..scan_limit]) {
         Ok(Some(len)) => len,
         Ok(None) => {
             return if buf.len() >= REQUEST_HEADER_SIZE {
-                Err(Error::HeaderTooLarge)
+                Err(HttpStatus::RequestHeaderFieldsTooLarge)
             } else {
                 Ok(Status::Incomplete)
             };
         }
-        Err(err) => return classify_head_error(buf, err),
+        Err(status) => return classify_head_error(buf, status),
     };
 
     let (body, consumed) = match head.body {
         Body::None => (Cow::Borrowed(&[][..]), head_len),
         Body::Length(n) => {
             if n > MAX_REQUEST_BODY_SIZE {
-                return Err(Error::BodyTooLarge);
+                return Err(HttpStatus::PayloadTooLarge);
             }
-            let total = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
+            let total = head_len.checked_add(n).ok_or(HttpStatus::PayloadTooLarge)?;
             if buf.len() < total {
                 return Ok(Status::Incomplete);
             }
@@ -84,7 +85,7 @@ pub fn parse_slice_into<'a>(
             };
             let total = head_len
                 .checked_add(wire_consumed)
-                .ok_or(Error::BodyTooLarge)?;
+                .ok_or(HttpStatus::PayloadTooLarge)?;
             (Cow::Owned(decoded), total)
         }
     };
@@ -94,22 +95,25 @@ pub fn parse_slice_into<'a>(
 
 #[cold]
 #[inline(never)]
-fn classify_head_error<'a>(buf: &[u8], err: Error) -> Result<Status<SliceParts<'a>>, Error> {
+fn classify_head_error<'a>(
+    buf: &[u8],
+    status: HttpStatus,
+) -> Result<Status<SliceParts<'a>>, HttpStatus> {
     let scan_limit = buf.len().min(REQUEST_HEADER_SIZE);
     match head::find_head_end(&buf[..scan_limit], 0) {
-        Err(()) => Err(Error::Malformed),
+        Err(()) => Err(HttpStatus::BadRequest),
         Ok(None) => {
             if buf.len() >= REQUEST_HEADER_SIZE {
-                Err(Error::HeaderTooLarge)
+                Err(HttpStatus::RequestHeaderFieldsTooLarge)
             } else {
                 Ok(Status::Incomplete)
             }
         }
         Ok(Some(len)) => {
             if len > REQUEST_HEADER_SIZE {
-                Err(Error::HeaderTooLarge)
+                Err(HttpStatus::RequestHeaderFieldsTooLarge)
             } else {
-                Err(err)
+                Err(status)
             }
         }
     }
@@ -119,9 +123,9 @@ fn classify_head_error<'a>(buf: &[u8], err: Error) -> Result<Status<SliceParts<'
 /// enforcing compile-time limits from [`crate::constants`].
 ///
 /// Returns `Ok(Status::Complete(req, bytes_consumed))`, `Ok(Status::Incomplete)` on partial
-/// input, or `Err(Error)` on malformed syntax or exceeded limits.
+/// input, or `Err(HttpStatus)` on malformed syntax or exceeded limits.
 #[inline]
-pub fn parse_slice(buf: &[u8]) -> Result<Status<SliceRequest<'_>>, Error> {
+pub fn parse_slice(buf: &[u8]) -> Result<Status<SliceRequest<'_>>, HttpStatus> {
     let mut head = Head::new();
     match parse_slice_into(buf, &mut head)? {
         Status::Complete((head_len, body), consumed) => Ok(Status::Complete(
@@ -146,6 +150,7 @@ mod tests {
         MAX_REQUEST_BODY_SIZE, MAX_REQUEST_HEADERS, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE,
         REQUEST_HEADER_SIZE,
     };
+    use crate::http::parser::Error;
 
     /// Hands out at most `step` bytes per read(): worst-case TCP fragmentation.
     struct Dribble<'a> {
@@ -227,7 +232,7 @@ mod tests {
 
     fn status(stream: &[u8]) -> Option<u16> {
         match run(stream, 7) {
-            Err(e) => e.status(),
+            Err(e) => e.status().map(|s| s.code()),
             Ok(_) => Some(200),
         }
     }
@@ -337,10 +342,10 @@ mod tests {
             MAX_REQUEST_BODY_SIZE
         );
         assert_eq!(status(oversized_chunked.as_bytes()), Some(413));
-        assert!(matches!(
-            parse_slice(oversized_chunked.as_bytes()),
-            Err(Error::BodyTooLarge)
-        ));
+        assert_eq!(
+            parse_slice(oversized_chunked.as_bytes()).err(),
+            Some(HttpStatus::PayloadTooLarge)
+        );
 
         // smuggling / malformed
         let cases: &[&[u8]] = &[
@@ -549,10 +554,10 @@ mod tests {
         too_large.extend(std::iter::repeat_n(b'a', exact_pad_len + 1));
         too_large.extend_from_slice(suffix);
         assert_eq!(too_large.len(), REQUEST_HEADER_SIZE + 1);
-        assert!(matches!(
-            parse_slice(&too_large),
-            Err(Error::HeaderTooLarge)
-        ));
+        assert_eq!(
+            parse_slice(&too_large).err(),
+            Some(HttpStatus::RequestHeaderFieldsTooLarge)
+        );
         assert_eq!(status(&too_large), Some(431));
     }
 
@@ -612,7 +617,7 @@ mod tests {
     fn parse_head_with(
         buf: &[u8],
         backend: TestBackend,
-    ) -> Result<Option<(usize, Vec<u8>)>, Error> {
+    ) -> Result<Option<(usize, Vec<u8>)>, HttpStatus> {
         let mut h = Head::new();
         match h.parse_with_backend_for_test(buf, backend) {
             Ok(Some(len)) => {
@@ -662,20 +667,12 @@ mod tests {
         }
         for (label, backend) in backends {
             let got = parse_head_with(buf, backend);
-            match (&scalar, &got) {
-                (Ok(a), Ok(b)) => assert_eq!(
-                    a,
-                    b,
-                    "backend={label} mismatch on {:?}",
-                    String::from_utf8_lossy(buf)
-                ),
-                (Err(a), Err(b)) => assert_eq!(
-                    std::mem::discriminant(a),
-                    std::mem::discriminant(b),
-                    "backend={label} error mismatch: {a:?} vs {b:?}"
-                ),
-                (a, b) => panic!("backend={label} outcome mismatch: {a:?} vs {b:?}"),
-            }
+            assert_eq!(
+                scalar,
+                got,
+                "backend={label} mismatch on {:?}",
+                String::from_utf8_lossy(buf)
+            );
         }
     }
 
@@ -802,16 +799,16 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
                 "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{hex}\r\nhello"
             );
             assert_eq!(status(wire.as_bytes()), Some(413), "hex={hex}");
-            assert!(matches!(
-                parse_slice(wire.as_bytes()),
-                Err(Error::BodyTooLarge)
-            ));
+            assert_eq!(
+                parse_slice(wire.as_bytes()).err(),
+                Some(HttpStatus::PayloadTooLarge)
+            );
         }
 
         // Leading-zero > 16 hex digit DoS -> 400
         let lz = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n00000000000000001\r\na\r\n0\r\n\r\n";
         assert_eq!(status(lz), Some(400));
-        assert!(matches!(parse_slice(lz), Err(Error::Malformed)));
+        assert_eq!(parse_slice(lz).err(), Some(HttpStatus::BadRequest));
 
         // Oversized trailer section (> 8 KiB) -> 431
         let mut big_trailers =
@@ -821,10 +818,10 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
         }
         big_trailers.extend_from_slice(b"\r\n");
         assert_eq!(status(&big_trailers), Some(431));
-        assert!(matches!(
-            parse_slice(&big_trailers),
-            Err(Error::HeaderTooLarge)
-        ));
+        assert_eq!(
+            parse_slice(&big_trailers).err(),
+            Some(HttpStatus::RequestHeaderFieldsTooLarge)
+        );
     }
 
     #[test]
@@ -861,14 +858,14 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
             parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n"),
             Ok(Status::Incomplete)
         ));
-        assert!(matches!(
-            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n\r\n"),
-            Err(Error::VersionNotSupported)
-        ));
-        assert!(matches!(
-            parse_slice(b"GET / HTTP/2.0\r\nHost: a\n\r\n\r\n"),
-            Err(Error::Malformed)
-        ));
+        assert_eq!(
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\r\n\r\n").err(),
+            Some(HttpStatus::HttpVersionNotSupported)
+        );
+        assert_eq!(
+            parse_slice(b"GET / HTTP/2.0\r\nHost: a\n\r\n\r\n").err(),
+            Some(HttpStatus::BadRequest)
+        );
 
         // 5. Incomplete MAX_REQUEST_HEADERS + 1 vs complete MAX_REQUEST_HEADERS + 1 (< REQUEST_HEADER_SIZE).
         let mut many_incomplete = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
@@ -882,10 +879,10 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
         ));
         let mut many_complete = many_incomplete;
         many_complete.extend_from_slice(b"\r\n");
-        assert!(matches!(
-            parse_slice(&many_complete),
-            Err(Error::HeaderTooLarge)
-        ));
+        assert_eq!(
+            parse_slice(&many_complete).err(),
+            Some(HttpStatus::RequestHeaderFieldsTooLarge)
+        );
 
         // 6. parse_slice_into reusing one Head across two pipelined requests.
         let mut pipelined = post(b"first");
@@ -925,9 +922,17 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
         assert_eq!(parsed.head.method, Method::from(ok_token.as_str()));
 
         let too_long_token = "X".repeat(24);
-        let bad_req = format!("{too_long_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let err = parse_slice(bad_req.as_bytes()).err().unwrap();
-        assert_eq!(err.status(), Some(400));
+        let long_req = format!("{too_long_token} / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert_eq!(
+            parse_slice(long_req.as_bytes()).err(),
+            Some(HttpStatus::NotImplemented)
+        );
+
+        let bad_long = format!("{}X( / HTTP/1.1\r\nHost: localhost\r\n\r\n", "X".repeat(23));
+        assert_eq!(
+            parse_slice(bad_long.as_bytes()).err(),
+            Some(HttpStatus::BadRequest)
+        );
     }
 
     #[test]
@@ -971,8 +976,8 @@ Cookie: session=abcdef; theme=dark; padding=0123456789abcdef0123456789abcdef\r\n
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
                 (Err(a), Err(b)) => {
                     assert_eq!(
-                        std::mem::discriminant(&a),
-                        std::mem::discriminant(&b),
+                        (std::mem::discriminant(&a), a.status()),
+                        (std::mem::discriminant(&b), b.status()),
                         "{a:?} vs {b:?}"
                     )
                 }

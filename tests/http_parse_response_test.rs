@@ -101,16 +101,47 @@ Content-Length: 15\r\n\
 fn test_request_parse_rejects_invalid_framing_and_accepts_chunked_and_identity() {
     let unsupported_te =
         b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n";
-    assert!(Request::capture(unsupported_te).is_err());
+    assert_eq!(
+        Request::capture(unsupported_te).err(),
+        Some(Status::NotImplemented)
+    );
 
     let duplicate_te = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n";
-    assert!(Request::capture(duplicate_te).is_err());
+    assert_eq!(
+        Request::capture(duplicate_te).err(),
+        Some(Status::BadRequest)
+    );
 
     let chunked_with_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    assert!(Request::capture(chunked_with_cl).is_err());
+    assert_eq!(
+        Request::capture(chunked_with_cl).err(),
+        Some(Status::BadRequest)
+    );
 
     let conflicting_cl = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
-    assert!(Request::capture(conflicting_cl).is_err());
+    assert_eq!(
+        Request::capture(conflicting_cl).err(),
+        Some(Status::BadRequest)
+    );
+
+    let long_method = format!("{} /ok HTTP/1.1\r\nHost: localhost\r\n\r\n", "X".repeat(24));
+    assert_eq!(
+        Request::capture(long_method.as_bytes()).err(),
+        Some(Status::NotImplemented)
+    );
+
+    let bad_expect =
+        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nExpect: nope\r\nContent-Length: 0\r\n\r\n";
+    assert_eq!(
+        Request::capture(bad_expect).err(),
+        Some(Status::ExpectationFailed)
+    );
+
+    let h2_preface = b"GET /ok HTTP/2.0\r\nHost: localhost\r\n\r\n";
+    assert_eq!(
+        Request::capture(h2_preface).err(),
+        Some(Status::HttpVersionNotSupported)
+    );
 
     let identity = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\n";
     assert!(matches!(
@@ -1091,6 +1122,17 @@ async fn test_tcp_listener_spec_compliance_and_error_responses() {
         addr,
         b"GET /spec HTTP/2.0\r\nHost: localhost\r\n\r\n",
         "HTTP/1.1 505 HTTP Version Not Supported\r\n",
+    )
+    .await;
+
+    let long_method_tcp = format!(
+        "{} /spec HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "X".repeat(24)
+    );
+    send_expect_status(
+        addr,
+        long_method_tcp.as_bytes(),
+        "HTTP/1.1 501 Not Implemented\r\n",
     )
     .await;
 

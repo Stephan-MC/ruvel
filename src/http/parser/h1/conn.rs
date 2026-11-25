@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::constants::{
     MAX_REQUEST_BODY_SIZE, REQUEST_BODY_SIZE, REQUEST_BUFFER_SIZE, REQUEST_HEADER_SIZE,
 };
+use crate::http::Status as HttpStatus;
 use crate::http::parser::Error;
 
 use super::dechunk::{Dechunker, MAX_CHUNK_LINE, MAX_TRAILER};
@@ -109,8 +110,8 @@ impl Conn {
     /// - `Ok(Some(frame))` when a complete request is buffered and ready for [`Conn::request`].
     /// - `Ok(None)` when more bytes must be read from the peer via [`Conn::prepare_read`] and
     ///   [`Conn::fill`] / [`Conn::fill_async`].
-    /// - `Err(err)` immediately on malformed syntax, unsupported protocol/encoding, or limit violation.
-    pub fn try_next_request(&mut self) -> Result<Option<Frame>, Error> {
+    /// - `Err(status)` immediately on malformed syntax, unsupported protocol/encoding, or limit violation.
+    pub fn try_next_request(&mut self) -> Result<Option<Frame>, HttpStatus> {
         loop {
             match self.phase {
                 Phase::Head => {
@@ -235,7 +236,7 @@ impl Conn {
 
     /// Reads bytes asynchronously into the connection's spare buffer space.
     #[inline]
-    pub async fn fill_async<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> Result<usize, Error> {
+    pub async fn fill_async<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<usize> {
         debug_assert!(self.filled < self.buf.len());
         loop {
             match r.read(&mut self.buf[self.filled..]).await {
@@ -244,7 +245,7 @@ impl Conn {
                     return Ok(n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Error::Io(e)),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -255,7 +256,7 @@ impl Conn {
     /// On the first read (`scanned == 0`), executes a single-pass SIMD/scalar parse directly
     /// via [`Head::parse_prefix_status`]. Only if the head spans multiple reads or errors
     /// does it use incremental [`find_head_end`] scanning / error classification.
-    fn try_head(&mut self) -> Result<bool, Error> {
+    fn try_head(&mut self) -> Result<bool, HttpStatus> {
         let data = &self.buf[self.pos..self.filled];
         if data.is_empty() {
             return Ok(false);
@@ -267,17 +268,17 @@ impl Conn {
                 Ok(Some(len)) => len,
                 Ok(None) => {
                     if data.len() >= REQUEST_HEADER_SIZE {
-                        return Err(Error::HeaderTooLarge);
+                        return Err(HttpStatus::RequestHeaderFieldsTooLarge);
                     }
                     self.scanned = scan_limit;
                     return Ok(false);
                 }
-                Err(err) => {
+                Err(status) => {
                     return match find_head_end(&data[..scan_limit], 0) {
-                        Err(()) => Err(Error::Malformed),
+                        Err(()) => Err(HttpStatus::BadRequest),
                         Ok(None) => {
                             if data.len() >= REQUEST_HEADER_SIZE {
-                                Err(Error::HeaderTooLarge)
+                                Err(HttpStatus::RequestHeaderFieldsTooLarge)
                             } else {
                                 self.scanned = scan_limit;
                                 Ok(false)
@@ -285,9 +286,9 @@ impl Conn {
                         }
                         Ok(Some(len)) => {
                             if len > REQUEST_HEADER_SIZE {
-                                Err(Error::HeaderTooLarge)
+                                Err(HttpStatus::RequestHeaderFieldsTooLarge)
                             } else {
-                                Err(err)
+                                Err(status)
                             }
                         }
                     };
@@ -295,17 +296,17 @@ impl Conn {
             }
         } else {
             match find_head_end(&data[..scan_limit], self.scanned) {
-                Err(()) => return Err(Error::Malformed),
+                Err(()) => return Err(HttpStatus::BadRequest),
                 Ok(None) => {
                     if data.len() >= REQUEST_HEADER_SIZE {
-                        return Err(Error::HeaderTooLarge);
+                        return Err(HttpStatus::RequestHeaderFieldsTooLarge);
                     }
                     self.scanned = scan_limit;
                     return Ok(false);
                 }
                 Ok(Some(len)) => {
                     if len > REQUEST_HEADER_SIZE {
-                        return Err(Error::HeaderTooLarge);
+                        return Err(HttpStatus::RequestHeaderFieldsTooLarge);
                     }
                     self.head.parse(&data[..len])?;
                     len
@@ -325,9 +326,9 @@ impl Conn {
             Body::Length(n) => {
                 // Rejected from the header alone, before any body byte is buffered.
                 if n > MAX_REQUEST_BODY_SIZE {
-                    return Err(Error::BodyTooLarge);
+                    return Err(HttpStatus::PayloadTooLarge);
                 }
-                let need = head_len.checked_add(n).ok_or(Error::BodyTooLarge)?;
+                let need = head_len.checked_add(n).ok_or(HttpStatus::PayloadTooLarge)?;
                 (Phase::Body { head_len, need }, n > 0)
             }
             Body::Chunked => (
@@ -363,7 +364,7 @@ impl Conn {
 
     /// Reads bytes synchronously into the connection's spare buffer space.
     #[inline]
-    pub fn fill<R: Read>(&mut self, r: &mut R) -> Result<usize, Error> {
+    pub fn fill<R: Read>(&mut self, r: &mut R) -> io::Result<usize> {
         debug_assert!(self.filled < self.buf.len());
         loop {
             match r.read(&mut self.buf[self.filled..]) {
@@ -372,7 +373,7 @@ impl Conn {
                     return Ok(n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Error::Io(e)),
+                Err(e) => return Err(e),
             }
         }
     }

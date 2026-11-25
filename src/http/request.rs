@@ -1,5 +1,5 @@
-use crate::http::Method;
-use crate::http::parser::{self, HttpVersion, Status as ParseStatus, h1};
+use crate::http::parser::{HttpVersion, Status as ParseStatus, h1};
+use crate::http::{Method, Status};
 use crate::routing::route::Params;
 
 use super::headers::Headers;
@@ -35,7 +35,7 @@ impl Request {
     /// Capture one complete HTTP/1.x request from the leading bytes of `buf`
     /// enforcing [`crate::constants::REQUEST_HEADER_SIZE`] and
     /// [`crate::constants::MAX_REQUEST_BODY_SIZE`].
-    pub fn capture(buf: &[u8]) -> Result<ParseStatus<Self>, parser::Error> {
+    pub fn capture(buf: &[u8]) -> Result<ParseStatus<Self>, Status> {
         let mut head = h1::Head::new();
         match h1::parse_slice_into(buf, &mut head)? {
             ParseStatus::Complete((head_len, body), consumed) => {
@@ -53,7 +53,7 @@ impl Request {
     }
 
     /// Materialize an owned [`Request`] from a zero-copy borrowed [`h1::Request`] view.
-    pub fn from_h1(raw: h1::Request<'_>) -> Result<Self, parser::Error> {
+    pub fn from_h1(raw: h1::Request<'_>) -> Result<Self, Status> {
         let mut req = Self::from_h1_head_only(&raw)?;
         let body = raw.body();
         if !body.is_empty() {
@@ -62,12 +62,12 @@ impl Request {
         Ok(req)
     }
 
-    fn from_h1_head_only(raw: &h1::Request<'_>) -> Result<Self, parser::Error> {
+    fn from_h1_head_only(raw: &h1::Request<'_>) -> Result<Self, Status> {
         let path_bytes = raw.path();
         let path = if path_bytes == b"/" {
             Cow::Borrowed("/")
         } else {
-            let s = std::str::from_utf8(path_bytes).map_err(|_| parser::Error::Malformed)?;
+            let s = std::str::from_utf8(path_bytes).map_err(|_| Status::BadRequest)?;
             Cow::Owned(s.to_owned())
         };
 
@@ -75,7 +75,7 @@ impl Request {
         let query = if query_bytes.is_empty() {
             Cow::Borrowed("")
         } else {
-            let s = std::str::from_utf8(query_bytes).map_err(|_| parser::Error::Malformed)?;
+            let s = std::str::from_utf8(query_bytes).map_err(|_| Status::BadRequest)?;
             Cow::Owned(s.to_owned())
         };
 
@@ -83,9 +83,8 @@ impl Request {
         let mut seen_singletons: u16 = 0;
         let mut saw_unknown_singleton = false;
         for (name_bytes, value_bytes) in raw.headers() {
-            let name_str = std::str::from_utf8(name_bytes).map_err(|_| parser::Error::Malformed)?;
-            let value_str =
-                std::str::from_utf8(value_bytes).map_err(|_| parser::Error::Malformed)?;
+            let name_str = std::str::from_utf8(name_bytes).map_err(|_| Status::BadRequest)?;
+            let value_str = std::str::from_utf8(value_bytes).map_err(|_| Status::BadRequest)?;
             let (name, kind) = intern_header_name(name_str);
             let value = intern_common_header_value(value_str);
             match kind {
