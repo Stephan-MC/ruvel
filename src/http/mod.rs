@@ -8,6 +8,7 @@ pub mod parser;
 mod request;
 mod response;
 mod status;
+mod version;
 
 pub use crate::contracts::support::Responsable;
 pub use controllers::Controller;
@@ -18,3 +19,4 @@ pub use middleware::{BoxFuture, HandlerFn, Middleware, Next};
 pub use request::Request;
 pub use response::Response;
 pub use status::{Status, StatusCode};
+pub use version::Version;

@@ -1,5 +1,5 @@
-use crate::http::parser::{HttpVersion, Status as ParseStatus, h1};
-use crate::http::{Method, Status};
+use crate::http::parser::{Status as ParseStatus, h1};
+use crate::http::{Method, Status, Version};
 use crate::routing::route::Params;
 
 use super::headers::Headers;
@@ -13,7 +13,7 @@ pub struct Request {
     /// Raw query string without the leading `?`. Empty when the target has no query.
     pub query: Cow<'static, str>,
     /// Wire HTTP protocol version negotiated/parsed for this request.
-    pub version: HttpVersion,
+    pub version: Version,
     pub headers: Headers,
     pub body: Vec<u8>,
     pub params: Params,
@@ -25,7 +25,7 @@ impl Request {
             method,
             path: path.into(),
             query: Cow::Borrowed(""),
-            version: HttpVersion::Http1_1,
+            version: Version::Http1_1,
             headers: Headers::new(),
             body: Vec::new(),
             params: Params::new(),
@@ -112,7 +112,7 @@ impl Request {
             method: raw.method(),
             path,
             query,
-            version: HttpVersion::from_h1_minor(raw.minor()),
+            version: Version::from_h1_minor(raw.minor()),
             headers,
             body: Vec::new(),
             params: Params::new(),
